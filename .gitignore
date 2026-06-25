@@ -1,0 +1,64 @@
+# CAP NIGHTPASS
+_out
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+connection.properties
+default-*.json
+.cdsrc-private.json
+gen/
+node_modules/
+target/
+
+# Web IDE, App Studio
+.che/
+.gen/
+
+# MTA
+*_mta_build_tmp
+*.mtar
+mta_archives/
+
+# Other
+.DS_Store
+*.orig
+*.log
+
+*.iml
+*.flattened-pom.xml
+
+# IDEs
+# .vscode
+# .idea
+
+# @cap-js/cds-typer
+@cds-models
+
+# secrets / local env
+.env
+
+# agent / editor local state
+.claude/
+
+# regenerated test artifacts (Playwright smoke screenshots)
+test/screenshots/
+
+# internal working docs (not part of the published repo)
+CLAUDE.md
+CAP_GUIDE.MD
+IMPLEMENTATION.MD
+
+# internal dev/helper scripts (not part of the published repo)
+docs/render-diagram.mjs
+test/ui-smoke.mjs
+test/ui-debug.mjs
+
+# internal research / demo surface (not part of the published repo)
+tractusx/VERIFICATION-MODEL.md
+tractusx/pac/verify-via-nightgate.mts
+
+# empty-dir placeholders (unused)
+.gitkeep

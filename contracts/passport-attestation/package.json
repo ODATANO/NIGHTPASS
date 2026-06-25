@@ -1,0 +1,7 @@
+{
+  "name": "@odatano/passport-attestation-contract",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Compact contract for the NIGHTPASS Battery Passport. Extends the NIGHTGATE AttestationVault pattern with a passportId -> payload_hash binding (T18). Managed artifacts under src/managed/ are committed so consumers need no Compact toolchain."
+}

@@ -1,0 +1,70 @@
+{
+  "_version": "1.65.0",
+  "sap.app": {
+    "id": "passport",
+    "type": "application",
+    "title": "NIGHTPASS - Battery Passport",
+    "description": "EU Battery Regulation 2023/1542 Digital Product Passport with three disclosure tiers over one backend.",
+    "applicationVersion": { "version": "1.0.0" },
+    "dataSources": {
+      "passportService": {
+        "uri": "/api/v1/passport/",
+        "type": "OData",
+        "settings": {
+          "odataVersion": "4.0"
+        }
+      }
+    }
+  },
+  "sap.ui5": {
+    "rootView": {
+      "viewName": "passport.view.App",
+      "type": "XML",
+      "id": "appView",
+      "async": true
+    },
+    "models": {
+      "": {
+        "dataSource": "passportService",
+        "type": "sap.ui.model.odata.v4.ODataModel",
+        "settings": {
+          "synchronizationMode": "None",
+          "operationMode": "Server",
+          "autoExpandSelect": true,
+          "groupId": "$auto"
+        }
+      }
+    },
+    "routing": {
+      "config": {
+        "routerClass": "sap.m.routing.Router",
+        "type": "View",
+        "viewType": "XML",
+        "viewPath": "passport.view",
+        "controlId": "appNavContainer",
+        "controlAggregation": "pages",
+        "async": true
+      },
+      "routes": [
+        { "name": "consumer",  "pattern": "",          "target": "consumer" },
+        { "name": "recycler",  "pattern": "recycler",  "target": "recycler" },
+        { "name": "authority", "pattern": "authority", "target": "authority" }
+      ],
+      "targets": {
+        "consumer":  { "viewName": "Consumer" },
+        "recycler":  { "viewName": "Recycler" },
+        "authority": { "viewName": "Authority" }
+      }
+    },
+    "dependencies": {
+      "minUI5Version": "1.120.0",
+      "libs": {
+        "sap.m": {},
+        "sap.f": {},
+        "sap.tnt": {},
+        "sap.ui.layout": {},
+        "sap.ui.unified": {}
+      }
+    }
+  }
+}

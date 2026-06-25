@@ -1,0 +1,76 @@
+<mvc:View
+  controllerName="passport.controller.Consumer"
+  xmlns:mvc="sap.ui.core.mvc"
+  xmlns="sap.m"
+  xmlns:f="sap.f"
+  xmlns:form="sap.ui.layout.form"
+  xmlns:core="sap.ui.core">
+
+  <Page id="consumerPage" title="Battery Passport" class="npConsumer">
+    <VBox class="sapUiContentPadding" alignItems="Stretch">
+
+      <!-- Hero -->
+      <VBox alignItems="Center" class="npHero sapUiMediumMarginBottom">
+        <core:Icon src="sap-icon://energy-saving-lightbulb" size="3rem" class="npHeroIcon"/>
+        <Title text="View Battery Passport" level="H2" class="sapUiSmallMarginTop"/>
+        <Text text="Public product information under EU Battery Regulation 2023/1542 (Annex XIII, Point 1)."
+              textAlign="Center" class="sapUiTinyMarginTop npHeroSub"/>
+      </VBox>
+
+      <!-- Passport picker -->
+      <List id="passportList"
+            headerText="Passports"
+            mode="SingleSelectMaster"
+            items="{/Passports}"
+            selectionChange="onPassportSelect"
+            updateFinished="onListUpdateFinished"
+            noDataText="No passports found.">
+        <ObjectListItem
+          title="{model}"
+          number="{batteryCategory}"
+          type="Active">
+          <attributes>
+            <ObjectAttribute text="{passportId}"/>
+            <ObjectAttribute text="{manufacturerId}"/>
+          </attributes>
+        </ObjectListItem>
+      </List>
+
+      <!-- Detail -->
+      <Panel id="detail" visible="false" class="sapUiMediumMarginTop">
+        <ObjectHeader title="{model}" number="{performanceClass}" numberUnit="Class"
+                      responsive="true">
+          <attributes>
+            <ObjectAttribute title="Passport ID" text="{passportId}"/>
+            <ObjectAttribute title="Category" text="{ path: 'batteryCategory', formatter: '.formatCategory' }"/>
+          </attributes>
+        </ObjectHeader>
+        <form:SimpleForm editable="false" layout="ResponsiveGridLayout" labelSpanL="4" labelSpanM="4">
+          <Label text="Manufacturer"/>
+          <Text text="{manufacturerId}"/>
+          <Label text="Manufacture date"/>
+          <Text text="{manufactureDate}"/>
+          <Label text="Weight (kg)"/>
+          <Text text="{weightKg}"/>
+          <Label text="Performance class"/>
+          <ObjectStatus text="{performanceClass}" state="{ path: 'performanceClass', formatter: '.formatPerfState' }"/>
+          <Label text="Passport URL"/>
+          <Link text="{qrCodeUrl}" href="{qrCodeUrl}" target="_blank" class="npMono"/>
+        </form:SimpleForm>
+        <VBox alignItems="Center" class="sapUiMediumMarginTop npQrBox">
+          <core:Icon src="sap-icon://qr-code" size="1.25rem" class="npHeroIcon"/>
+          <Text text="Scan to open this passport" class="sapUiTinyMarginTop npHeroSub"/>
+          <Image src="{ path: 'passportId', formatter: '.formatQrSrc' }"
+                 width="180px" height="180px"
+                 densityAware="false" class="sapUiSmallMarginTop"/>
+        </VBox>
+      </Panel>
+
+      <IllustratedMessage id="emptyDetail"
+        illustrationType="sapIllus-SearchEarth"
+        title="Select a battery"
+        description="Pick a passport above to see its public product information."/>
+
+    </VBox>
+  </Page>
+</mvc:View>

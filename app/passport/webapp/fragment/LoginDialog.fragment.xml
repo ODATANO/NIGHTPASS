@@ -1,0 +1,26 @@
+<core:FragmentDefinition
+  xmlns="sap.m"
+  xmlns:core="sap.ui.core"
+  xmlns:l="sap.ui.layout.form">
+
+  <Dialog id="loginDialog" title="Sign in" contentWidth="22rem">
+    <l:SimpleForm editable="true" layout="ResponsiveGridLayout" labelSpanL="4" labelSpanM="4">
+      <Label text="Identity"/>
+      <Select id="loginUser" width="100%">
+        <core:Item key="recycler"  text="Recycler (legitimate interest)"/>
+        <core:Item key="authority" text="Authority (notified body)"/>
+      </Select>
+      <Label text="Password"/>
+      <Input id="loginPass" type="Password" width="100%"/>
+    </l:SimpleForm>
+    <MessageStrip
+      text="Demo identities (mocked auth): password equals the username. Consumer tier needs no sign-in."
+      type="Information" showIcon="true" class="sapUiSmallMargin"/>
+    <beginButton>
+      <Button text="Sign in" type="Emphasized" press="onLoginConfirm"/>
+    </beginButton>
+    <endButton>
+      <Button text="Cancel" press="onLoginCancel"/>
+    </endButton>
+  </Dialog>
+</core:FragmentDefinition>

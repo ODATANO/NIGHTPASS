@@ -1,0 +1,33 @@
+.npHeaderSub {
+  opacity: 0.75;
+  align-self: center;
+}
+
+/* Consumer hero. Mobile-first landing. */
+.npHero {
+  padding: 1.5rem 1rem 0.5rem;
+}
+.npHeroIcon {
+  color: var(--sapBrandColor, #0a6ed1);
+}
+.npHeroSub {
+  max-width: 32rem;
+  opacity: 0.8;
+}
+.npConsumer .npHero .sapMTitle {
+  text-align: center;
+}
+
+/* Hashes, addresses, URLs */
+.npMono,
+.npMono .sapMText,
+.npMono .sapMLnk {
+  font-family: "Courier New", monospace;
+  font-size: 0.85rem;
+  word-break: break-all;
+}
+
+/* Keep the master list compact next to the detail */
+.sapUiContentPadding {
+  padding: 1rem;
+}

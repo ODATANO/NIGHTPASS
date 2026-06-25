@@ -1,0 +1,43 @@
+<mvc:View
+  controllerName="passport.controller.App"
+  xmlns:mvc="sap.ui.core.mvc"
+  xmlns="sap.m"
+  xmlns:tnt="sap.tnt"
+  height="100%">
+
+  <App id="rootApp" height="100%">
+    <tnt:ToolPage id="toolPage">
+      <tnt:header>
+        <tnt:ToolHeader>
+          <Title text="NIGHTPASS" level="H4" class="sapUiSmallMarginBegin"/>
+          <Text text="Battery Passport" class="sapUiSmallMarginBegin npHeaderSub"/>
+          <ToolbarSpacer/>
+          <ObjectStatus
+            text="{= ${session>/authenticated} ? ${session>/user} + ' · ' + ${session>/role} : 'Public (anonymous)' }"
+            state="{= ${session>/authenticated} ? 'Success' : 'None' }"
+            icon="{= ${session>/authenticated} ? 'sap-icon://employee' : 'sap-icon://visitor' }"
+            class="sapUiSmallMarginEnd"/>
+          <Button id="loginBtn"
+            text="{= ${session>/authenticated} ? 'Sign out' : 'Sign in' }"
+            icon="{= ${session>/authenticated} ? 'sap-icon://log' : 'sap-icon://key' }"
+            type="Transparent"
+            press="onLoginPress"/>
+        </tnt:ToolHeader>
+      </tnt:header>
+
+      <tnt:sideContent>
+        <tnt:SideNavigation id="sideNav" selectedKey="consumer" itemSelect="onNavSelect">
+          <tnt:NavigationList>
+            <tnt:NavigationListItem text="Consumer" icon="sap-icon://customer" key="consumer"/>
+            <tnt:NavigationListItem text="Recycler" icon="sap-icon://recycle" key="recycler"/>
+            <tnt:NavigationListItem text="Authority" icon="sap-icon://official-service" key="authority"/>
+          </tnt:NavigationList>
+        </tnt:SideNavigation>
+      </tnt:sideContent>
+
+      <tnt:mainContents>
+        <NavContainer id="appNavContainer"/>
+      </tnt:mainContents>
+    </tnt:ToolPage>
+  </App>
+</mvc:View>

@@ -1,0 +1,76 @@
+<mvc:View
+  controllerName="passport.controller.Recycler"
+  xmlns:mvc="sap.ui.core.mvc"
+  xmlns="sap.m"
+  xmlns:form="sap.ui.layout.form"
+  xmlns:core="sap.ui.core">
+
+  <Page id="recyclerPage" title="Battery Passport - Recycler view">
+    <MessageStrip
+      text="Legitimate-interest tier (Annex XIII, Points 2/3): dismantling, cell chemistry, capacity and recycled-content shares. Supplier identities are not shown."
+      type="Information" showIcon="true" class="sapUiSmallMargin"/>
+
+    <VBox class="sapUiContentPadding">
+      <List id="passportList"
+            headerText="Passports"
+            mode="SingleSelectMaster"
+            items="{/Passports}"
+            selectionChange="onPassportSelect"
+            updateFinished="onListUpdateFinished"
+            noDataText="No passports found.">
+        <ObjectListItem title="{model}" number="{batteryCategory}" type="Active">
+          <attributes>
+            <ObjectAttribute text="{passportId}"/>
+          </attributes>
+        </ObjectListItem>
+      </List>
+
+      <VBox id="detail" visible="false" class="sapUiMediumMarginTop">
+        <ObjectHeader title="{model}" responsive="true">
+          <attributes>
+            <ObjectAttribute title="Passport ID" text="{passportId}"/>
+            <ObjectAttribute title="Category" text="{ path: 'batteryCategory', formatter: '.formatCategory' }"/>
+            <ObjectAttribute title="Weight (kg)" text="{weightKg}"/>
+          </attributes>
+        </ObjectHeader>
+
+        <Panel headerText="Cells / packs" expandable="true" expanded="true">
+          <Table id="batteriesTable" items="{batteries}" noDataText="No cell data.">
+            <columns>
+              <Column><Text text="Serial number"/></Column>
+              <Column><Text text="Cell chemistry"/></Column>
+              <Column hAlign="End"><Text text="Capacity (kWh)"/></Column>
+            </columns>
+            <ColumnListItem>
+              <cells>
+                <Text text="{serialNumber}"/>
+                <ObjectIdentifier title="{cellChemistry}"/>
+                <Text text="{capacityKwh}"/>
+              </cells>
+            </ColumnListItem>
+          </Table>
+        </Panel>
+
+        <Panel headerText="Recycled content" expandable="true" expanded="true">
+          <Table id="recycledTable" items="{recycledMaterials}" noDataText="No recycled-content declarations.">
+            <columns>
+              <Column><Text text="Material"/></Column>
+              <Column hAlign="End"><Text text="Recycled share (%)"/></Column>
+            </columns>
+            <ColumnListItem>
+              <cells>
+                <ObjectIdentifier title="{material}"/>
+                <ObjectNumber number="{recycledPercentage}" unit="%"/>
+              </cells>
+            </ColumnListItem>
+          </Table>
+        </Panel>
+      </VBox>
+
+      <IllustratedMessage id="emptyDetail"
+        illustrationType="sapIllus-EmptyList"
+        title="Select a battery"
+        description="Pick a passport to see dismantling and recycled-content data."/>
+    </VBox>
+  </Page>
+</mvc:View>

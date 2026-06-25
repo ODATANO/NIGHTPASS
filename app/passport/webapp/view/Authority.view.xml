@@ -1,0 +1,113 @@
+<mvc:View
+  controllerName="passport.controller.Authority"
+  xmlns:mvc="sap.ui.core.mvc"
+  xmlns="sap.m"
+  xmlns:form="sap.ui.layout.form"
+  xmlns:core="sap.ui.core">
+
+  <Page id="authorityPage" title="Battery Passport - Authority view">
+    <MessageStrip
+      text="Notified-body tier (Annex XIII, Points 2/3 + supplier identities): full disclosure including carbon footprint, supplier names, due-diligence documents and on-chain anchors."
+      type="Warning" showIcon="true" class="sapUiSmallMargin"/>
+
+    <VBox class="sapUiContentPadding">
+      <List id="passportList"
+            headerText="Passports"
+            mode="SingleSelectMaster"
+            items="{/Passports}"
+            selectionChange="onPassportSelect"
+            updateFinished="onListUpdateFinished"
+            noDataText="No passports found.">
+        <ObjectListItem title="{model}" number="{batteryCategory}" type="Active">
+          <attributes>
+            <ObjectAttribute text="{passportId}"/>
+          </attributes>
+        </ObjectListItem>
+      </List>
+
+      <VBox id="detail" visible="false" class="sapUiMediumMarginTop">
+        <ObjectHeader title="{model}" responsive="true">
+          <attributes>
+            <ObjectAttribute title="Passport ID" text="{passportId}"/>
+            <ObjectAttribute title="Manufacturer" text="{manufacturerId}"/>
+            <ObjectAttribute title="Category" text="{ path: 'batteryCategory', formatter: '.formatCategory' }"/>
+            <ObjectAttribute title="Manufacture date" text="{manufactureDate}"/>
+            <ObjectAttribute title="Weight (kg)" text="{weightKg}"/>
+          </attributes>
+        </ObjectHeader>
+
+        <Panel headerText="Cells / packs" expandable="true" expanded="true">
+          <Table id="batteriesTable" items="{batteries}" noDataText="No cell data.">
+            <columns>
+              <Column><Text text="Serial number"/></Column>
+              <Column><Text text="Cell chemistry"/></Column>
+              <Column hAlign="End"><Text text="Capacity (kWh)"/></Column>
+              <Column hAlign="End"><Text text="Carbon footprint (kg CO₂)"/></Column>
+              <Column><Text text="Supplier"/></Column>
+            </columns>
+            <ColumnListItem>
+              <cells>
+                <Text text="{serialNumber}"/>
+                <ObjectIdentifier title="{cellChemistry}"/>
+                <Text text="{capacityKwh}"/>
+                <ObjectNumber number="{carbonFootprintKgCO2}" unit="kg"/>
+                <Text text="{supplierName}"/>
+              </cells>
+            </ColumnListItem>
+          </Table>
+        </Panel>
+
+        <Panel headerText="Recycled content" expandable="true" expanded="true">
+          <Table id="recycledTable" items="{recycledMaterials}" noDataText="No recycled-content declarations.">
+            <columns>
+              <Column><Text text="Material"/></Column>
+              <Column hAlign="End"><Text text="Recycled share (%)"/></Column>
+              <Column><Text text="Source supplier"/></Column>
+            </columns>
+            <ColumnListItem>
+              <cells>
+                <ObjectIdentifier title="{material}"/>
+                <ObjectNumber number="{recycledPercentage}" unit="%"/>
+                <Text text="{sourceSupplierName}"/>
+              </cells>
+            </ColumnListItem>
+          </Table>
+        </Panel>
+
+        <Panel headerText="Due-diligence documents" expandable="true" expanded="true">
+          <Table id="diligenceTable" items="{diligenceDocs}" noDataText="No documents.">
+            <columns>
+              <Column><Text text="Document type"/></Column>
+            </columns>
+            <ColumnListItem>
+              <cells>
+                <Text text="{docType}"/>
+              </cells>
+            </ColumnListItem>
+          </Table>
+        </Panel>
+
+        <Panel headerText="On-chain anchor (Midnight)" expandable="true" expanded="true">
+          <form:SimpleForm editable="false" layout="ResponsiveGridLayout" labelSpanL="3" labelSpanM="4">
+            <Label text="Payload hash"/>
+            <Text text="{payloadHash}" class="npMono"/>
+            <Label text="Passport-ID hash"/>
+            <Text text="{passportIdHash}" class="npMono"/>
+            <Label text="Contract address"/>
+            <Text text="{contractAddress}" class="npMono"/>
+            <Label text="Attestation tx"/>
+            <ObjectStatus
+              text="{ path: 'attestationTxHash', formatter: '.formatTxLink' }"
+              state="{= ${attestationTxHash} ? 'Success' : 'None' }"
+              class="npMono"/>
+          </form:SimpleForm>
+        </Panel>
+      </VBox>
+
+      <IllustratedMessage id="emptyDetail"
+        illustrationType="sapIllus-EmptyList"
+        title="Select a battery"
+        description="Pick a passport to see the full record and on-chain anchors."/>
+    </VBox>
+  </Page>
+</mvc:View>

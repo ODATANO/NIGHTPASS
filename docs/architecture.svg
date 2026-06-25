@@ -1,0 +1,113 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1320 760" font-family="-apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#5b6b7b"/>
+    </marker>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%">
+      <feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#1a2233" flood-opacity="0.18"/>
+    </filter>
+    <style>
+      .layer  { font-size: 11px; letter-spacing: 1.2px; font-weight: 700; }
+      .title  { font-size: 17px; font-weight: 700; }
+      .sub    { font-size: 11.5px; }
+      .uititle{ font-size: 16px; font-weight: 700; }
+      .arrlbl { font-size: 11px; fill: #5b6b7b; font-weight: 600; }
+      .box    { rx: 10; }
+    </style>
+  </defs>
+
+  <!-- background -->
+  <rect x="0" y="0" width="1320" height="760" fill="#fbfcfe"/>
+
+  <!-- header -->
+  <text x="40" y="56" font-size="26" font-weight="800" fill="#1a2233">NIGHTPASS · Battery Passport Architecture</text>
+  <text x="40" y="84" font-size="14" fill="#5b6b7b">EU Battery Regulation 2023/1542 · Digital Product Passport with selective disclosure on Midnight (ZK)</text>
+  <line x1="40" y1="100" x2="1280" y2="100" stroke="#e2e8f0" stroke-width="1.5"/>
+
+  <!-- ===================== PIPELINE (left -> right) ===================== -->
+
+  <!-- 1. SAP S/4HANA -->
+  <rect class="box" x="30"  y="130" width="190" height="120" rx="10" fill="#eaf3fc" stroke="#0a6ed1" stroke-width="2" filter="url(#shadow)"/>
+  <text x="125" y="158" text-anchor="middle" class="layer"  fill="#0a6ed1">ENTERPRISE</text>
+  <text x="125" y="186" text-anchor="middle" class="title"  fill="#0a3d6e">SAP S/4HANA</text>
+  <text x="125" y="214" text-anchor="middle" class="sub"    fill="#41607f">Goods movement event</text>
+
+  <!-- 2. CAP PassportService -->
+  <rect class="box" x="297" y="130" width="190" height="120" rx="10" fill="#e3f7f5" stroke="#049f9a" stroke-width="2.5" filter="url(#shadow)"/>
+  <text x="392" y="158" text-anchor="middle" class="layer"  fill="#049f9a">APPLICATION</text>
+  <text x="392" y="186" text-anchor="middle" class="title"  fill="#04635f">CAP · PassportService</text>
+  <text x="392" y="210" text-anchor="middle" class="sub"    fill="#2c6e6a">/api/v1/passport</text>
+  <text x="392" y="226" text-anchor="middle" class="sub"    fill="#2c6e6a">tier gating · generatePassport</text>
+
+  <!-- 3. NIGHTGATE plugin -->
+  <rect class="box" x="564" y="130" width="190" height="120" rx="10" fill="#ede9fb" stroke="#6c4ad6" stroke-width="2" filter="url(#shadow)"/>
+  <text x="659" y="158" text-anchor="middle" class="layer"  fill="#6c4ad6">PLATFORM · PLUGIN</text>
+  <text x="659" y="186" text-anchor="middle" class="title"  fill="#3b2680">NIGHTGATE</text>
+  <text x="659" y="210" text-anchor="middle" class="sub"    fill="#4a3a85">@odatano/nightgate · OData</text>
+  <text x="659" y="226" text-anchor="middle" class="sub"    fill="#4a3a85">AttestationVault SDK</text>
+
+  <!-- 4. Midnight Indexer -->
+  <rect class="box" x="831" y="130" width="190" height="120" rx="10" fill="#e7e3f5" stroke="#4b2e83" stroke-width="2" filter="url(#shadow)"/>
+  <text x="926" y="158" text-anchor="middle" class="layer"  fill="#4b2e83">INDEXER</text>
+  <text x="926" y="186" text-anchor="middle" class="title"  fill="#2b1a5e">Midnight Indexer</text>
+  <text x="926" y="210" text-anchor="middle" class="sub"    fill="#41357a">tx status · job polling</text>
+  <text x="926" y="226" text-anchor="middle" class="sub"    fill="#41357a">proof submission</text>
+
+  <!-- 5. Midnight Network -->
+  <rect class="box" x="1098" y="130" width="190" height="120" rx="10" fill="#2b1a5e" stroke="#1a0f3d" stroke-width="2" filter="url(#shadow)"/>
+  <text x="1193" y="158" text-anchor="middle" class="layer"  fill="#b9a7f0">NETWORK</text>
+  <text x="1193" y="186" text-anchor="middle" class="title"  fill="#ffffff">Midnight</text>
+  <text x="1193" y="210" text-anchor="middle" class="sub"    fill="#cfc3f3">preprod · ZK ledger</text>
+  <text x="1193" y="226" text-anchor="middle" class="sub"    fill="#cfc3f3">hash + bindings only</text>
+
+  <!-- pipeline arrows -->
+  <line x1="220"  y1="190" x2="295"  y2="190" stroke="#5b6b7b" stroke-width="2" marker-end="url(#arrow)"/>
+  <line x1="487"  y1="190" x2="562"  y2="190" stroke="#5b6b7b" stroke-width="2" marker-end="url(#arrow)"/>
+  <line x1="754"  y1="190" x2="829"  y2="190" stroke="#5b6b7b" stroke-width="2" marker-end="url(#arrow)"/>
+  <line x1="1021" y1="190" x2="1096" y2="190" stroke="#5b6b7b" stroke-width="2" marker-end="url(#arrow)"/>
+  <text x="257"  y="180" text-anchor="middle" class="arrlbl">build</text>
+  <text x="524"  y="180" text-anchor="middle" class="arrlbl">anchor</text>
+  <text x="791"  y="180" text-anchor="middle" class="arrlbl">submit</text>
+  <text x="1058" y="180" text-anchor="middle" class="arrlbl">prove</text>
+
+  <!-- ===================== DISCLOSURE TIERS (branch from CAP) ===================== -->
+
+  <!-- branch bus -->
+  <path d="M392 250 L392 380" stroke="#5b6b7b" stroke-width="2" fill="none"/>
+  <path d="M142 380 L642 380" stroke="#5b6b7b" stroke-width="2" fill="none"/>
+  <path d="M142 380 L142 468" stroke="#5b6b7b" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+  <path d="M392 380 L392 468" stroke="#5b6b7b" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+  <path d="M642 380 L642 468" stroke="#5b6b7b" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+  <text x="410" y="372" class="arrlbl">disclosure tiers, enforced server-side (Annex XIII boundary) · one SAPUI5 app · three routes</text>
+
+  <!-- Consumer -->
+  <rect class="box" x="42"  y="470" width="200" height="120" rx="10" fill="#e8f6ec" stroke="#2e7d32" stroke-width="2" filter="url(#shadow)"/>
+  <text x="142" y="498" text-anchor="middle" class="layer"   fill="#2e7d32">PUBLIC · ANON</text>
+  <text x="142" y="526" text-anchor="middle" class="uititle" fill="#1b5e20">Consumer</text>
+  <text x="142" y="550" text-anchor="middle" class="sub"     fill="#2f6b34">Annex XIII Point 1</text>
+  <text x="142" y="566" text-anchor="middle" class="sub"     fill="#2f6b34">QR landing · mobile</text>
+
+  <!-- Recycler -->
+  <rect class="box" x="292" y="470" width="200" height="120" rx="10" fill="#fff6e5" stroke="#ef8c00" stroke-width="2" filter="url(#shadow)"/>
+  <text x="392" y="498" text-anchor="middle" class="layer"   fill="#c06f00">LEGITIMATE INTEREST</text>
+  <text x="392" y="526" text-anchor="middle" class="uititle" fill="#8a5200">Recycler</text>
+  <text x="392" y="550" text-anchor="middle" class="sub"     fill="#8a5a13">+ chemistry · capacity</text>
+  <text x="392" y="566" text-anchor="middle" class="sub"     fill="#8a5a13">+ recycled-content %</text>
+
+  <!-- Authority -->
+  <rect class="box" x="542" y="470" width="200" height="120" rx="10" fill="#fdeaea" stroke="#c62828" stroke-width="2" filter="url(#shadow)"/>
+  <text x="642" y="498" text-anchor="middle" class="layer"   fill="#c62828">NOTIFIED BODY</text>
+  <text x="642" y="526" text-anchor="middle" class="uititle" fill="#8e1c1c">Authority</text>
+  <text x="642" y="550" text-anchor="middle" class="sub"     fill="#9a2a2a">+ supplier identities · CO₂</text>
+  <text x="642" y="566" text-anchor="middle" class="sub"     fill="#9a2a2a">+ diligence docs · lineage</text>
+
+  <!-- ===================== legend / notes ===================== -->
+  <rect x="820" y="470" width="468" height="120" rx="10" fill="#f4f6fa" stroke="#d6deea" stroke-width="1.5"/>
+  <text x="844" y="498" class="layer" fill="#41607f">DESIGN INVARIANTS</text>
+  <text x="844" y="522" font-size="12.5" fill="#3a475a">• On-chain ≠ API: only the public metadata + blake2b-256 payload</text>
+  <text x="858" y="540" font-size="12.5" fill="#3a475a">hash reach Midnight; everything else stays AES-encrypted off-chain.</text>
+  <text x="844" y="562" font-size="12.5" fill="#3a475a">• Contract calls are ZK proofs, not signatures.</text>
+  <text x="844" y="580" font-size="12.5" fill="#3a475a">• Three layers: platform plugin / SDK surface / consumer app.</text>
+
+  <text x="40" y="724" font-size="11.5" fill="#90a0b4">Three layers reusable across product passports, not just batteries.  ·  PassportService → @odatano/nightgate (CAP plugin) → Midnight preprod.</text>
+</svg>

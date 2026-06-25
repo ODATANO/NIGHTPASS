@@ -1,0 +1,8 @@
+# Normalize line endings to LF in the repo (cross-platform, avoids CRLF churn)
+* text=auto eol=lf
+
+# Compact / Midnight proving artifacts are binary - never touch line endings
+*.prover binary
+*.verifier binary
+*.bzkir binary
+*.png binary

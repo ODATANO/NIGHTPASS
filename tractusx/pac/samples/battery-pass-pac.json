@@ -1,0 +1,53 @@
+{
+  "@context": [
+    "https://www.w3.org/ns/credentials/v2",
+    "https://w3id.org/security/data-integrity/v2",
+    "https://raw.githubusercontent.com/eclipse-tractusx/tractusx-profiles/refs/heads/main/tx/credentials/schema/context/aac/v1/AttributeAttestationCredential.jsonld",
+    "https://raw.githubusercontent.com/eclipse-tractusx/tractusx-profiles/refs/heads/main/tx/credentials/schema/context/pac/v1/PredicateAttestationCredential.jsonld",
+    "urn:samm:io.catenax.battery.battery_pass:6.1.0#BatteryPass"
+  ],
+  "type": [
+    "VerifiableCredential",
+    "AttributeAttestationCredential",
+    "PredicateAttestationCredential",
+    "BatteryPass"
+  ],
+  "id": "urn:uuid:pac-batterypass-carbonfootprint-0001",
+  "issuer": "did:web:cell-manufacturer.example",
+  "validFrom": "2026-06-01T00:00:00Z",
+  "validUntil": "2026-09-01T00:00:00Z",
+  "credentialSubject": {
+    "attributes": [
+      {
+        "@id": "sustainability.carbonFootprint.footprintValue",
+        "unit": "kg CO2 / kWh",
+        "digestMultibase": "mb:0x6a1f3c8e9b2d4a7f0c5e1b8d3a6f9c2e4b7d0a3f6c9e2b5d8a1f4c7e0b3d6a9f",
+        "disclosureMode": "zkPredicate",
+        "claim": {
+          "predicate": "lessOrEqual",
+          "threshold": "50000",
+          "unit": "milli-kg CO2 / kWh"
+        },
+        "proof": {
+          "system": "midnight-compact",
+          "circuit": "provePredicate",
+          "verificationMethod": "0200a3f1c47e9b6d2058e1c4a7f0b3d6e9c2a5f8b1d4e7a0c3f6b9d2e5a8c1f4b7d0",
+          "proofValue": "6fb641b6f5e1c97f3a2b8d0e4c7a1f5b9d2e6c0a3f7b4d8e1c5a9f2b6d0e3c7a4"
+        },
+        "status": "predicate-proven"
+      }
+    ]
+  },
+  "origin": {
+    "semanticId": "urn:samm:io.catenax.battery.battery_pass:6.1.0#BatteryPass",
+    "@id": "did:web:cell-manufacturer.example:api:public:urn%3Auuid%3Abatterypass-0001",
+    "@type": "application/vc+ld+json"
+  },
+  "credentialStatus": {
+    "id": "https://issuer.example/revocation/2026/list.json#42",
+    "type": "BitstringStatusListEntry",
+    "statusPurpose": "revocation",
+    "statusListIndex": "42",
+    "statusListCredential": "https://issuer.example/revocation/2026/list.json"
+  }
+}

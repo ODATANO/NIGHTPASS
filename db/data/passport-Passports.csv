@@ -1,0 +1,2 @@
+ID;passportId;manufacturerId;batteryCategory;model;manufactureDate;weightKg;performanceClass;qrCodeUrl
+11111111-1111-4111-8111-111111111111;BAT-SAMPLE-0001;DE-CELLCO-001;EV;PowerCell EV-75;2026-03-15;432.500;B;https://passport.example/p/BAT-SAMPLE-0001

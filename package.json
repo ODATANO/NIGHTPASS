@@ -1,0 +1,86 @@
+{
+  "name": "@odatano/passport",
+  "version": "0.1.0",
+  "description": "NIGHTPASS is an EU Battery Regulation 2023/1542 Digital Product Passport (Midnight ZK) consumer app. It consumes @odatano/nightgate as a CAP plugin.",
+  "private": true,
+  "author": "ODATANO",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ODATANO/NIGHTPASS"
+  },
+  "dependencies": {
+    "@odatano/nightgate": "0.3.6",
+    "@sap/cds": "^9",
+    "express": "^4",
+    "qrcode": "^1.5.4"
+  },
+  "devDependencies": {
+    "@cap-js/cds-typer": "^0.39.1",
+    "@cap-js/cds-types": "^0.16.0",
+    "@cap-js/sqlite": "^2",
+    "@sap/cds-dk": "^9.9.2",
+    "@types/node": "^24.0.0",
+    "@types/qrcode": "^1.5.6",
+    "playwright": "^1.60.0",
+    "tsx": "^4",
+    "typescript": "^6.0.3"
+  },
+  "scripts": {
+    "start": "cds-tsx serve",
+    "deploy": "node -e \"const cds=require('@sap/cds');(async()=>{await cds.plugins;const m=await cds.load('*');await cds.deploy(m).to('db');console.log('deployed to db/passport.db')})().catch(e=>{console.error(e);process.exit(1)})\"",
+    "pac:demo": "node --experimental-strip-types tractusx/pac/build-pac.mts"
+  },
+  "cds": {
+    "requires": {
+      "db": {
+        "kind": "sqlite",
+        "credentials": {
+          "database": "db/passport.db"
+        }
+      },
+      "nightgate": {
+        "kind": "nightgate",
+        "network": "preprod",
+        "crawler": {
+          "enabled": false
+        },
+        "contentSecurityPolicy": "default-src 'self' https://ui5.sap.com; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://ui5.sap.com; style-src 'self' 'unsafe-inline' https://ui5.sap.com; img-src 'self' data: blob: https:; font-src 'self' data: https://ui5.sap.com; connect-src 'self' ws: wss: https://ui5.sap.com http://localhost:*",
+        "contracts": {
+          "passport-attestation": {
+            "artifactPath": "contracts/passport-attestation/src/managed/passport-attestation/contract/index.js",
+            "privateStateId": "passportAttestationPrivateState",
+            "zkConfigPath": "contracts/passport-attestation/src/managed/passport-attestation"
+          }
+        }
+      }
+    },
+    "[development]": {
+      "requires": {
+        "auth": {
+          "kind": "mocked",
+          "users": {
+            "recycler": {
+              "password": "recycler",
+              "roles": [
+                "recycler"
+              ]
+            },
+            "authority": {
+              "password": "authority",
+              "roles": [
+                "authority",
+                "recycler"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "odata": {
+      "version": "v4"
+    }
+  },
+  "imports": {
+    "#cds-models/*": "./@cds-models/*/index.js"
+  }
+}
