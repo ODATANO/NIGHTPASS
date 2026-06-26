@@ -10,7 +10,7 @@
 
 `NIGHTPASS` implements the EU Battery Passport and answers one dataset with a different view per audience (**consumer / recycler / authority**), while proving sensitive claims (e.g. "recycled cobalt share ≥ threshold") *without revealing the underlying value*. Public metadata plus a payload hash are anchored on-chain; everything else stays encrypted off-chain, and the disclosure tier is enforced at the API layer.
 
-It consumes [`@odatano/nightgate`](https://github.com/ODATANO/NIGHTGATE) as a CAP plugin (via `cds.requires.nightgate`). Platform functionality is never reimplemented here.
+It consumes [`@odatano/nightgate`](https://github.com/ODATANO/NIGHTGATE) as a CAP plugin (via `cds.requires.nightgate`).
 
 ## The problem
 
@@ -30,7 +30,7 @@ A five-layer pipeline: **SAP → CAP → NIGHTGATE → Midnight Indexer → Midn
 
 ![Architecture](docs/architecture.png)
 
-Full write-up in [`docs/architecture.md`](docs/architecture.md) (≈10-min read). The SVG (`docs/architecture.svg`) is the source of truth for the rendered PNG.
+Full write-up in [`docs/architecture.md`](docs/architecture.md)
 
 **On-chain vs off-chain.** Only a `payloadHash` (blake2b-256) and the `passportId → payloadHash` binding go on-chain; the sensitive payload is AES-256-GCM encrypted off-chain. Midnight has only public ledger state (plaintext for all) and private witness state (client-side), so the chain physically cannot hold tier-restricted cleartext. The split is deliberate: **verifying a claim** and **authorizing a tier** move on-chain; **delivering tier-specific cleartext** stays off-chain in the API layer.
 
@@ -44,8 +44,6 @@ cp .env.example .env   # then set ENCRYPTION_KEY (.env is gitignored)
 npm run deploy   # creates db/passport.db: domain tables + the 23 midnight_* plugin tables
 npm start        # cds-tsx serve  →  http://localhost:4004
 ```
-
-Working on the repo? See [`docs/development.md`](docs/development.md) for local-dev gotchas (the TS loader requirement, plugin linking).
 
 ### Services on :4004
 
@@ -71,7 +69,6 @@ In development, auth is `mocked`. Anonymous requests resolve to **consumer**; lo
 
 `contracts/passport-attestation/src/passport-attestation.compact` carries the AttestationVault pattern (attest / grant / revoke / commitValue / provePredicate) plus a `bindPassport` circuit that anchors `passportId → payload_hash`. It is re-embedded here (not inherited) because Compact cannot inherit ledger state across contracts.
 
-The Compact toolchain runs **only via WSL** on this machine (the `compact` on the Windows PATH is the NTFS compression tool, not the Midnight compiler):
 
 ```bash
 wsl -e bash -lc 'export PATH=$HOME/.local/bin:$PATH; \
@@ -110,7 +107,7 @@ tractusx/pac/                       Predicate Attestation Credential glue + inde
 
 **Working and verified:** NIGHTGATE plugin mount (23 `midnight_*` tables + both services on :4004); domain schema with Annex XIII tier comments and nested `$expand`; the `passport-attestation` Compact contract (6 circuits / 28 managed artefacts, registered and deploy-ready); the three disclosure UIs with server-side tier gating (browser smoke 12/12 green); QR + resolver; architecture docs.
 
-**In test / pending live run:** `generatePassport` is live-verified on the offline path (200 + row with 64-hex hashes + encrypted cipher; duplicate → 409, unknown batch → 404); the on-chain run with a wallet is outstanding, blocked on a running proof server (`:6300`). The PAC verify demo (`verifyPredicateViaIndexer` in `tractusx/pac/`) returns correct `verified:false` until a proven predicate attestation exists.
+**In test / pending live run:** `generatePassport` is live-verified on the offline path (200 + row with 64-hex hashes + encrypted cipher; duplicate → 409, unknown batch → 404); the on-chain run with a wallet is outstanding, blocked on a running Indexer. The PAC verify demo (`verifyPredicateViaIndexer` in `tractusx/pac/`) returns correct `verified:false` until a proven predicate attestation exists.
 
 ## Glossary
 
