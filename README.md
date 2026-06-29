@@ -52,6 +52,7 @@ npm start        # cds-tsx serve  →  http://localhost:4004
 | PassportService | `/api/v1/passport` | this repo (`srv/`) |
 | NightgateService (+ indexer / analytics / admin) | `/api/v1/nightgate` | `@odatano/nightgate` plugin |
 | Passport UI (3 tiers) | `/passport/webapp/` | `app/passport/webapp/` |
+| Disclosure connector (Lace) | `/connector/dist/` | `app/connector/` (Vite bundle) |
 
 ### Disclosure tiers (dev auth)
 
@@ -64,6 +65,17 @@ In development, auth is `mocked`. Anonymous requests resolve to **consumer**; lo
 ## How a passport is created
 
 `generatePassport(batchId, sessionId?)` builds a batch, computes a blake2b-256 `payloadHash` (+ `passportIdHash`), AES-256-GCM-encrypts the payload (HKDF key from `ENCRYPTION_KEY` + passportId), and produces a QR URL. With a `sessionId` it anchors on-chain via the plugin (`anchorDocument` + `bindPassport` / `submitContractCall`), polls `getJobStatus`, then inserts the row. The offline path is live-verified; the on-chain run requires a wallet + DUST + a proof server on preprod.
+
+## Browser connector (Lace)
+
+`app/connector/` is the browser human-attester path: connect a Midnight wallet (Lace) over the DApp-Connector and run `attest` / `grantDisclosure` / `revokeDisclosure` on the AttestationVault directly, in parallel to the server-side submission path. It uses NIGHTGATE's `@odatano/nightgate/browser` building blocks (manifest discovery, zk-config over HTTP, provider assembly, call helpers).
+
+```bash
+npm run build:connector     # Vite build into app/connector/dist (WASM needs Vite, not esbuild)
+npm start                   # serves the page at http://localhost:4004/connector/dist/
+```
+
+Open the page with Lace (Midnight) installed and unlocked, connect, then submit. The flow runs prove (local proof server on :6300) plus balance plus submit via the wallet, so submitting requires the wallet to hold DUST on preprod. The page CSP (`cds.requires.nightgate.contentSecurityPolicy`) must allow `https://*.midnight.network`, and `app/connector/dist` is a gitignored build artifact.
 
 ## Contracts (Compact / Midnight)
 
@@ -90,6 +102,7 @@ db/data/passport-*.csv              CSV seeds
 srv/passport-service.{cds,ts}       PassportService + generatePassport + tier-gating handlers
 srv/server.ts                       QR + resolver Express routes (cds.on bootstrap)
 app/passport/webapp/                SAPUI5 Freestyle app, one app / three routes (consumer, recycler, authority)
+app/connector/                      Browser Lace DApp-Connector page (Vite bundle) for attest / grant / revoke
 contracts/passport-attestation/     Compact contract (bindPassport + AttestationVault pattern) + managed ZK artefacts
 docs/                               architecture.svg/png/md
 tractusx/pac/                       Predicate Attestation Credential glue + indexer-trust verify demo
@@ -102,6 +115,7 @@ tractusx/pac/                       Predicate Attestation Credential glue + inde
 | `npm start` | Serve via `cds-tsx serve` (the only correct way, see note above) |
 | `npm run deploy` | Deploy the merged model to `db/passport.db` |
 | `npm run pac:demo` | Build a Predicate Attestation Credential and verify it the portable way (`tractusx/pac/build-pac.mts`) |
+| `npm run build:connector` | Build the Lace connector page (Vite) into `app/connector/dist` |
 
 ## Status
 
