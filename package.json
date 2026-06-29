@@ -9,7 +9,7 @@
     "url": "https://github.com/ODATANO/NIGHTPASS"
   },
   "dependencies": {
-    "@odatano/nightgate": "0.3.6",
+    "@odatano/nightgate": "file:../NIGHTGATE/odatano-nightgate-0.3.6.tgz",
     "@sap/cds": "^9",
     "express": "^4",
     "qrcode": "^1.5.4"
@@ -21,12 +21,19 @@
     "@sap/cds-dk": "^9.9.2",
     "@types/node": "^24.0.0",
     "@types/qrcode": "^1.5.6",
+    "esbuild": "^0.28.1",
+    "esbuild-plugins-node-modules-polyfill": "^1.8.2",
     "playwright": "^1.60.0",
+    "rollup": "^4.62.2",
     "tsx": "^4",
-    "typescript": "^6.0.3"
+    "typescript": "^6.0.3",
+    "vite": "^8.1.0",
+    "vite-plugin-top-level-await": "^1.6.0",
+    "vite-plugin-wasm": "^3.6.0"
   },
   "scripts": {
     "start": "cds-tsx serve",
+    "build:connector": "vite build app/connector",
     "deploy": "node -e \"const cds=require('@sap/cds');(async()=>{await cds.plugins;const m=await cds.load('*');await cds.deploy(m).to('db');console.log('deployed to db/passport.db')})().catch(e=>{console.error(e);process.exit(1)})\"",
     "pac:demo": "node --experimental-strip-types tractusx/pac/build-pac.mts"
   },
@@ -44,7 +51,7 @@
         "crawler": {
           "enabled": false
         },
-        "contentSecurityPolicy": "default-src 'self' https://ui5.sap.com; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://ui5.sap.com; style-src 'self' 'unsafe-inline' https://ui5.sap.com; img-src 'self' data: blob: https:; font-src 'self' data: https://ui5.sap.com; connect-src 'self' ws: wss: https://ui5.sap.com http://localhost:*",
+        "contentSecurityPolicy": "default-src 'self' https://ui5.sap.com; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://ui5.sap.com; style-src 'self' 'unsafe-inline' https://ui5.sap.com; img-src 'self' data: blob: https:; font-src 'self' data: https://ui5.sap.com; connect-src 'self' ws: wss: https://ui5.sap.com http://localhost:* https://*.midnight.network",
         "contracts": {
           "passport-attestation": {
             "artifactPath": "contracts/passport-attestation/src/managed/passport-attestation/contract/index.js",

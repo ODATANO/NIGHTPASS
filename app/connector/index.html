@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>NIGHTPASS Battery Passport Connector (Lace)</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 760px; margin: 2rem auto; padding: 0 1rem; }
+    fieldset { margin: 1rem 0; }
+    label { display: block; margin: .4rem 0 .1rem; font-size: .85rem; color: #444; }
+    input { width: 100%; padding: .4rem; font-family: monospace; box-sizing: border-box; }
+    button { padding: .5rem 1rem; margin: .5rem .3rem 0 0; cursor: pointer; }
+    #log { background: #111; color: #0f0; font-family: monospace; font-size: .8rem; padding: .8rem; height: 16rem; overflow: auto; white-space: pre-wrap; }
+    .wallets button { background: #f5f5f5; border: 1px solid #ccc; }
+    .hint { font-size: .8rem; color: #777; }
+  </style>
+</head>
+<body>
+  <h1>NIGHTPASS Battery Passport Connector</h1>
+  <p>Browser attester path (Lace): attest Battery Passport data and control tiered disclosure on the AttestationVault.</p>
+  <p class="hint">For a self-contained test, run <b>attest, grant, revoke</b> with the SAME connected wallet (they share one app-managed attester secret). A server-created grant cannot be revoked here (different secret).</p>
+
+  <fieldset>
+    <legend>1. Wallet</legend>
+    <div id="wallets" class="wallets">scanning window.midnight ...</div>
+    <div id="walletStatus"></div>
+  </fieldset>
+
+  <fieldset>
+    <legend>2. Contract</legend>
+    <label>AttestationVault address (deployed)</label>
+    <input id="contractAddress" placeholder="hex" />
+  </fieldset>
+
+  <fieldset>
+    <legend>3. Battery-pass values to hashes</legend>
+    <label>payload value (private content, sha256 to payloadHash)</label>
+    <input id="src_payload" placeholder="e.g. battery-pass:DE-BAT-00042" />
+    <label>metadata value (public type, sha256 to metadataHash)</label>
+    <input id="src_metadata" placeholder='e.g. {"type":"battery-passport","standard":"EU-2023/1542"}' />
+    <button id="hashBtn" type="button">Compute hashes &amp; fill fields</button>
+    <p class="hint">Fills payloadHash and metadataHash below. payloadHash is also copied into grant and revoke so all three target the same attestation.</p>
+  </fieldset>
+
+  <fieldset>
+    <legend>attest(payload_hash, metadata_hash)</legend>
+    <label>payloadHash (32-byte hex)</label>
+    <input id="a_payloadHash" placeholder="64 hex chars" />
+    <label>metadataHash (32-byte hex)</label>
+    <input id="a_metadataHash" placeholder="64 hex chars" />
+    <button id="attestBtn" disabled>Attest</button>
+  </fieldset>
+
+  <fieldset>
+    <legend>grantDisclosure(payload_hash, grantee, level)</legend>
+    <label>payloadHash (32-byte hex)</label>
+    <input id="g_payloadHash" placeholder="64 hex chars" />
+    <label>grantee (32-byte hex)</label>
+    <input id="g_grantee" placeholder="64 hex chars" />
+    <label>level (0=public, 1=legitimate-interest, 2=authority)</label>
+    <input id="g_level" value="1" />
+    <button id="grantBtn" disabled>Grant</button>
+  </fieldset>
+
+  <fieldset>
+    <legend>revokeDisclosure(payload_hash, grantee)</legend>
+    <label>payloadHash (32-byte hex)</label>
+    <input id="r_payloadHash" placeholder="64 hex chars" />
+    <label>grantee (32-byte hex)</label>
+    <input id="r_grantee" placeholder="64 hex chars" />
+    <button id="revokeBtn" disabled>Revoke</button>
+  </fieldset>
+
+  <fieldset>
+    <legend>Log</legend>
+    <div id="log"></div>
+  </fieldset>
+
+  <script type="module">
+    const logEl = document.getElementById('log');
+    const log = (m) => { logEl.textContent += m + '\n'; logEl.scrollTop = logEl.scrollHeight; };
+    const val = (id) => document.getElementById(id).value.trim();
+    let api = null;
+    let connecting = false;
+
+    // Load the bundle dynamically so a load error is visible on the page.
+    let mod;
+    try {
+      mod = await import('./connector.mjs');
+    } catch (e) {
+      document.getElementById('wallets').textContent = 'bundle failed to load, see console / log';
+      log('BUNDLE LOAD ERROR: ' + (e?.stack || e?.message || e));
+      throw e;
+    }
+    const { listWallets, connect, attest, grantDisclosure, revokeDisclosure } = mod;
+
+    // Hash helpers.
+    const toHex = (buf) => Array.from(new Uint8Array(buf)).map((b) => b.toString(16).padStart(2, '0')).join('');
+    const randHex = (n = 32) => { const b = new Uint8Array(n); crypto.getRandomValues(b); return toHex(b); };
+    async function sha256Hex(text) { return toHex(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))); }
+    const setVal = (id, v) => { const el = document.getElementById(id); if (el) el.value = v; };
+    function setPayloadHash(h) { setVal('a_payloadHash', h); setVal('g_payloadHash', h); setVal('r_payloadHash', h); }
+    function setGrantee(g) { setVal('g_grantee', g); setVal('r_grantee', g); }
+
+    // Field persistence + defaults (everything pre-filled on reload).
+    const DEFAULTS = {
+      contractAddress: '1d4304ba2438629585bf3025bdc9edcdd5dbcea8332db08d08ba24e2942c1911',
+      src_payload: 'battery-pass:DE-BAT-00042',
+      src_metadata: '{"type":"battery-passport","standard":"EU-2023/1542"}',
+      g_level: '1'
+    };
+    const PERSIST_IDS = ['contractAddress', 'src_payload', 'src_metadata',
+      'a_payloadHash', 'a_metadataHash', 'g_payloadHash', 'g_grantee', 'g_level',
+      'r_payloadHash', 'r_grantee'];
+    const SKEY = 'nightpass:connector:fields:v1';
+    function saveFields() {
+      const out = {};
+      for (const id of PERSIST_IDS) { const el = document.getElementById(id); if (el) out[id] = el.value; }
+      try { localStorage.setItem(SKEY, JSON.stringify(out)); } catch {}
+    }
+    function loadFields() {
+      let saved = {};
+      try { saved = JSON.parse(localStorage.getItem(SKEY) || '{}'); } catch {}
+      for (const id of PERSIST_IDS) {
+        const el = document.getElementById(id);
+        if (!el) continue;
+        if (saved[id] != null && saved[id] !== '') el.value = saved[id];
+        else if (DEFAULTS[id] != null) el.value = DEFAULTS[id];
+        el.addEventListener('input', saveFields);
+      }
+      // Pre-fill hash + grantee with valid hex on first load so the form is
+      // submit-ready without typing. Persisted, so stable on reload.
+      if (!document.getElementById('a_payloadHash').value) setPayloadHash(randHex());
+      if (!document.getElementById('a_metadataHash').value) setVal('a_metadataHash', randHex());
+      if (!document.getElementById('g_grantee').value) setGrantee(randHex());
+      saveFields();
+    }
+    loadFields();
+
+    document.getElementById('hashBtn').onclick = async () => {
+      const p = val('src_payload'), m = val('src_metadata');
+      if (!p && !m) return log('enter a payload and/or metadata value first');
+      const ph = p ? await sha256Hex(p) : null;
+      const mh = m ? await sha256Hex(m) : null;
+      if (ph) setPayloadHash(ph);
+      if (mh) setVal('a_metadataHash', mh);
+      saveFields();
+      log('hashes computed: payloadHash=' + (ph ?? '(unchanged)') + ' metadataHash=' + (mh ?? '(unchanged)'));
+    };
+
+    function setEnabled(on) {
+      for (const id of ['attestBtn', 'grantBtn', 'revokeBtn']) document.getElementById(id).disabled = !on;
+    }
+
+    function renderWallets() {
+      const ws = listWallets();
+      const el = document.getElementById('wallets');
+      if (!ws.length) {
+        const keys = Object.keys((window.midnight) || {});
+        el.textContent = keys.length
+          ? `window.midnight present but no usable wallet entries: [${keys.join(', ')}]`
+          : 'No Midnight wallet found. Install/enable Lace (Midnight) and reload. (window.midnight is undefined)';
+        return;
+      }
+      el.innerHTML = '';
+      for (const w of ws) {
+        const b = document.createElement('button');
+        b.textContent = `Connect ${w.name}`;
+        b.onclick = async () => {
+          if (api) { log('already connected, reload the page to reconnect.'); return; }
+          if (connecting) { log('connect already in progress, APPROVE the Lace popup (click the Lace icon if you do not see it).'); return; }
+          connecting = true; b.disabled = true;
+          try {
+            log(`connecting ${w.name} (approve the Lace popup)`);
+            api = await connect(w.key);
+            document.getElementById('walletStatus').textContent = `connected: ${w.name}`;
+            setEnabled(true); log('connected.');
+          } catch (e) {
+            log('connect failed: ' + (e?.message || e));
+            b.disabled = false; // allow a fresh single retry
+          } finally { connecting = false; }
+        };
+        el.appendChild(b);
+      }
+    }
+
+    const guard = (fn) => async () => {
+      if (!api) return log('connect a wallet first');
+      try { await fn(); } catch (e) { log('ERROR: ' + (e?.stack || e?.message || e)); }
+    };
+
+    document.getElementById('attestBtn').onclick = guard(() =>
+      attest(api, { contractAddress: val('contractAddress'), payloadHash: val('a_payloadHash'), metadataHash: val('a_metadataHash') }, log));
+    document.getElementById('grantBtn').onclick = guard(() =>
+      grantDisclosure(api, { contractAddress: val('contractAddress'), payloadHash: val('g_payloadHash'), grantee: val('g_grantee'), level: Number(val('g_level')) }, log));
+    document.getElementById('revokeBtn').onclick = guard(() =>
+      revokeDisclosure(api, { contractAddress: val('contractAddress'), payloadHash: val('r_payloadHash'), grantee: val('r_grantee') }, log));
+
+    renderWallets();
+    setTimeout(() => { if (!api && !connecting) renderWallets(); }, 1000);
+  </script>
+</body>
+</html>
