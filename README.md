@@ -68,14 +68,47 @@ In development, auth is `mocked`. Anonymous requests resolve to **consumer**; lo
 
 ## Browser connector (Lace)
 
-`app/connector/` is the browser human-attester path: connect a Midnight wallet (Lace) over the DApp-Connector and run `attest` / `grantDisclosure` / `revokeDisclosure` on the AttestationVault directly, in parallel to the server-side submission path. It uses NIGHTGATE's `@odatano/nightgate/browser` building blocks (manifest discovery, zk-config over HTTP, provider assembly, call helpers).
+`app/connector/` is the browser human-attester path: connect a Midnight wallet (Lace) over the DApp-Connector and run `deploy` / `attest` / `grantDisclosure` / `revokeDisclosure` / `commitValue` / `provePredicate` on the AttestationVault directly. It uses NIGHTGATE's `@odatano/nightgate/browser` building blocks (manifest discovery, zk-config over HTTP, provider assembly, call helpers).
+
+> **Two paths, one contract — automatic vs manual.** The **SAP/CAP app** (`PassportService`, `srv/`) is the production path: `generatePassport` anchors the hash, binds `passportId → payloadHash`, and issues predicate attestations **automatically, in the background**, server-side via NIGHTGATE's worker wallet (async jobs, no UI, no wallet popups). This **browser connector** is the **manual, human-attester path**: the same AttestationVault operations driven interactively from a user's own Lace wallet, with visible steps, balances, and on-chain verification — for demos and self-custodial attestation. Both target the same contract on the same chain; they differ only in *who holds the key* and *whether it is automated*.
 
 ```bash
 npm run build:connector     # Vite build into app/connector/dist (WASM needs Vite, not esbuild)
 npm start                   # serves the page at http://localhost:4004/connector/dist/
 ```
 
-Open the page with Lace (Midnight) installed and unlocked, connect, then submit. The flow runs prove (local proof server on :6300) plus balance plus submit via the wallet, so submitting requires the wallet to hold DUST on preprod. The page CSP (`cds.requires.nightgate.contentSecurityPolicy`) must allow `https://*.midnight.network`, and `app/connector/dist` is a gitignored build artifact.
+### Demo flow (what the page does)
+
+A presentation-ready single page. The **wallet connect sits top-right** and shows live **DUST + NIGHT balances** after connecting (refreshed after every tx); the steps run top to bottom; an optional **activity log** toggles in from the hero. Every on-chain id links to the **Preview Explorer** (`/contracts/0x…`, `/transactions/0x…`).
+
+1. **Contract** — target an existing AttestationVault or **deploy** a fresh one from the wallet. A **Check vault on chain** button confirms (green) whether a vault is already deployed at the address (indexer `contractAction` lookup); auto-runs on load.
+2. **Battery-pass values → hashes** — a full **EU 2023/1542 Annex XIII** passport (private, off-chain) plus its public metadata subset; sha256 → `payloadHash` / `metadataHash`.
+3. **Attest** — anchor the passport hashes on the vault under the wallet's attester identity.
+4. **Disclosure control** — `grantDisclosure` / `revokeDisclosure` per audience tier (0/1/2).
+5. **Predicate proof (`value ≤ threshold`)** — the PAC capability. The hidden value is **pulled from a real passport field** (JSON path, default `carbonFootprint.total_gCO2e_per_kWh`), committed, then proven against a public threshold in zero-knowledge. The value never leaves the browser; only the commitment and a `true` result land on-chain. Lower the threshold to demo a rejected (false) proof.
+6. **Verify on chain** — scans the indexer for a submitted tx; the badge turns green on SUCCESS (auto-runs after every action) with an Explorer link.
+7. **Export Catena-X credential (PAC)** — bundles the attestation + predicate proof into a downloadable Predicate Attestation Credential JSON (W3C-VC-shaped, profile CX-0143) with a **live preview**. `valueDisclosed: false` — the proven value is not included.
+8. **Verify credential (verifier side)** — the consumer loads or pastes a PAC and independently confirms on-chain that its predicate proof is present and SUCCESS, proving the claim **without ever seeing the value** (indexer-trust, CX-0143). Closes the issue → verify loop.
+
+### How it works (key facts)
+
+Open the page with Lace (Midnight) installed, unlocked, and funded with tDUST; connect; optionally click **Deploy new AttestationVault** (the deployed address auto-fills the contract field); then attest / grant / revoke.
+
+- **The network follows the wallet.** Lace's `getConfiguration()` supplies the indexer URI and network id, so the connector targets whatever network Lace is set to. The one literal to match is `NETWORK` in `connector.mjs` (currently `preview`).
+- **Local proof server required.** Prove runs against `http://localhost:6300` (`docker compose -f <NIGHTGATE>/docker/docker-compose.yml up -d proof-server` with `NIGHTGATE_PROOF_NETWORK=<net>`); the hosted proof server omits the CORS header on the POST response, so a browser fetch is blocked.
+- **`submitTx` returns the transaction identifier, not the serialized tx.** The indexer's `watchForTxData(txId)` matches `offset.identifier` against a transaction's `identifiers`. Lace's `submitTransaction` returns `undefined`, so the adapter derives the id via `ledger.Transaction.deserialize('signature','proof','binding', bytes).identifiers()[0]` (with the pre-balance identifier as fallback). Returning the serialized tx instead produced an oversized request and an indexer `Failed to fetch`.
+- The page CSP (`cds.requires.nightgate.contentSecurityPolicy`) must allow `https://*.midnight.network`, and `app/connector/dist` is a gitignored build artifact.
+
+### Live verification (Preview, 2026-06-30)
+
+The full prove -> balance -> submit -> finalize round-trip is live-proven on the Midnight **Preview** network via Lace, both transactions submitted from the funded Lace wallet through the same `makeConnectorWalletAdapter`:
+
+| Step | On-chain result (Preview Explorer links) |
+|---|---|
+| Deploy AttestationVault | contract [`0x89a952c6…65280`](https://preview.midnightexplorer.com/contracts/0x89a952c62503e714ec59e7d1e5d6e54dc5d22bb87234bd62108cb0f684765280) · deploy tx [`0x50017232…17c66`](https://preview.midnightexplorer.com/transactions/0x50017232b3c1e21f42a06e844765249932897f62b4340e8930c0f21f06617c66) (block 1399183, SUCCESS) |
+| `attest(payloadHash, metadataHash)` | tx [`0x1f0f6b10…73b463`](https://preview.midnightexplorer.com/transactions/0x1f0f6b108041f17733acf35b547da2ca727aea6081c3d509397a6c453e73b463) (block 1399202, SUCCESS) |
+
+The Preview public indexer (`https://indexer.preview.midnight.network/api/v4/graphql`, CORS open) resolved each transaction. Note the explorer keys transactions by their 32-byte **hash** (shown above), whereas the SDK watches by the 33-byte transaction **identifier**; the local proof server ran with `--network preview`.
 
 ## Contracts (Compact / Midnight)
 
@@ -119,7 +152,7 @@ tractusx/pac/                       Predicate Attestation Credential glue + inde
 
 ## Status
 
-**Working and verified:** NIGHTGATE plugin mount (23 `midnight_*` tables + both services on :4004); domain schema with Annex XIII tier comments and nested `$expand`; the `passport-attestation` Compact contract (6 circuits / 28 managed artefacts, registered and deploy-ready); the three disclosure UIs with server-side tier gating (browser smoke 12/12 green); QR + resolver; architecture docs.
+**Working and verified:** NIGHTGATE plugin mount (23 `midnight_*` tables + both services on :4004); domain schema with Annex XIII tier comments and nested `$expand`; the `passport-attestation` Compact contract (6 circuits / 28 managed artefacts, registered and deploy-ready); the three disclosure UIs with server-side tier gating (browser smoke 12/12 green); QR + resolver; architecture docs. **Browser connector (Lace) live-verified on Preview** — full wallet-driven demo flow (deploy → attest → commit → zero-knowledge predicate proof → export PAC → verifier-side credential check), with live DUST/NIGHT balances and Explorer-linked on-chain verification; deploy + attest landed on-chain (see [Live verification](#live-verification-preview-2026-06-30)).
 
 **In test / pending live run:** `generatePassport` is live-verified on the offline path (200 + row with 64-hex hashes + encrypted cipher; duplicate → 409, unknown batch → 404); the on-chain run with a wallet is outstanding, blocked on a running Indexer. The PAC verify demo (`verifyPredicateViaIndexer` in `tractusx/pac/`) returns correct `verified:false` until a proven predicate attestation exists.
 

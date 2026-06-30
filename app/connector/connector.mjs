@@ -27,7 +27,7 @@ if (typeof globalThis.global === 'undefined') globalThis.global = globalThis;
 const loadBrowserSdk = () => import('@odatano/nightgate/browser');
 const loadVaultContract = () => import('@odatano/nightgate/browser/attestation-vault');
 
-const NETWORK = 'preprod';
+const NETWORK = 'preview';
 const CONTRACT = 'attestation-vault';
 const PRIVATE_STATE_ID = 'attestationVaultPrivateState';
 
@@ -39,6 +39,95 @@ const PRIVATE_STATE_ID = 'attestationVaultPrivateState';
 // real response, so we self-prove against it instead. Requires the local proof
 // server to be running.
 const LOCAL_PROVER_URL = 'http://localhost:6300';
+
+// Fallback Preview indexer for on-chain verification when no wallet config has
+// been seen yet. Overridden at runtime by the connector's reported indexerUri
+// (so verification follows whatever network the wallet is on).
+const PREVIEW_INDEXER_HTTP = 'https://indexer.preview.midnight.network/api/v4/graphql';
+let _lastIndexerUri = null;
+let _lastSubmittedTxId = null;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** The transaction identifier of the most recent submit (for chain verification). */
+export function getLastTxId() { return _lastSubmittedTxId; }
+
+// Stringify a value for diagnostic logging, surviving bigint.
+function safeStr(x) {
+    try { return JSON.stringify(x, (_k, v) => (typeof v === 'bigint' ? v.toString() : v)); } catch { return String(x); }
+}
+// Await a value that may be a plain value, a Promise, or an Observable.
+async function resolveMaybe(v, log) {
+    try {
+        if (v && typeof v.then === 'function') return await v;
+        if (v && typeof v.subscribe === 'function') {
+            return await new Promise((resolve) => {
+                let done = false; const finish = (x) => { if (!done) { done = true; resolve(x); } };
+                const sub = v.subscribe({ next: (x) => { finish(x); try { sub?.unsubscribe?.(); } catch {} }, error: () => finish(null) });
+                setTimeout(() => finish(null), 8000);
+            });
+        }
+        return v;
+    } catch (e) { log?.(`resolve error: ${e?.message || e}`); return null; }
+}
+// Coerce a scalar-ish balance value to a numeric string.
+function coerceAmount(x) {
+    if (x == null) return null;
+    if (typeof x === 'bigint') return x.toString();
+    if (typeof x === 'number') return String(x);
+    if (typeof x === 'string') return x;
+    if (typeof x === 'object') {
+        for (const k of ['balance', 'available', 'amount', 'value', 'total']) {
+            if (x[k] != null) { const c = coerceAmount(x[k]); if (c != null) return c; }
+        }
+    }
+    return null;
+}
+// Normalize a balances collection (Map | array of {tokenType,amount} | object map | scalar)
+// into [tokenType, amount] entries.
+function balanceEntries(x) {
+    if (x == null) return [];
+    if (x instanceof Map) return [...x.entries()];
+    if (Array.isArray(x)) return x.map((e) => [e?.tokenType ?? e?.type ?? '?', e?.amount ?? e?.value ?? e?.balance ?? e]);
+    const scalar = coerceAmount(x);
+    if (scalar != null && !Object.values(x).some((v) => v && typeof v === 'object')) return [['native', scalar]];
+    if (typeof x === 'object') return Object.entries(x);
+    return [];
+}
+
+/**
+ * Read the connected wallet's DUST + NIGHT balances via the Lace connector's
+ * dedicated getters (getDustBalance / getUnshieldedBalances). Shapes are
+ * runtime-injected, so each raw return is logged and parsed best-effort.
+ * Returns { dust, night } (atomic-unit strings or null).
+ */
+export async function readWalletBalances(api, log = console.log) {
+    const L = mklog(log);
+    let dust = null, night = null;
+
+    try {
+        if (typeof api?.getDustBalance === 'function') {
+            const d = await resolveMaybe(api.getDustBalance(), L);
+            L(`getDustBalance → ${safeStr(d)}`);
+            dust = coerceAmount(d);
+            if (dust == null) { const e = balanceEntries(d); if (e.length) dust = coerceAmount(e[0][1]); }
+        }
+    } catch (e) { L(`getDustBalance error: ${e?.message || e}`); }
+
+    try {
+        if (typeof api?.getUnshieldedBalances === 'function') {
+            const u = await resolveMaybe(api.getUnshieldedBalances(), L);
+            L(`getUnshieldedBalances → ${safeStr(u)}`);
+            const entries = balanceEntries(u);
+            for (const [tt, amt] of entries) L(`  unshielded ${String(tt).slice(0, 28)} = ${safeStr(amt)}`);
+            // NIGHT is the native unshielded token (all-zero token type), else the first / largest.
+            const native = entries.find(([tt]) => /^(0x)?0*$/i.test(String(tt)) || /night/i.test(String(tt))) || entries[0];
+            if (native) night = coerceAmount(native[1]);
+        }
+    } catch (e) { L(`getUnshieldedBalances error: ${e?.message || e}`); }
+
+    L(`wallet balances → DUST=${dust ?? 'n/a'} NIGHT=${night ?? 'n/a'}`);
+    return { dust, night };
+}
 
 /** Discover injected DApp-Connector wallets (window.midnight.*). */
 export function listWallets() {
@@ -124,12 +213,58 @@ function describe(x) {
     return `object ctor=${ctor}${len} keys=[${keys}]`;
 }
 
+/** Decode a serialized tx (hex or base64 string, or Uint8Array) to bytes. */
+function txStringToBytes(s) {
+    if (s instanceof Uint8Array) return s;
+    if (typeof s !== 'string') throw new Error('cannot decode tx of type ' + typeof s);
+    if (/^[0-9a-fA-F]+$/.test(s) && s.length % 2 === 0) {
+        const out = new Uint8Array(s.length / 2);
+        for (let i = 0; i < out.length; i++) out[i] = parseInt(s.substr(i * 2, 2), 16);
+        return out;
+    }
+    const bin = atob(s);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+}
+
+/**
+ * Recover a transaction's identifiers from its serialized (balanced) form. The
+ * indexer's watchForTxData(txId) matches `offset.identifier` against a tx's
+ * `identifiers`, so this is what submitTx must return — NOT the serialized tx.
+ * A fully built+balanced contract tx is signature/proof/binding; we try a few
+ * marker combos defensively. Returns null if none deserialize.
+ */
+function identifiersFromSerialized(ledger, serialized, log) {
+    let bytes;
+    try { bytes = txStringToBytes(serialized); } catch (e) { log(`txId decode failed: ${e?.message}`); return null; }
+    const combos = [
+        ['signature', 'proof', 'binding'],
+        ['signature-erased', 'proof', 'binding'],
+        ['signature', 'proof', 'no-binding']
+    ];
+    for (const [s, p, b] of combos) {
+        try {
+            const t = ledger.Transaction.deserialize(s, p, b, bytes);
+            const ids = t.identifiers();
+            if (ids && ids.length) { log(`deserialized balanced tx (${s}/${p}/${b}) -> ${ids.length} identifier(s)`); return ids; }
+        } catch { /* try next marker combo */ }
+    }
+    return null;
+}
+
 function makeConnectorWalletAdapter(api, walletKeys, ledger, log) {
+    // Captured from the proven (pre-balance) Transaction object the SDK hands to
+    // balanceTx. The contract deploy/call identifier is balancing-independent, so
+    // these survive into the balanced tx and serve as a fallback if we can't
+    // deserialize Lace's balanced string.
+    let preBalanceIdentifiers = null;
     return {
         getCoinPublicKey() { return walletKeys.coinPublicKey; },
         getEncryptionPublicKey() { return walletKeys.encryptionPublicKey; },
         async balanceTx(tx /*, ttl */) {
             log(`balanceTx in: ${describe(tx)} serialize=${typeof tx?.serialize}`);
+            try { if (typeof tx?.identifiers === 'function') { preBalanceIdentifiers = tx.identifiers(); log(`pre-balance identifiers: ${preBalanceIdentifiers?.length}`); } } catch {}
             const serialized = typeof tx?.serialize === 'function' ? tx.serialize() : tx;
             log(`balanceTx serialized: ${describe(serialized)}`);
             let res;
@@ -162,34 +297,55 @@ function makeConnectorWalletAdapter(api, walletKeys, ledger, log) {
         async submitTx(tx) {
             log(`submitTx in: ${describe(tx)} serialize=${typeof tx?.serialize}`);
             const serialized = typeof tx?.serialize === 'function' ? tx.serialize() : tx;
-            const res = await api.submitTransaction(serialized);
+            // The SDK watches by transaction IDENTIFIER, not the serialized tx.
+            // Derive it from the balanced tx (Lace's submitTransaction returns
+            // undefined). Returning the serialized tx here is what produced the
+            // 29KB "txId" → indexer "Failed to fetch".
+            let ids = identifiersFromSerialized(ledger, serialized, log);
+            if ((!ids || !ids.length) && preBalanceIdentifiers?.length) {
+                ids = preBalanceIdentifiers;
+                log(`using pre-balance identifiers as fallback (${ids.length})`);
+            }
+            const txId = ids && ids[0];
+            log(`watch txId: ${txId ?? '(none — watch will fail)'}`);
+            let res;
+            try {
+                res = await api.submitTransaction(serialized);
+            } catch (e) {
+                log(`submitTransaction THREW: name=${e?.name} msg=${e?.message || '(empty)'}`);
+                try { log('  toString: ' + String(e)); } catch {}
+                throw e;
+            }
             log(`submitTransaction returned: ${describe(res)}`);
-            // submitTx must return a TransactionId. Prefer Lace's return value.
-            return res ?? serialized;
+            // submitTx must return a TransactionId. Prefer Lace's return value if
+            // it's a real (short) id string; otherwise the derived identifier.
+            if (typeof res === 'string' && res && res.length < 200) { _lastSubmittedTxId = res; return res; }
+            if (txId) { _lastSubmittedTxId = txId; return txId; }
+            throw new Error('submitTx: could not determine a transaction identifier to watch');
         }
     };
 }
 
 /**
- * Shared path: assemble providers, find the deployed vault bound with the
- * prepared call's witnesses, and invoke the circuit. `call` comes from one of
- * the prepare* helpers ({ circuitId, args, witnesses }).
+ * Assemble providers + load the SDK + set the network + build the wallet adapter
+ * and the witness-bound compiled contract. Shared by deploy and call. `witnesses`
+ * is the AttestationVault witness object (attester secret, etc.) — for deploy it
+ * binds the deployer identity, for a call it satisfies the circuit witnesses.
  */
-async function runPreparedCall(api, contractAddress, call, log) {
-    if (!contractAddress) throw new Error('contractAddress is required (the deployed vault address)');
-
+async function prepareSdkContext(api, witnesses, log) {
     log('fetching manifest…');
     const manifest = await fetchManifest();
 
     log('assembling providers (zk-config from /zk-config, indexer from wallet)…');
     const { createNightgateConnectorProviders } = await loadBrowserSdk();
     const providers = await createNightgateConnectorProviders({ connector: api, manifest, contract: CONTRACT });
+    _lastIndexerUri = providers.config?.indexerUri || _lastIndexerUri;
     log(`indexer: ${providers.config?.indexerUri} (ws ${providers.config?.indexerWsUri})`);
     log(`prover: ${providers.config?.proverServerUri ?? '(none, wallet-delegated)'}`);
     log(`wallet: ${providers.walletKeys?.shieldedAddress ?? '(no address)'}`);
 
     log('loading SDK (contracts + ledger)…');
-    const [{ findDeployedContract }, ledger, { Contract }, { CompiledContract }, networkIdMod, proofMod] = await Promise.all([
+    const [contracts, ledger, { Contract }, { CompiledContract }, networkIdMod, proofMod] = await Promise.all([
         import('@midnight-ntwrk/midnight-js-contracts'),
         import('@midnight-ntwrk/ledger-v8'),
         loadVaultContract(),
@@ -221,7 +377,6 @@ async function runPreparedCall(api, contractAddress, call, log) {
         midnightProvider: walletAdapter
     };
 
-    log(`finding deployed contract for ${call.circuitId}…`);
     // midnight-js-contracts@4.1.0 expects a compact-js `CompiledContract`
     // (tagged + witnesses), not a raw `new Contract(witnesses)` instance. Wrap
     // our classic compactc artifact: make(tag, ctor) attaches the constructor,
@@ -230,15 +385,29 @@ async function runPreparedCall(api, contractAddress, call, log) {
     // to compact-js getContractContext → "reading 'Symbol()'" crash.)
     const compiledContract = CompiledContract.withWitnesses(
         CompiledContract.make(CONTRACT, Contract),
-        call.witnesses
+        witnesses
     );
     // AttestationVault has NO contract private state (all ledger is public,
     // witnesses pass ctx.privateState through). We still must seed a DEFINED
-    // value: both findDeployedContract and the callTx scoped transaction read
-    // the private state and assertDefined rejects null/undefined. An empty
+    // value: deploy, findDeployedContract and the callTx scoped transaction all
+    // read the private state and assertDefined rejects null/undefined. An empty
     // object satisfies that and flows through the witnesses unchanged.
     await fullProviders.privateStateProvider.set(PRIVATE_STATE_ID, {});
-    const deployed = await findDeployedContract(fullProviders, {
+
+    return { fullProviders, compiledContract, contracts };
+}
+
+/**
+ * Shared path: assemble providers, find the deployed vault bound with the
+ * prepared call's witnesses, and invoke the circuit. `call` comes from one of
+ * the prepare* helpers ({ circuitId, args, witnesses }).
+ */
+async function runPreparedCall(api, contractAddress, call, log) {
+    if (!contractAddress) throw new Error('contractAddress is required (the deployed vault address)');
+    const { fullProviders, compiledContract, contracts } = await prepareSdkContext(api, call.witnesses, log);
+
+    log(`finding deployed contract for ${call.circuitId}…`);
+    const deployed = await contracts.findDeployedContract(fullProviders, {
         contractAddress, compiledContract,
         privateStateId: PRIVATE_STATE_ID,
         initialPrivateState: {}
@@ -248,6 +417,38 @@ async function runPreparedCall(api, contractAddress, call, log) {
     const result = await deployed.callTx[call.circuitId](...call.args);
     log(`submitted ${call.circuitId}: ${JSON.stringify(result?.public?.txId ?? result)}`);
     return result;
+}
+
+/**
+ * Deploy a fresh AttestationVault from the connected (funded) wallet. Returns
+ * the deployed contract address. Uses the SAME app-managed attester secret as
+ * attest/grant/revoke so the deployer-bound attester identity matches — a vault
+ * deployed here can be attested + disclosure-managed by this same wallet.
+ *
+ * This is also the first real exercise of makeConnectorWalletAdapter's
+ * prove→balance→submit path; if deploy lands on-chain the adapter boundary is
+ * confirmed and the circuit calls follow the identical wallet round-trip.
+ */
+export async function deployVault(api, log = console.log) {
+    const L = mklog(log);
+    L('deploy: loading browser SDK (first call downloads ~10MB WASM, please wait)…');
+    const { buildAttestationVaultWitnesses } = await loadBrowserSdk();
+    L('deploy: deriving app-managed attester secret (binds the deployer identity)…');
+    const attestationSecret = await deriveAttesterSecret(api);
+    const witnesses = buildAttestationVaultWitnesses({ attestationSecret });
+    const { fullProviders, compiledContract, contracts } = await prepareSdkContext(api, witnesses, L);
+
+    L('deploying attestation-vault (prove + balance + submit via wallet)…');
+    const result = await contracts.deployContract(fullProviders, {
+        compiledContract,
+        privateStateId: PRIVATE_STATE_ID,
+        initialPrivateState: {}
+    });
+    const addr = result?.deployTxData?.public?.contractAddress
+        ?? result?.public?.contractAddress
+        ?? result?.contractAddress;
+    L(`deployed attestation-vault at: ${addr ?? '(address not found in result)'}`);
+    return { contractAddress: addr, result };
 }
 
 function mklog(log) {
@@ -282,4 +483,148 @@ export async function revokeDisclosure(api, { contractAddress, payloadHash, gran
     L('revoke: deriving app-managed attester secret (no wallet popup)…');
     const attestationSecret = await deriveAttesterSecret(api);
     return runPreparedCall(api, contractAddress, prepareRevokeDisclosure({ payloadHash, grantee, attestationSecret }), L);
+}
+
+// --- Predicate Attestation (value ≤ / ≥ threshold, value stays off-chain) ----
+// Two-step PAC flow on the AttestationVault:
+//   1) commitValue(payload_hash)            — pins a Pedersen-style commitment to
+//      the hidden value+salt on-chain (the value itself is a witness, never sent).
+//   2) provePredicate(payload_hash, threshold, op) — proves value ≤ threshold
+//      (op 0) or value ≥ threshold (op 1) against that commitment in-circuit; the
+//      tx only lands if the assert holds, so a successful tx IS the proof, and
+//      the chain records predicate_results[claim]=true WITHOUT the value.
+// Both witness attested_value()+value_salt(), so the SAME value+salt must be used
+// for commit and prove (and the payload must already be attested by this wallet).
+
+/** commitValue(payload_hash) — attach a hidden numeric commitment. */
+export async function commitValue(api, { contractAddress, payloadHash, value, valueSalt }, log = console.log) {
+    const L = mklog(log);
+    L('commitValue: loading browser SDK…');
+    const { buildAttestationVaultWitnesses } = await loadBrowserSdk();
+    L('commitValue: deriving app-managed attester secret…');
+    const attestationSecret = await deriveAttesterSecret(api);
+    const call = {
+        circuitId: 'commitValue',
+        args: [fromHex(payloadHash)],
+        witnesses: buildAttestationVaultWitnesses({ attestationSecret, witnessValues: { attestedValue: String(value), valueSalt } })
+    };
+    L(`committing hidden value (only its commitment goes on-chain)…`);
+    return runPreparedCall(api, contractAddress, call, L);
+}
+
+/** provePredicate(payload_hash, threshold, op) — op 0 = value ≤ threshold, 1 = value ≥ threshold. */
+export async function provePredicate(api, { contractAddress, payloadHash, value, valueSalt, threshold, op }, log = console.log) {
+    const L = mklog(log);
+    L('provePredicate: loading browser SDK…');
+    const { buildAttestationVaultWitnesses } = await loadBrowserSdk();
+    L('provePredicate: deriving app-managed attester secret…');
+    const attestationSecret = await deriveAttesterSecret(api);
+    const opNum = Number(op);
+    const call = {
+        circuitId: 'provePredicate',
+        args: [fromHex(payloadHash), BigInt(threshold), BigInt(opNum)],
+        witnesses: buildAttestationVaultWitnesses({ attestationSecret, witnessValues: { attestedValue: String(value), valueSalt } })
+    };
+    L(`proving ${value} ${opNum === 0 ? '≤' : '≥'} ${threshold} in zero-knowledge (the value never leaves the browser)…`);
+    const result = await runPreparedCall(api, contractAddress, call, L);
+    L(`✓ predicate proven on-chain: ${value} ${opNum === 0 ? '≤' : '≥'} ${threshold} holds — verified without revealing ${value}.`);
+    return result;
+}
+
+// --- On-chain verification (indexer scan) -----------------------------------
+// The verification model is indexer-trust: a tx that landed in a block with
+// status SUCCESS is confirmed. Polls the Preview indexer (HTTP GraphQL) for the
+// transaction by its identifier and reports status via onStatus(kind, text):
+//   'scanning' (in progress) | 'ok' (found, SUCCESS) | 'fail' (failed / not found).
+const VERIFY_TX_QUERY = `query VerifyTx($offset: TransactionOffset!) {
+  transactions(offset: $offset) {
+    hash
+    block { height }
+    ... on RegularTransaction { transactionResult { status } }
+  }
+}`;
+
+export async function verifyTxOnChain(txId, opts = {}, log = console.log, onStatus = () => {}) {
+    const L = mklog(log);
+    if (!txId) { onStatus('fail', 'no tx id'); throw new Error('verifyTxOnChain: txId required'); }
+    const url = opts.indexerUrl || _lastIndexerUri || PREVIEW_INDEXER_HTTP;
+    const attempts = opts.attempts ?? 20;
+    const delayMs = opts.delayMs ?? 2000;
+    L(`verify: scanning chain for tx ${String(txId).slice(0, 18)}… via ${url}`);
+    for (let i = 0; i < attempts; i++) {
+        onStatus('scanning', `scanning chain… (${i + 1}/${attempts})`);
+        try {
+            const res = await fetch(url, {
+                method: 'POST',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ query: VERIFY_TX_QUERY, variables: { offset: { identifier: txId } } })
+            });
+            const json = await res.json();
+            const tx = (json?.data?.transactions || [])[0];
+            if (tx) {
+                const status = tx?.transactionResult?.status || 'UNKNOWN';
+                const height = tx?.block?.height;
+                const hash = tx?.hash; // 32-byte tx hash = the explorer's tx key (≠ identifier)
+                if (/SUCCESS/i.test(status)) {
+                    onStatus('ok', `on-chain ✓  block ${height} · ${status}`, hash);
+                    L(`verify: ✓ found in block ${height}, status ${status}, hash ${hash}`);
+                    return { found: true, status, blockHeight: height, hash };
+                }
+                onStatus('fail', `on-chain but ${status}`, hash);
+                L(`verify: found but status ${status}`);
+                return { found: true, status, blockHeight: height, hash };
+            }
+        } catch (e) {
+            L(`verify: scan attempt ${i + 1} error: ${e?.message || e}`);
+        }
+        await sleep(delayMs);
+    }
+    onStatus('fail', 'not found (scan timed out)');
+    L('verify: not found within scan window');
+    return { found: false };
+}
+
+// --- Vault presence check ---------------------------------------------------
+// Look up whether a contract is deployed at `address` by asking the indexer for
+// its latest contractAction. Non-null = the vault exists on this network.
+// onStatus(kind, text): 'scanning' | 'ok' (exists) | 'fail' (not found / error).
+const CHECK_VAULT_QUERY = `query CheckVault($address: HexEncoded!) {
+  contractAction(address: $address) {
+    __typename
+    ... on ContractDeploy { transaction { hash block { height } } }
+    ... on ContractCall { transaction { hash block { height } } }
+    ... on ContractUpdate { transaction { hash block { height } } }
+  }
+}`;
+
+export async function checkVaultExists(address, opts = {}, log = console.log, onStatus = () => {}) {
+    const L = mklog(log);
+    const addr = String(address || '').trim().replace(/^0x/, '');
+    if (!/^[0-9a-fA-F]{64}$/.test(addr)) { onStatus('fail', 'enter a 64-hex contract address'); return { exists: false }; }
+    const url = opts.indexerUrl || _lastIndexerUri || PREVIEW_INDEXER_HTTP;
+    onStatus('scanning', 'checking chain…');
+    L(`check: looking up contract ${addr.slice(0, 16)}… via ${url}`);
+    try {
+        const res = await fetch(url, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ query: CHECK_VAULT_QUERY, variables: { address: addr } })
+        });
+        const json = await res.json();
+        const action = json?.data?.contractAction;
+        if (action) {
+            const kind = action.__typename || 'contract';
+            const height = action?.transaction?.block?.height;
+            onStatus('ok', `vault exists on-chain ✓ (${kind}${height ? `, latest block ${height}` : ''})`);
+            L(`check: ✓ contract present (${kind})`);
+            return { exists: true, kind, blockHeight: height };
+        }
+        onStatus('fail', 'not deployed on this network — deploy one');
+        L('check: contract not found');
+        return { exists: false };
+    } catch (e) {
+        onStatus('fail', 'check error: ' + (e?.message || e));
+        L(`check: error ${e?.message || e}`);
+        return { exists: false, error: String(e?.message || e) };
+    }
 }
