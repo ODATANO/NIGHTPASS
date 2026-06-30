@@ -172,7 +172,7 @@
     <section class="col-main">
       <div class="card">
         <h2><span class="step">1</span> Contract</h2>
-        <p class="sub">Target an existing AttestationVault, or deploy a fresh one from the connected wallet (costs tDUST). The deployed address auto-fills below.</p>
+        <p class="sub">Use an existing vault, or deploy a fresh one from your wallet.</p>
         <label>AttestationVault address (deployed)</label>
         <input id="contractAddress" placeholder="hex" />
         <button id="checkVaultBtn" class="btn btn-ghost" type="button">Check vault on chain</button>
@@ -182,7 +182,7 @@
 
       <div class="card">
         <h2><span class="step">2</span> Battery-pass values → hashes</h2>
-        <p class="sub">The full passport is the <b>private</b> content (stays off-chain, AES-encrypted by the issuer); only its sha256 <span class="sig">payloadHash</span> is anchored. The public metadata (Tier-1, consumer-visible) hashes to <span class="sig">metadataHash</span>. payloadHash is copied into commit/grant/revoke so everything targets the same attestation.</p>
+        <p class="sub">Private passport → <span class="sig">payloadHash</span>, public metadata → <span class="sig">metadataHash</span>.</p>
         <label>payload value — full EU 2023/1542 Annex XIII passport (private, off-chain)</label>
         <textarea id="src_payload" class="payload" spellcheck="false" placeholder="full battery passport JSON"></textarea>
         <label>metadata value — public subset (on-chain-anchored type)</label>
@@ -192,7 +192,7 @@
 
       <div class="card">
         <h2><span class="step">3</span> Attest <span class="sig">attest(payload_hash, metadata_hash)</span></h2>
-        <p class="sub">Anchor the passport: record the payload + metadata hashes on the vault under your attester identity.</p>
+        <p class="sub">Anchor the passport hashes on the vault under your attester identity.</p>
         <div class="row2">
           <div>
             <label>payloadHash (32-byte hex)</label>
@@ -208,7 +208,7 @@
 
       <div class="card">
         <h2><span class="step">4</span> Disclosure control</h2>
-        <p class="sub">Grant or revoke an audience's access to a passport. <span class="sig">grantDisclosure(payload_hash, grantee, level)</span> · <span class="sig">revokeDisclosure(payload_hash, grantee)</span></p>
+        <p class="sub">Grant or revoke an audience's access to a passport.</p>
         <div class="row2">
           <div>
             <label>payloadHash · grant</label>
@@ -227,19 +227,18 @@
             <button id="revokeBtn" class="btn btn-danger" disabled>Revoke</button>
           </div>
         </div>
-        <div class="note">For a self-contained demo, run <b>attest → grant → revoke</b> with the same connected wallet (they share one app-managed attester secret). A server-created grant cannot be revoked here (different secret).</div>
       </div>
 
       <div class="card">
         <h2><span class="step">5</span> Predicate proof <span class="sig">value ≤ threshold</span></h2>
-        <p class="sub">The PAC capability: take a real field <b>out of the passport above</b>, commit it (hidden), and prove it satisfies a bound (e.g. "carbon footprint ≤ 50000 gCO₂e/kWh") <b>without revealing the value</b>. Only the commitment and a <span class="sig">true</span> result land on-chain. Uses the payloadHash from step 3, so attest first. To demo a failing proof, lower the threshold below the passport value.</p>
+        <p class="sub">Take a field from the passport, commit it, and prove <b>value ≤ threshold</b> in zero-knowledge — <b>without revealing the value</b>. Attest first; lower the threshold for a failing proof.</p>
         <label>payloadHash (the attested payload to bind the value to)</label>
         <input id="p_payloadHash" placeholder="64 hex chars" />
         <div class="row2">
           <div>
             <label>source field — JSON path in the passport</label>
             <input id="p_field" placeholder="e.g. carbonFootprint.total_gCO2e_per_kWh" />
-            <label>hidden value (derived from the passport, stays off-chain)</label>
+            <label>hidden value (from the passport)</label>
             <input id="p_value" readonly placeholder="auto-pulled from the passport field" />
             <button id="pullBtn" type="button" class="btn btn-ghost">↻ Pull value from passport</button>
             <label>value salt (32-byte hex, commitment opening)</label>
@@ -253,18 +252,18 @@
               <option value="0">value ≤ threshold</option>
               <option value="1">value ≥ threshold</option>
             </select>
-            <label>unit / claim (for the credential)</label>
+            <label>unit / claim</label>
             <input id="p_unit" placeholder="e.g. gCO2e/kWh" />
           </div>
         </div>
         <button id="commitBtn" class="btn btn-ghost" disabled>1 · Commit value</button>
         <button id="proveBtn" class="btn btn-primary" disabled>2 · Prove predicate</button>
-        <p class="hint">A successful <span class="sig">provePredicate</span> tx <b>is</b> the proof: the circuit asserts the bound in-zero-knowledge, so the chain only accepts it when the hidden value actually satisfies it. The value never leaves this browser.</p>
+        <p class="hint">A successful <span class="sig">provePredicate</span> tx <b>is</b> the proof — the chain only accepts it if the hidden value satisfies the bound.</p>
       </div>
 
       <div class="card">
         <h2><span class="step">6</span> Verify on chain</h2>
-        <p class="sub">Scan the Preview indexer for a submitted transaction. The badge turns <b style="color:var(--green)">green</b> when the tx is found in a block with status SUCCESS. Runs automatically after every action (the last tx id fills in below); you can also paste an id and scan manually.</p>
+        <p class="sub">Scan the indexer for a tx; <b style="color:var(--green)">green</b> = found in a block with SUCCESS. Auto-runs after every action.</p>
         <label>transaction id (identifier)</label>
         <input id="v_txId" placeholder="filled automatically after an action, or paste one" />
         <button id="verifyBtn" class="btn btn-ghost" type="button">Scan chain</button>
@@ -273,7 +272,7 @@
 
       <div class="card">
         <h2><span class="step">7</span> Export Catena-X credential (PAC)</h2>
-        <p class="sub">Bundle the attestation + zero-knowledge predicate proof into a downloadable <b>Predicate Attestation Credential</b> — the artifact that rides into a Catena-X (CX-0143) dataspace over the EDC data plane. The hidden value is <b>not</b> included; only the proven predicate and its on-chain proof reference (tx hash, block, SUCCESS).</p>
+        <p class="sub">Bundle attestation + predicate proof into a downloadable Catena-X credential (PAC). The hidden value is <b>not</b> included.</p>
         <label>preview (live — this is exactly what downloads)</label>
         <pre id="pacPreview" class="pac-pre">…</pre>
         <button id="exportBtn" class="btn btn-primary" type="button">Download credential (JSON)</button>
@@ -282,7 +281,7 @@
 
       <div class="card">
         <h2><span class="step">8</span> Verify credential (verifier side)</h2>
-        <p class="sub">The consumer/verifier side, closing the loop: take a PAC and independently confirm on-chain that its predicate proof is present and SUCCESS — proving the claim holds <b>without ever seeing the value</b>. This is the indexer-trust verification a Catena-X (CX-0143) consumer runs against the credential alone.</p>
+        <p class="sub">Verifier side: confirm a PAC's predicate proof on-chain (SUCCESS) — the claim holds <b>without ever seeing the value</b>.</p>
         <button id="loadCredBtn" class="btn btn-ghost" type="button">↧ Load current credential</button>
         <textarea id="v_pac" class="metadata" spellcheck="false" placeholder="paste a Predicate Attestation Credential (PAC) JSON, or load the current one…"></textarea>
         <button id="verifyCredBtn" class="btn btn-primary" type="button">Verify credential</button>
