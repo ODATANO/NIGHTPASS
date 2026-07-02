@@ -9,7 +9,7 @@
     "url": "https://github.com/ODATANO/NIGHTPASS"
   },
   "dependencies": {
-    "@odatano/nightgate": "0.4.2",
+    "@odatano/nightgate": "^0.4.3",
     "@sap/cds": "^9",
     "express": "^4",
     "qrcode": "^1.5.4"
@@ -34,8 +34,10 @@
   "scripts": {
     "start": "cds-tsx serve",
     "build:connector": "vite build app/connector",
+    "build:connector-lib": "vite build app/connector -c app/connector/vite.lib.config.mjs",
     "deploy": "node -e \"const cds=require('@sap/cds');(async()=>{await cds.plugins;const m=await cds.load('*');await cds.deploy(m).to('db');console.log('deployed to db/passport.db')})().catch(e=>{console.error(e);process.exit(1)})\"",
-    "pac:demo": "node --experimental-strip-types tractusx/pac/build-pac.mts"
+    "pac:demo": "node --experimental-strip-types tractusx/pac/build-pac.mts",
+    "producer:smoke": "node test/integration/producer-smoke.mjs"
   },
   "cds": {
     "requires": {
@@ -48,39 +50,22 @@
       "nightgate": {
         "kind": "nightgate",
         "network": "preview",
+        "granteeBinding": "did",
         "crawler": {
           "enabled": false
         },
         "contentSecurityPolicy": "default-src 'self' https://ui5.sap.com; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://ui5.sap.com; style-src 'self' 'unsafe-inline' https://ui5.sap.com; img-src 'self' data: blob: https:; font-src 'self' data: https://ui5.sap.com; connect-src 'self' ws: wss: https://ui5.sap.com http://localhost:* https://*.midnight.network",
         "contracts": {
-          "passport-attestation": {
-            "artifactPath": "contracts/passport-attestation/src/managed/passport-attestation/contract/index.js",
-            "privateStateId": "passportAttestationPrivateState",
-            "zkConfigPath": "contracts/passport-attestation/src/managed/passport-attestation"
+          "attestation-vault": {
+            "artifactPath": "node_modules/@odatano/nightgate/contracts/attestation-vault/src/managed/attestation-vault/contract/index.js",
+            "privateStateId": "attestationVaultPrivateState",
+            "zkConfigPath": "node_modules/@odatano/nightgate/contracts/attestation-vault/src/managed/attestation-vault"
           }
         }
-      }
-    },
-    "[development]": {
-      "requires": {
-        "auth": {
-          "kind": "mocked",
-          "users": {
-            "recycler": {
-              "password": "recycler",
-              "roles": [
-                "recycler"
-              ]
-            },
-            "authority": {
-              "password": "authority",
-              "roles": [
-                "authority",
-                "recycler"
-              ]
-            }
-          }
-        }
+      },
+      "auth": {
+        "kind": "custom",
+        "impl": "srv/auth.js"
       }
     },
     "odata": {

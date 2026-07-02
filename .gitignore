@@ -50,6 +50,7 @@ test/screenshots/
 CLAUDE.md
 CAP_GUIDE.MD
 IMPLEMENTATION.MD
+docs/development.md
 
 # internal dev/helper scripts (not part of the published repo)
 docs/render-diagram.mjs
@@ -64,6 +65,7 @@ tractusx/pac/verify-via-nightgate.mts
 .gitkeep
 # Connector browser bundle (build artifact, large WASM)
 app/connector/dist/
+app/connector/lib/
 
 # Personal/local-only notes (not for GitHub)
 app/connector/ERKLAERUNG.md

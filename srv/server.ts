@@ -1,6 +1,8 @@
 import cds from '@sap/cds';
 import QRCode from 'qrcode';
 
+const { SELECT } = cds.ql;
+
 /**
  * NIGHTPASS bootstrap extras (T23): the public QR landing resolver and the QR
  * image endpoint. Registered on the Express app before CAP's services so a
@@ -39,6 +41,24 @@ cds.on('bootstrap', (app: any) => {
             res.end(png);
         } catch (e: any) {
             res.status(500).end(String(e?.message ?? e));
+        }
+    });
+
+    // --- Supplier resolve by on-chain hash: GET /resolve/:payloadHash --------
+    // A supplier handed only the passport payloadHash resolves the exact battery:
+    // look up its passportId and 302 into the tier-gated viewer (their disclosure
+    // grant / role decides how much they see).
+    app.get('/resolve/:payloadHash', async (req: any, res: any) => {
+        const payloadHash = String(req.params.payloadHash || '').replace(/^0x/, '').toLowerCase();
+        if (!/^[0-9a-f]{64}$/.test(payloadHash)) return res.status(400).end('invalid payloadHash');
+        try {
+            const row: any = await SELECT.one.from('passport.Passports').columns('passportId').where({ payloadHash });
+            if (!row) return res.status(404).end('no battery for that payloadHash');
+            const tier = tierFromAuth(req.headers.authorization);
+            const hash = tier === 'consumer' ? '' : `#/${tier}`;
+            return res.redirect(302, `/passport/webapp/index.html?p=${encodeURIComponent(row.passportId)}${hash}`);
+        } catch (e: any) {
+            return res.status(500).end(String(e?.message ?? e));
         }
     });
 });

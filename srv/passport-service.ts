@@ -1,11 +1,10 @@
 import cds from '@sap/cds';
-import { blake2b } from '@noble/hashes/blake2b';
-import { bytesToHex } from '@noble/hashes/utils';
-import { createCipheriv, hkdfSync, randomBytes } from 'node:crypto';
 import QRCode from 'qrcode';
-import { Passport, Passports } from '#cds-models/passport';
+import { Passport, Passports, PredicateProofLog, Partners } from '#cds-models/passport';
+import { hashPayload, blake2b256Hex, encryptPayload, anchorPassport } from './lib/passport-anchor';
+import { granteeIdForDid } from './lib/grantee';
 
-const { INSERT, SELECT } = cds.ql;
+const { INSERT, SELECT, UPDATE } = cds.ql;
 
 // --- Disclosure tiers (T20) --------------------------------------------------
 //
@@ -64,18 +63,45 @@ async function granteesOf(req: cds.Request): Promise<string[]> {
     return grantees;
 }
 
-/** On-chain tier granted to the requester for one passport (by payloadHash). */
-async function onChainTierForPayload(req: cds.Request, payloadHash: unknown): Promise<Tier> {
-    if (typeof payloadHash !== 'string' || !payloadHash) return 'consumer';
-    const grantees = await granteesOf(req);
-    if (!grantees.length) return 'consumer';
+/**
+ * Effective disclosure grants for a set of grantee ids → Map(payloadHash → maxLevel).
+ * Unions two sources so the demo works offline and stays on-chain-ready:
+ *   (a) on-chain indexed grants  (`midnight.DisclosureGrants`, active) — real ACL.
+ *   (b) producer-side offline log (`passport.DisclosureGrantLog`) — latest op per
+ *       (payloadHash, grantee); counts only if the newest op is `grant`.
+ */
+async function effectiveGrantsFor(grantees: string[]): Promise<Map<string, number>> {
+    const out = new Map<string, number>();
+    if (!grantees.length) return out;
+    const bump = (ph: unknown, lvl: unknown) => {
+        if (typeof ph !== 'string' || !ph) return;
+        const n = Number(lvl) || 0;
+        out.set(ph, Math.max(out.get(ph) ?? -1, n));
+    };
+    // (a) on-chain
     try {
-        const grants = await cds.db.read('midnight.DisclosureGrants')
-            .columns('level').where({ payloadHash, grantee: { in: grantees }, active: true });
-        let lvl = 0;
-        for (const g of grants) lvl = Math.max(lvl, Number((g as Record<string, unknown>).level) || 0);
-        return levelToTier(lvl);
-    } catch { return 'consumer'; }
+        const rows = await cds.db.read('midnight.DisclosureGrants')
+            .columns('payloadHash', 'level').where({ grantee: { in: grantees }, active: true });
+        for (const g of rows as Record<string, unknown>[]) bump(g.payloadHash, g.level);
+    } catch { /* plugin tables absent */ }
+    // (b) offline producer log: latest op per (passport, grantee); if it's a
+    // `grant`, map passport_ID → payloadHash and count it.
+    try {
+        const rows = await SELECT.from('passport.DisclosureGrantLog')
+            .columns('grantee', 'level', 'op', 'createdAt', 'passport_ID')
+            .where({ grantee: { in: grantees } })
+            .orderBy('createdAt asc');
+        const latest = new Map<string, Record<string, unknown>>();
+        for (const r of rows as Record<string, unknown>[]) latest.set(`${r.passport_ID}|${r.grantee}`, r);
+        const granted = [...latest.values()].filter((r) => r.op === 'grant');
+        if (granted.length) {
+            const ids = [...new Set(granted.map((r) => r.passport_ID))];
+            const ps = await SELECT.from(Passports).columns('ID', 'payloadHash').where({ ID: { in: ids } });
+            const idToHash = new Map((ps as Record<string, unknown>[]).map((p) => [p.ID, p.payloadHash]));
+            for (const r of granted) bump(idToHash.get(r.passport_ID), r.level);
+        }
+    } catch { /* no offline grants */ }
+    return out;
 }
 
 /** Fields on Passports beyond Annex XIII Point 1. Authority-only lineage. */
@@ -149,6 +175,9 @@ function asRows(data: unknown): Record<string, unknown>[] {
 export default class PassportService extends cds.ApplicationService {
     override async init(): Promise<void> {
         this.on('generatePassport', this.generatePassport);
+        this.on('resolveByHash', this.resolveByHash);
+        this.on('passportCredential', this.passportCredential);
+        this.on('registerPartner', this.registerPartner);
 
         // Disclosure-tier gating (T20): redact restricted fields per requester
         // tier on every read (the Annex XIII boundary). Base tier is the
@@ -157,12 +186,35 @@ export default class PassportService extends cds.ApplicationService {
         // projections (unqualified names, relative to PassportService), not the
         // db-level `passport.*` entities the cds-typer classes resolve to, which
         // a service READ never matches.
+        // The disclosure gate matches grants by payloadHash, so it must be in the
+        // row even when the client didn't $select it. Inject it up front; it is
+        // then stripped again by redactPassport for non-authority tiers.
+        this.before('READ', 'Passports', (req) => {
+            const cols = (req.query as any)?.SELECT?.columns as any[] | undefined;
+            if (Array.isArray(cols) && !cols.some((c) => c === '*' || (c?.ref && c.ref[0] === 'payloadHash'))) {
+                cols.push({ ref: ['payloadHash'] });
+            }
+        });
+
         this.after('READ', 'Passports', async (data, req) => {
             const local = localTierOf(req);
+            const grantees = await granteesOf(req);
+            // A registered dataspace partner (DID login, role 'partner') has no
+            // local tier — the GRANT LEVEL per passport drives disclosure, and
+            // they see ONLY passports granted to them. Built-in demo users and
+            // the producer keep role-based behavior (no list scoping).
+            const isPartner = !!req.user?.is?.('partner');
+            const effective = grantees.length ? await effectiveGrantsFor(grantees) : null;
+            const kept: Record<string, unknown>[] = [];
             for (const row of asRows(data)) {
-                const tier = maxTier(local, await onChainTierForPayload(req, row.payloadHash));
-                redactPassport(row, tier);
+                const ph = typeof row.payloadHash === 'string' ? row.payloadHash : '';
+                const grantLvl = effective && ph ? (effective.get(ph) ?? -1) : -1;
+                if (isPartner && grantLvl < 0) continue; // partner: granted passports only
+                const grantTier: Tier = grantLvl >= 0 ? levelToTier(grantLvl) : 'consumer';
+                redactPassport(row, maxTier(local, grantTier));
+                kept.push(row);
             }
+            if (isPartner && Array.isArray(data)) data.splice(0, data.length, ...kept);
         });
         // Direct child reads carry no passport scope, so on-chain (per-attestation)
         // grants can't be resolved here; gate on the local role only.
@@ -202,9 +254,8 @@ export default class PassportService extends cds.ApplicationService {
         //    the payload body stays off-chain (encrypted, step 3). The passportId
         //    is a human string, so derive a stable Bytes<32> id for the on-chain
         //    binding by hashing it the same way.
-        const canonicalPayload = canonicalize(batch.payload);
-        const payloadHash = bytesToHex(blake2b(Buffer.from(canonicalPayload, 'utf8'), { dkLen: 32 }));
-        const passportIdHash = bytesToHex(blake2b(Buffer.from(passportId, 'utf8'), { dkLen: 32 }));
+        const { canonicalPayload, payloadHash } = hashPayload(batch.payload);
+        const passportIdHash = blake2b256Hex(passportId);
 
         // 3. Encrypt the payload with a per-passport key derived from passportId.
         const payloadCipher = encryptPayload(canonicalPayload, passportId);
@@ -213,39 +264,19 @@ export default class PassportService extends cds.ApplicationService {
         const qrCodeUrl = `${demoHost}/p/${passportId}`;
         const contractAddress = process.env.PASSPORT_CONTRACT_ADDRESS ?? null;
 
-        // 4 + 5. On-chain anchor (only when a signing session is supplied).
+        // 4 + 5. On-chain anchor (only when a signing session is supplied):
+        // anchorDocument (AttestationVault.attest) + bindPassport, shared with the
+        // producer cockpit via srv/lib/passport-anchor.
         let attestationTxHash: string | null = null;
         if (sessionId) {
-            const nightgate = await cds.connect.to('nightgate');
-            // anchorDocument hex-decodes sha256 and calls AttestationVault.attest
-            // on our registered contract. contractAddress must be a deployment of
-            // 'passport-attestation' the session can sign for.
             if (!contractAddress) {
                 return req.reject(400,
                     'PASSPORT_CONTRACT_ADDRESS env is required for on-chain anchoring (a deployed passport-attestation address)');
             }
-            const anchor: any = await nightgate.send('anchorDocument', {
-                sha256:              payloadHash,
-                storageRef:          `passport://${passportId}`,
-                sessionId,
-                contractAddress,
-                contentType:         'application/json',
-                compiledArtifactRef: 'passport-attestation'
-            });
-            attestationTxHash = await waitForJob(nightgate, anchor.jobId, sessionId);
-
-            // Anchor the passportId → payload_hash binding on-chain via the
-            // passport-attestation `bindPassport` circuit. Args are Bytes<32>,
-            // passed as hex strings and coerced server-side (NIGHTGATE 0.3.2
-            // arg-coercion, FR submitcontractcall-bytes-args.md, RESOLVED).
-            const bind: any = await nightgate.send('submitContractCall', {
-                contractAddress,
-                circuit:             'bindPassport',
-                compiledArtifactRef: 'passport-attestation',
-                sessionId,
-                args:                JSON.stringify([passportIdHash, payloadHash])
-            });
-            await waitForJob(nightgate, bind.jobId, sessionId);
+            const nightgate = await cds.connect.to('nightgate');
+            ({ attestationTxHash } = await anchorPassport(nightgate, {
+                payloadHash, passportId, passportIdHash, contractAddress, sessionId
+            }));
         }
 
         // 6. Persist the passport row (payloadCipher excluded from the read
@@ -271,6 +302,113 @@ export default class PassportService extends cds.ApplicationService {
         // 7. Return the action result, incl. the QR as a data-URL PNG (T23).
         const qrCodePng = await QRCode.toDataURL(qrCodeUrl, { width: 320, margin: 1 });
         return { passportId, attestationTxHash, qrCodeUrl, qrCodePng };
+    };
+
+    /** Supplier resolution by on-chain payloadHash → identity + verification + link. */
+    private resolveByHash = async (req: cds.Request) => {
+        const raw = String((req.data as { payloadHash?: string }).payloadHash ?? '').replace(/^0x/, '').toLowerCase();
+        if (!/^[0-9a-f]{64}$/.test(raw)) return req.reject(400, 'payloadHash must be 32-byte hex');
+        const row = await SELECT.one.from(Passports)
+            .columns('passportId', 'manufacturerId', 'model', 'batteryCategory', 'contractAddress', 'attestationTxHash', 'status', 'payloadHash')
+            .where({ payloadHash: raw });
+        if (!row) return req.reject(404, 'no battery for that payloadHash');
+        const demoHost = process.env.PASSPORT_DEMO_HOST ?? 'https://passport.example';
+        return {
+            passportId:        row.passportId,
+            payloadHash:       raw,
+            manufacturerId:    row.manufacturerId,
+            model:             row.model,
+            batteryCategory:   row.batteryCategory,
+            contractAddress:   row.contractAddress,
+            attestationTxHash: row.attestationTxHash,
+            status:            row.status,
+            verified:          row.status === 'anchored' && !!row.attestationTxHash,
+            viewerUrl:         `${demoHost}/resolve/${raw}`
+        };
+    };
+
+    /** Build a W3C-VC-style Battery Passport Credential (JSON) for a supplier. */
+    private passportCredential = async (req: cds.Request) => {
+        const raw = String((req.data as { payloadHash?: string }).payloadHash ?? '').replace(/^0x/, '').toLowerCase();
+        if (!/^[0-9a-f]{64}$/.test(raw)) return req.reject(400, 'payloadHash must be 32-byte hex');
+        const p = await SELECT.one.from(Passports)
+            .columns('ID', 'passportId', 'manufacturerId', 'model', 'batteryCategory', 'contractAddress', 'attestationTxHash', 'status', 'payloadHash')
+            .where({ payloadHash: raw });
+        if (!p) return req.reject(404, 'no battery for that payloadHash');
+        const proofs = await SELECT.from(PredicateProofLog)
+            .columns('sourceField', 'predicate', 'threshold', 'unit', 'txHash', 'result', 'status')
+            .where({ passport_ID: p.ID, status: 'succeeded' });
+        const explorer = (h: unknown) => (h ? `https://preview.midnightexplorer.com/transactions/0x${String(h).replace(/^0x/, '')}` : null);
+        const credential = {
+            '@context': ['https://www.w3.org/ns/credentials/v2', 'https://catena-x.net/schema/pac/v1'],
+            type: ['VerifiableCredential', 'BatteryPassportCredential'],
+            id: `urn:bpass:${p.passportId}`,
+            profile: 'Catena-X CX-0143 Battery Passport',
+            issuanceDate: new Date().toISOString(),
+            credentialSubject: {
+                passportId: p.passportId,
+                standard: 'EU 2023/1542 Annex XIII',
+                batteryCategory: p.batteryCategory,
+                model: p.model,
+                manufacturerId: p.manufacturerId,
+                payloadHash: raw,
+                attestation: {
+                    contractAddress: p.contractAddress ? `0x${String(p.contractAddress).replace(/^0x/, '')}` : null,
+                    transactionHash: p.attestationTxHash ? `0x${String(p.attestationTxHash).replace(/^0x/, '')}` : null,
+                    status: p.status,
+                    verified: p.status === 'anchored' && !!p.attestationTxHash,
+                    explorer: explorer(p.attestationTxHash)
+                },
+                predicateProofs: (proofs as Record<string, unknown>[]).map((pr) => ({
+                    sourceField: pr.sourceField,
+                    claim: `${pr.sourceField} ${pr.predicate} ${pr.threshold}${pr.unit ? ' ' + pr.unit : ''}`,
+                    operator: pr.predicate,
+                    threshold: pr.threshold,
+                    unit: pr.unit,
+                    valueDisclosed: false,
+                    result: pr.result,
+                    transactionHash: pr.txHash ? `0x${String(pr.txHash).replace(/^0x/, '')}` : null,
+                    verificationModel: 'indexer-trust',
+                    explorer: explorer(pr.txHash)
+                }))
+            }
+        };
+        return JSON.stringify(credential, null, 2);
+    };
+
+    /** Register a dataspace partner (DID/BPN) + bind DID → granteeId for reads. */
+    private registerPartner = async (req: cds.Request) => {
+        const { did, name, role, secret } = req.data as
+            { did?: string; name?: string; role?: string; secret?: string };
+        const d = String(did ?? '').trim();
+        if (!d) return req.reject(400, 'did is required');
+        if (!secret) return req.reject(400, 'secret is required');
+        const r = role === 'authority' ? 'authority' : 'recycler';
+        const granteeId = granteeIdForDid(d);
+
+        const existing = await SELECT.one.from(Partners).where({ did: d });
+        if (existing) {
+            await UPDATE.entity(Partners).set({ name, role: r, granteeId, secret }).where({ did: d });
+        } else {
+            await INSERT.into(Partners).entries({ did: d, name, role: r, granteeId, secret } as any);
+        }
+
+        // Bind DID → granteeId in the plugin's GranteeIdentities (global scope),
+        // so granteesOf(req) resolves this partner at read time. Idempotent.
+        const now = new Date().toISOString();
+        const gi: any = await cds.db.run(
+            SELECT.one.from('midnight.GranteeIdentities').where({ userId: d, scope: null })
+        );
+        if (gi) {
+            await cds.db.run(UPDATE.entity('midnight.GranteeIdentities')
+                .set({ granteeId, bindingKind: 'did', modifiedAt: now }).where({ ID: gi.ID }));
+        } else {
+            await cds.db.run(INSERT.into('midnight.GranteeIdentities').entries({
+                ID: cds.utils.uuid(), userId: d, granteeId, bindingKind: 'did', scope: null,
+                createdAt: now, modifiedAt: now
+            }));
+        }
+        return { did: d, name, role: r, granteeId };
     };
 }
 
@@ -324,62 +462,3 @@ function resolveBatch(batchId: string): Batch | null {
     };
 }
 
-// --- Helpers -----------------------------------------------------------------
-
-/**
- * Deterministic canonical JSON: object keys sorted recursively so the same
- * logical payload always hashes to the same payload_hash.
- */
-function canonicalize(value: unknown): string {
-    return JSON.stringify(sortKeys(value));
-}
-
-function sortKeys(value: unknown): unknown {
-    if (Array.isArray(value)) return value.map(sortKeys);
-    if (value && typeof value === 'object') {
-        return Object.fromEntries(
-            Object.keys(value as Record<string, unknown>).sort()
-                .map(k => [k, sortKeys((value as Record<string, unknown>)[k])])
-        );
-    }
-    return value;
-}
-
-/**
- * AES-256-GCM encrypt with a per-passport key derived via HKDF from the app
- * secret (ENCRYPTION_KEY) and passportId as salt. Output layout: iv(12) ||
- * authTag(16) || ciphertext, returned as a Buffer for the LargeBinary column.
- */
-function encryptPayload(plaintext: string, passportId: string): Buffer {
-    const masterHex = process.env.ENCRYPTION_KEY;
-    const master = masterHex
-        ? Buffer.from(masterHex, 'hex')
-        : Buffer.from('00'.repeat(32), 'hex'); // dev fallback; prod must set ENCRYPTION_KEY
-    const key = Buffer.from(
-        hkdfSync('sha256', master, Buffer.from(passportId, 'utf8'), Buffer.from('passport-payload'), 32)
-    );
-    const iv = randomBytes(12);
-    const cipher = createCipheriv('aes-256-gcm', key, iv);
-    const ct = Buffer.concat([cipher.update(Buffer.from(plaintext, 'utf8')), cipher.final()]);
-    const tag = cipher.getAuthTag();
-    return Buffer.concat([iv, tag, ct]);
-}
-
-/**
- * Poll a NIGHTGATE async job to completion and return its tx hash.
- * Throws on job failure. ~2.5 min cap (30 × 5s); proof and submit are slow.
- */
-async function waitForJob(nightgate: cds.Service, jobId: string, sessionId: string): Promise<string> {
-    for (let i = 0; i < 30; i++) {
-        const job: any = await nightgate.send('getJobStatus', { jobId, sessionId });
-        if (job.status === 'succeeded') {
-            const result = job.result ? JSON.parse(job.result) : {};
-            return String(result.txHash ?? '');
-        }
-        if (job.status === 'failed') {
-            throw new Error(`anchor job failed: ${job.errorCode ?? ''} ${job.errorMessage ?? ''}`.trim());
-        }
-        await new Promise(r => setTimeout(r, 5000));
-    }
-    throw new Error(`anchor job ${jobId} did not complete within timeout`);
-}

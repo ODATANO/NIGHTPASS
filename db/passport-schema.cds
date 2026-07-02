@@ -26,6 +26,42 @@ type BatteryCategory : String enum {
     LMT;         // light means of transport (e-bike, scooter)
 }
 
+/** Producer-cockpit lifecycle of a passport (save-then-submit split). */
+type PassportStatus : String enum {
+    draft;      // created off-chain, not yet anchored
+    anchoring;  // submit in flight
+    anchored;   // attest + bindPassport succeeded on-chain
+    failed;     // last submit attempt failed
+}
+
+/** On-chain step kinds tracked in PassportTransactions (transaction overview). */
+type TxKind : String enum {
+    attest; bindPassport; grantDisclosure; revokeDisclosure; commitValue; provePredicate; deploy;
+}
+
+/** Status of a tracked on-chain step / log row. `offline` = no session, never submitted. */
+type TxStatus : String enum { offline; pending; succeeded; failed; }
+
+type DisclosureOp : String enum { grant; revoke; }
+type PredicateOp  : String enum { lessOrEqual; greaterOrEqual; }
+
+/** Dataspace partner role (Catena-X-style). Producers grant these tiers. */
+type PartnerRole : String enum { recycler; authority; }
+
+/**
+ * Registered dataspace partners (recyclers / authorities). A partner self-
+ * registers with a DID/BPN; `granteeId = sha256(utf8(did))` (NIGHTGATE `did`
+ * binding) is the on-chain "who" a producer grants. `secret` is the mocked login
+ * credential (stands in for the real Catena-X SSI/credential layer).
+ */
+entity Partners : managed {
+    key did      : String(200);              // DID or BPN — the partner identity + login user
+    name         : String(200);
+    role         : PartnerRole;
+    granteeId    : String(64);               // sha256(utf8(did)) — matches the disclosure grantee
+    secret       : String(120);              // mock login password (demo only)
+}
+
 /**
  * A battery passport. The aggregate root.
  *
@@ -36,6 +72,7 @@ type BatteryCategory : String enum {
 @assert.unique: { passportId: [ passportId ] }
 entity Passports : cuid, managed {
     passportId       : String(64) not null;  // unique battery ID per Regulation 2023/1542 (Point 1)
+    owner            : String(160);          // producer wallet identity (shielded address); scopes the cockpit list
     manufacturerId   : String(200);          // Point 1
     batteryCategory  : BatteryCategory;      // Point 1
     model            : String(200);          // Point 1
@@ -56,6 +93,7 @@ entity Passports : cuid, managed {
     passportIdHash    : String(64);          // hex blake2b-256(passportId); on-chain bindPassport key
     contractAddress   : String(120);         // PassportAttestation deployment
     attestationTxHash : String(120);         // tx that anchored attest/bindPassport
+    status            : PassportStatus default #draft;  // producer lifecycle (draft → anchored)
 
     // On-chain anchor. Public metadata and payload hash are committed to Midnight.
     // Plugin-owned entity; the disclosure tier is decided in the API, not here.
@@ -79,8 +117,16 @@ entity Batteries : cuid {
     serialNumber         : String(100);      // legitimate interest
     cellChemistry        : String(50);       // legitimate interest (Points 2/3)
     capacityKwh          : Decimal(10, 3);   // legitimate interest (Points 2/3)
-    carbonFootprintKgCO2 : Decimal(15, 3);   // RESTRICTED (Points 2/3). Also the ZK-predicate field.
+    carbonFootprintKgCO2 : Decimal(15, 3);   // RESTRICTED (Points 2/3). Also a ZK-predicate field.
     supplierName         : String(200);      // RESTRICTED. AUTHORITY only (supplier identity).
+
+    // Commercially sensitive numeric fields a supplier wants to keep hidden but
+    // must prove a bound on (ZK-predicate fields; see PROVABLE_FIELDS). All are
+    // RESTRICTED cleartext, disclosed only via a proven predicate (value hidden).
+    recycledContentPct     : Decimal(5, 2);  // Art. 8 recycled content (Co/Li/Ni). Prove '>= min quota'.
+    cycleLife              : Integer;         // Annex IV full cycles to 80% SoH. Prove '>= N'.
+    roundTripEfficiencyPct : Decimal(5, 2);  // Annex IV round-trip efficiency. Prove '>= X%'.
+    leadContentPpm         : Decimal(10, 3);  // hazardous-substance concentration. Prove '<= limit'.
 }
 
 /**
@@ -105,4 +151,52 @@ entity DiligenceDoc : cuid {
     passport    : Association to Passports;
     docType     : String(100);               // e.g. "supply-chain-due-diligence-report"
     documentRef : Association to midnight.Documents;  // plugin-owned anchor (T12)
+}
+
+/**
+ * Per-passport on-chain transaction overview (producer cockpit). One row per
+ * submitted step (attest, bindPassport, grant/revoke, commit/prove). `offline`
+ * status = created without a signing session (no tx). Feeds the Transactions tab.
+ */
+entity PassportTransactions : cuid, managed {
+    passport     : Association to Passports;
+    kind         : TxKind;
+    jobId        : String(64);
+    txHash       : String(120);
+    identifier   : String(120);              // 33-byte tx identifier (indexer watch key)
+    status       : TxStatus default #offline;
+    blockHeight  : Integer64;
+    explorerUrl  : String(300);
+    errorMessage : String(1000);
+}
+
+/**
+ * Producer-side audit log of disclosure grants/revokes. Distinct from the
+ * plugin's chain-indexed `midnight.DisclosureGrants` (read-side tier gate);
+ * this records what the producer issued and its tx result.
+ */
+entity DisclosureGrantLog : cuid, managed {
+    passport : Association to Passports;
+    grantee  : String(80);                   // Bytes<32> grantee id (hex)
+    level    : Integer;                      // 0=public, 1=legitimate-interest, 2=authority
+    op       : DisclosureOp;
+    txHash   : String(120);
+    status   : TxStatus default #offline;
+}
+
+/**
+ * Producer-side log of ZK predicate proofs (PAC). The hidden value is NEVER
+ * stored; only the claim (field, predicate, threshold, unit) and the proof
+ * reference (predicateAttestationId, txHash, result).
+ */
+entity PredicateProofLog : cuid, managed {
+    passport               : Association to Passports;
+    sourceField            : String(120);    // e.g. carbonFootprintKgCO2
+    predicate              : PredicateOp;
+    threshold              : Integer64;
+    unit                   : String(60);
+    predicateAttestationId : String(64);
+    txHash                 : String(120);
+    status                 : TxStatus default #offline;
+    result                 : Boolean;        // proven true (tx SUCCESS) — value stays hidden
 }

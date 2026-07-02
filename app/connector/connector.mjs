@@ -531,6 +531,56 @@ export async function provePredicate(api, { contractAddress, payloadHash, value,
     return result;
 }
 
+// --- Field-bound Predicate (value bound to a SPECIFIC passport field) --------
+// Hardened flow that answers "is this the value from THIS passport?". The value
+// is proven to be a leaf in a Merkle content-root anchored at attest time, so it
+// can't be swapped for an arbitrary number:
+//   1) anchorContentRoot(payload_hash, content_root) — pins the root over the
+//      passport's provable fields (done once, typically right after attest).
+//   2) proveFieldPredicate(payload_hash, field_key, threshold, op) — recomputes
+//      the field's Merkle leaf from the witnessed value + inclusion path, asserts
+//      it folds to the anchored root, THEN asserts the predicate. A successful tx
+//      proves the predicate holds for THIS passport's field, value still hidden.
+
+/** anchorContentRoot(payload_hash, content_root) — pin the field Merkle root. */
+export async function anchorContentRoot(api, { contractAddress, payloadHash, contentRoot }, log = console.log) {
+    const L = mklog(log);
+    L('anchorContentRoot: loading browser SDK…');
+    const { buildAttestationVaultWitnesses } = await loadBrowserSdk();
+    L('anchorContentRoot: deriving app-managed attester secret…');
+    const attestationSecret = await deriveAttesterSecret(api);
+    const call = {
+        circuitId: 'anchorContentRoot',
+        args: [fromHex(payloadHash), fromHex(contentRoot)],
+        witnesses: buildAttestationVaultWitnesses({ attestationSecret })
+    };
+    L('anchoring content root (binds the passport fields for later field-bound proofs)…');
+    return runPreparedCall(api, contractAddress, call, L);
+}
+
+/**
+ * proveFieldPredicate(payload_hash, field_key, threshold, op) — field-bound proof.
+ * `merkleProof` = { fieldValue (scaled decimal string), siblings (4 × 64-hex),
+ * dirs (4 booleans) }. op 0 = value ≤ threshold, 1 = value ≥ threshold.
+ */
+export async function proveFieldPredicate(api, { contractAddress, payloadHash, fieldKey, threshold, op, fieldValue, siblings, dirs }, log = console.log) {
+    const L = mklog(log);
+    L('proveFieldPredicate: loading browser SDK…');
+    const { buildAttestationVaultWitnesses } = await loadBrowserSdk();
+    L('proveFieldPredicate: deriving app-managed attester secret…');
+    const attestationSecret = await deriveAttesterSecret(api);
+    const opNum = Number(op);
+    const call = {
+        circuitId: 'proveFieldPredicate',
+        args: [fromHex(payloadHash), fromHex(fieldKey), BigInt(threshold), BigInt(opNum)],
+        witnesses: buildAttestationVaultWitnesses({ attestationSecret, merkleProof: { fieldValue: String(fieldValue), siblings, dirs } })
+    };
+    L(`proving field ${fieldValue} ${opNum === 0 ? '≤' : '≥'} ${threshold} — bound to this passport's content root, value hidden…`);
+    const result = await runPreparedCall(api, contractAddress, call, L);
+    L(`✓ field-bound predicate proven on-chain: the passport's own value ${opNum === 0 ? '≤' : '≥'} ${threshold} holds.`);
+    return result;
+}
+
 // --- On-chain verification (indexer scan) -----------------------------------
 // The verification model is indexer-trust: a tx that landed in a block with
 // status SUCCESS is confirmed. Polls the Preview indexer (HTTP GraphQL) for the

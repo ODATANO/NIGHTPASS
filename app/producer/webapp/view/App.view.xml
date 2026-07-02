@@ -1,0 +1,22 @@
+<mvc:View
+  controllerName="producer.controller.App"
+  xmlns:mvc="sap.ui.core.mvc"
+  xmlns="sap.m"
+  xmlns:tnt="sap.tnt"
+  displayBlock="true"
+  height="100%">
+  <tnt:ToolPage id="toolPage">
+    <tnt:header>
+      <tnt:ToolHeader>
+        <Title text="NIGHTPASS · Producer Cockpit" level="H2"/>
+        <ToolbarSpacer/>
+        <ObjectStatus
+          text="{= ${session>/authenticated} ? 'signed in: ' + ${session>/user} : 'connecting…' }"
+          state="{= ${session>/authenticated} ? 'Success' : 'None' }"/>
+      </tnt:ToolHeader>
+    </tnt:header>
+    <tnt:mainContents>
+      <NavContainer id="appNavContainer" busy="{session>/busy}" busyIndicatorDelay="0"/>
+    </tnt:mainContents>
+  </tnt:ToolPage>
+</mvc:View>

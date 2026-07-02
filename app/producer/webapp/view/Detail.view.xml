@@ -1,0 +1,206 @@
+<mvc:View
+  controllerName="producer.controller.Detail"
+  xmlns:mvc="sap.ui.core.mvc"
+  xmlns="sap.m"
+  xmlns:f="sap.ui.layout.form"
+  xmlns:core="sap.ui.core">
+  <Page title="Passport {passportId}" showNavButton="true" navButtonPress="onNavBack">
+    <headerContent>
+      <SegmentedButton selectedKey="{ui>/mode}">
+        <items>
+          <SegmentedButtonItem key="wallet" icon="sap-icon://wallet" text="Wallet"/>
+          <SegmentedButtonItem key="server" icon="sap-icon://chain-link" text="Server"/>
+        </items>
+      </SegmentedButton>
+      <Button text="Attest" icon="{= ${ui>/mode} === 'wallet' ? 'sap-icon://wallet' : 'sap-icon://chain-link' }" press="onAttest"/>
+      <Button text="Grant" enabled="{ui>/anchored}" icon="{= ${ui>/mode} === 'wallet' ? 'sap-icon://wallet' : 'sap-icon://key' }" press="onGrantAction"/>
+      <Button text="Revoke" enabled="{ui>/anchored}" icon="sap-icon://delete" press="onRevokeAction"/>
+      <Button text="Prove" enabled="{ui>/anchored}" icon="{= ${ui>/mode} === 'wallet' ? 'sap-icon://wallet' : 'sap-icon://simulate' }" press="onProveAction"/>
+      <Button icon="sap-icon://refresh" tooltip="Refresh transactions" press="onRefresh"/>
+    </headerContent>
+    <content>
+      <IconTabBar id="tabs" expandable="false" class="sapUiResponsiveContentPadding">
+        <items>
+          <!-- Overview -->
+          <IconTabFilter text="Overview" icon="sap-icon://product">
+            <f:SimpleForm editable="false" layout="ResponsiveGridLayout" labelSpanXL="4" labelSpanL="4">
+              <f:content>
+                <Label text="Passport ID"/><Text text="{passportId}"/>
+                <Label text="Manufacturer"/><Text text="{manufacturerId}"/>
+                <Label text="Model"/><Text text="{model}"/>
+                <Label text="Category"/><Text text="{batteryCategory}"/>
+                <Label text="Manufacture date"/><Text text="{manufactureDate}"/>
+                <Label text="Weight (kg)"/><Text text="{weightKg}"/>
+                <Label text="Performance class"/><Text text="{performanceClass}"/>
+                <Label text="payloadHash"/><Text text="{payloadHash}"/>
+                <Label text="Contract"/>
+                <Link text="{= ${contractAddress} || '—' }"
+                      href="{= ${contractAddress} ? 'https://preview.midnightexplorer.com/contracts/0x' + ${contractAddress} : '' }"
+                      target="_blank" enabled="{= !!${contractAddress} }"/>
+                <Label text="Attestation tx"/>
+                <Link text="{= ${attestationTxHash} || 'not anchored' }"
+                      href="{= ${attestationTxHash} ? 'https://preview.midnightexplorer.com/transactions/0x' + ${attestationTxHash} : '' }"
+                      target="_blank" enabled="{= !!${attestationTxHash} }"/>
+              </f:content>
+            </f:SimpleForm>
+            <Table items="{batteries}" headerText="Cells">
+              <columns>
+                <Column><Text text="Serial"/></Column>
+                <Column><Text text="Chemistry"/></Column>
+                <Column><Text text="Capacity kWh"/></Column>
+                <Column><Text text="Carbon kg CO2"/></Column>
+                <Column><Text text="Supplier"/></Column>
+              </columns>
+              <items>
+                <ColumnListItem>
+                  <cells>
+                    <Text text="{serialNumber}"/>
+                    <Text text="{cellChemistry}"/>
+                    <Text text="{capacityKwh}"/>
+                    <Text text="{carbonFootprintKgCO2}"/>
+                    <Text text="{supplierName}"/>
+                  </cells>
+                </ColumnListItem>
+              </items>
+            </Table>
+          </IconTabFilter>
+
+          <!-- Disclosure -->
+          <IconTabFilter text="Disclosure" icon="sap-icon://locked" key="disc">
+            <f:SimpleForm editable="true" layout="ResponsiveGridLayout" labelSpanXL="3" labelSpanL="3">
+              <f:content>
+                <Label text="Partner"/>
+                <ComboBox id="granteePartner" items="{/Partners}" placeholder="select a registered partner">
+                  <core:Item key="{granteeId}" text="{name} ({role})"/>
+                </ComboBox>
+                <Label text="Level"/>
+                <Select id="grantLevel" selectedKey="1">
+                  <core:Item key="0" text="0 · public / consumer"/>
+                  <core:Item key="1" text="1 · legitimate-interest / recycler"/>
+                  <core:Item key="2" text="2 · authority"/>
+                </Select>
+              </f:content>
+            </f:SimpleForm>
+            <Table id="discTable" items="{/DisclosureGrantLog}" growing="true" headerText="Disclosure log">
+              <columns>
+                <Column><Text text="Op"/></Column>
+                <Column><Text text="Grantee"/></Column>
+                <Column><Text text="Level"/></Column>
+                <Column><Text text="Status"/></Column>
+                <Column demandPopin="true" minScreenWidth="Desktop"><Text text="Tx"/></Column>
+              </columns>
+              <items>
+                <ColumnListItem>
+                  <cells>
+                    <Text text="{op}"/>
+                    <Text text="{grantee}"/>
+                    <Text text="{level}"/>
+                    <ObjectStatus text="{status}" state="{= ${status} === 'succeeded' ? 'Success' : ${status} === 'failed' ? 'Error' : 'None' }"/>
+                    <Link text="{= ${txHash} || '—' }" href="{= ${txHash} ? 'https://preview.midnightexplorer.com/transactions/0x' + ${txHash} : '' }" target="_blank" enabled="{= !!${txHash} }"/>
+                  </cells>
+                </ColumnListItem>
+              </items>
+            </Table>
+          </IconTabFilter>
+
+          <!-- Predicate proof -->
+          <IconTabFilter text="Predicate" icon="sap-icon://simulate" key="proof">
+            <f:SimpleForm editable="true" layout="ResponsiveGridLayout" labelSpanXL="3" labelSpanL="3">
+              <f:content>
+                <Label text="Source field"/>
+                <Select id="proofField" selectedKey="carbonFootprintKgCO2" change="onProofFieldChange">
+                  <core:Item key="carbonFootprintKgCO2" text="Carbon footprint (kg CO₂ / kWh)"/>
+                  <core:Item key="capacityKwh" text="Capacity (kWh)"/>
+                  <core:Item key="recycledContentPct" text="Recycled content (%)"/>
+                  <core:Item key="cycleLife" text="Cycle life (cycles)"/>
+                  <core:Item key="roundTripEfficiencyPct" text="Round-trip efficiency (%)"/>
+                  <core:Item key="leadContentPpm" text="Lead content (ppm)"/>
+                  <core:Item key="recycledCoPct" text="Recycled cobalt (%)"/>
+                  <core:Item key="recycledLiPct" text="Recycled lithium (%)"/>
+                  <core:Item key="recycledNiPct" text="Recycled nickel (%)"/>
+                </Select>
+                <Label text="Predicate"/>
+                <Select id="proofPredicate" selectedKey="lessOrEqual">
+                  <core:Item key="lessOrEqual" text="value ≤ threshold"/>
+                  <core:Item key="greaterOrEqual" text="value ≥ threshold"/>
+                </Select>
+                <Label text="Threshold"/>
+                <Input id="proofThreshold" value="4000" type="Number"/>
+                <Label text="Unit"/>
+                <Input id="proofUnit" value="kg CO₂ / kWh"/>
+              </f:content>
+            </f:SimpleForm>
+            <Table id="proofTable" items="{/PredicateProofLog}" growing="true" headerText="Proof log">
+              <columns>
+                <Column><Text text="Field"/></Column>
+                <Column><Text text="Claim"/></Column>
+                <Column><Text text="Result"/></Column>
+                <Column><Text text="Status"/></Column>
+                <Column demandPopin="true" minScreenWidth="Desktop"><Text text="Tx"/></Column>
+              </columns>
+              <items>
+                <ColumnListItem>
+                  <cells>
+                    <Text text="{sourceField}"/>
+                    <Text text="{= ${predicate} + ' ' + ${threshold} + ' ' + (${unit} || '') }"/>
+                    <ObjectStatus text="{= ${status} === 'succeeded' ? 'proven' : ${status} === 'failed' ? 'false' : ${status} === 'offline' ? 'offline' : '—' }"
+                      state="{= ${status} === 'succeeded' ? 'Success' : ${status} === 'failed' ? 'Error' : 'None' }"/>
+                    <ObjectStatus text="{status}" state="{= ${status} === 'succeeded' ? 'Success' : ${status} === 'failed' ? 'Error' : 'None' }"/>
+                    <Link text="{= ${txHash} || '—' }" href="{= ${txHash} ? 'https://preview.midnightexplorer.com/transactions/0x' + ${txHash} : '' }" target="_blank" enabled="{= !!${txHash} }"/>
+                  </cells>
+                </ColumnListItem>
+              </items>
+            </Table>
+          </IconTabFilter>
+
+          <!-- Transactions -->
+          <IconTabFilter text="Transactions" icon="sap-icon://history" key="tx">
+            <Table id="txTable" items="{/PassportTransactions}" growing="true">
+              <columns>
+                <Column><Text text="Step"/></Column>
+                <Column><Text text="Status"/></Column>
+                <Column demandPopin="true" minScreenWidth="Tablet"><Text text="Tx hash"/></Column>
+                <Column demandPopin="true" minScreenWidth="Desktop"><Text text="When"/></Column>
+              </columns>
+              <items>
+                <ColumnListItem>
+                  <cells>
+                    <Text text="{kind}"/>
+                    <ObjectStatus text="{status}"
+                      state="{= ${status} === 'succeeded' ? 'Success' : ${status} === 'failed' ? 'Error' : ${status} === 'pending' ? 'Warning' : 'None' }"/>
+                    <Link text="{= ${txHash} || '—' }" href="{explorerUrl}" target="_blank" enabled="{= !!${explorerUrl} }"/>
+                    <Text text="{createdAt}"/>
+                  </cells>
+                </ColumnListItem>
+              </items>
+            </Table>
+          </IconTabFilter>
+
+          <!-- Catena-X -->
+          <IconTabFilter text="Catena-X" icon="sap-icon://supplier" key="cx">
+            <VBox class="sapUiContentPadding">
+              <Panel headerText="Battery Passport aspect" expandable="true" expanded="true">
+                <HBox wrap="Wrap" class="sapUiTinyMarginBottom">
+                  <Button text="Generate JSON" icon="sap-icon://create-form" press="onGenerateAspect" class="sapUiTinyMarginEnd"/>
+                  <Button text="Download" icon="sap-icon://download" press="onDownloadAspect" enabled="{= !!${cx>/aspect} }"/>
+                </HBox>
+                <TextArea value="{cx>/aspect}" editable="false" width="100%" rows="14" growing="false"
+                          placeholder="Generate the EU 2023/1542 / Catena-X aspect JSON from this passport."/>
+              </Panel>
+              <Panel headerText="Predicate Attestation Credential" expandable="true" expanded="true" class="sapUiSmallMarginTop">
+                <HBox wrap="Wrap" class="sapUiTinyMarginBottom">
+                  <Button text="Build PAC" icon="sap-icon://simulate" press="onBuildPac" class="sapUiTinyMarginEnd"/>
+                  <Button text="Download" icon="sap-icon://download" press="onDownloadPac" enabled="{= !!${cx>/pac} }"/>
+                </HBox>
+                <Text text="A Catena-X CX-0143 verifiable credential built from this passport's proven predicates. Claims and proof transactions only, the values stay hidden."
+                      class="sapUiTinyMarginBottom"/>
+                <TextArea value="{cx>/pac}" editable="false" width="100%" rows="14" growing="false"
+                          placeholder="Build the PAC from the passport's succeeded predicate proofs."/>
+              </Panel>
+            </VBox>
+          </IconTabFilter>
+        </items>
+      </IconTabBar>
+    </content>
+  </Page>
+</mvc:View>

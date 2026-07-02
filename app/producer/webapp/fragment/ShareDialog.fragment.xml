@@ -1,0 +1,42 @@
+<core:FragmentDefinition
+  xmlns:core="sap.ui.core"
+  xmlns="sap.m"
+  xmlns:f="sap.ui.layout.form">
+  <Dialog id="shareDialog" title="Share with supplier" contentWidth="34rem">
+    <content>
+      <f:SimpleForm editable="false" layout="ResponsiveGridLayout" labelSpanXL="4" labelSpanL="4">
+        <f:content>
+          <Label text="Passport ID"/><Text text="{share>/passportId}"/>
+          <Label text="payloadHash"/><Text text="{share>/payloadHash}"/>
+          <Label text="Resolve link"/>
+          <Link text="{share>/resolveUrl}" href="{share>/resolveUrl}" target="_blank"/>
+        </f:content>
+      </f:SimpleForm>
+      <HBox justifyContent="Center" class="sapUiSmallMarginBottom">
+        <Image src="{share>/qrUrl}" width="180px" height="180px"/>
+      </HBox>
+      <Panel headerText="Grant this supplier access" expandable="true" expanded="true">
+        <f:SimpleForm editable="true" layout="ResponsiveGridLayout" labelSpanXL="4" labelSpanL="4">
+          <f:content>
+            <Label text="Partner"/>
+            <ComboBox items="{/Partners}" selectedKey="{share>/grantee}" placeholder="select a registered partner">
+              <core:Item key="{granteeId}" text="{name} ({role})"/>
+            </ComboBox>
+            <Label text="Level"/>
+            <Select selectedKey="{share>/level}">
+              <core:Item key="1" text="1 · recycler / legitimate interest"/>
+              <core:Item key="2" text="2 · authority"/>
+            </Select>
+            <Label text=""/>
+            <Button text="Grant access" type="Emphasized" icon="sap-icon://key" press="onShareGrant"/>
+          </f:content>
+        </f:SimpleForm>
+      </Panel>
+    </content>
+    <buttons>
+      <Button text="Copy link" icon="sap-icon://copy" press="onCopyLink"/>
+      <Button text="Download credential" icon="sap-icon://download" press="onDownloadCredential"/>
+      <Button text="Close" press="onShareClose"/>
+    </buttons>
+  </Dialog>
+</core:FragmentDefinition>

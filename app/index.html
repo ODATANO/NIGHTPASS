@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>NIGHTPASS</title>
+  <style>
+    body { font-family: -apple-system, "Segoe UI", system-ui, sans-serif; background: #f5f6fb; color: #15152e; margin: 0; }
+    header { background: linear-gradient(120deg, #2b2b6f, #6f42c1); color: #fff; padding: 2rem 1.5rem; }
+    header h1 { margin: 0; font-size: 1.5rem; }
+    header p { margin: .4rem 0 0; color: #d9d8f4; }
+    .tiles { max-width: 960px; margin: 1.5rem auto; padding: 0 1.5rem; display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 1rem; }
+    a.tile { display: block; background: #fff; border: 1px solid #e7e7f0; border-radius: 14px; padding: 1.2rem; text-decoration: none; color: inherit; box-shadow: 0 8px 24px rgba(20,20,46,.06); }
+    a.tile:hover { border-color: #6f42c1; }
+    a.tile h2 { margin: 0 0 .3rem; font-size: 1.05rem; }
+    a.tile p { margin: 0; color: #6b6b86; font-size: .88rem; }
+    .badge { display: inline-block; font-size: .7rem; font-weight: 700; color: #6f42c1; background: #f1eefb; border: 1px solid #e2dbf6; border-radius: 999px; padding: .1rem .5rem; margin-bottom: .5rem; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>NIGHTPASS · EU Battery Passport (Midnight ZK)</h1>
+    <p>Producer cockpit, consumer tier views, and the wallet connector — one CAP backend.</p>
+  </header>
+  <div class="tiles">
+    <a class="tile" href="/producer/webapp/index.html">
+      <div class="badge">Producer / ERP</div>
+      <h2>Producer Cockpit</h2>
+      <p>Create passports, submit on-chain, manage disclosure levels, prove values in zero-knowledge.</p>
+    </a>
+    <a class="tile" href="/passport/webapp/index.html">
+      <div class="badge">Consumer</div>
+      <h2>Passport Viewer</h2>
+      <p>Three disclosure tiers (consumer / recycler / authority) over one dataset.</p>
+    </a>
+    <a class="tile" href="/connector/dist/index.html">
+      <div class="badge">Wallet</div>
+      <h2>Lace Connector</h2>
+      <p>Wallet-driven attest / disclosure / predicate proof + Catena-X credential export.</p>
+    </a>
+  </div>
+</body>
+</html>

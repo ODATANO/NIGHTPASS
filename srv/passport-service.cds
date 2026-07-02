@@ -21,6 +21,27 @@ service PassportService {
     @readonly entity RecycledMaterials as projection on passport.RecycledMaterials;
     @readonly entity DiligenceDoc      as projection on passport.DiligenceDoc;
 
+    // Registered dataspace partners (secret never served).
+    @readonly entity Partners as projection on passport.Partners excluding { secret };
+
+    /**
+     * Self-service partner registration (Catena-X-style): a recycler / authority
+     * registers a DID/BPN + a login secret and receives its `granteeId`
+     * (sha256(did)). Also binds the DID → granteeId in the plugin's
+     * GranteeIdentities so the read gate resolves the partner at read time.
+     */
+    action registerPartner(
+        did:    String,
+        name:   String,
+        role:   String,   // 'recycler' | 'authority'
+        secret: String
+    ) returns {
+        did:       String;
+        name:      String;
+        role:      String;
+        granteeId: String;
+    };
+
     /**
      * Generate a battery passport from a goods-receipt batch and anchor it on
      * Midnight. `sessionId` is a signing-enabled NIGHTGATE wallet session (from
@@ -37,4 +58,29 @@ service PassportService {
         qrCodeUrl:         String;
         qrCodePng:         LargeString;  // T23: data-URL PNG of qrCodeUrl
     };
+
+    /**
+     * Supplier resolution: given a passport `payloadHash` (the on-chain anchor a
+     * producer shares), return the public identity + on-chain verification + the
+     * tier-gated viewer URL, so a supplier can resolve the exact battery.
+     */
+    function resolveByHash(payloadHash: String) returns {
+        passportId:        String;
+        payloadHash:       String;
+        manufacturerId:    String;
+        model:             String;
+        batteryCategory:   String;
+        contractAddress:   String;
+        attestationTxHash: String;
+        status:            String;
+        verified:          Boolean;   // anchored on-chain (attest tx present)
+        viewerUrl:         String;    // /resolve/<hash> — tier-gated landing
+    };
+
+    /**
+     * Build a downloadable W3C-VC-style Battery Passport Credential (JSON) for a
+     * passport by `payloadHash`: public subject + attestation reference + any
+     * zero-knowledge predicate proofs. The artifact a supplier verifies.
+     */
+    function passportCredential(payloadHash: String) returns LargeString;
 }

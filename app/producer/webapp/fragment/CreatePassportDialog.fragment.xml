@@ -1,0 +1,98 @@
+<core:FragmentDefinition
+  xmlns:core="sap.ui.core"
+  xmlns="sap.m"
+  xmlns:f="sap.ui.layout.form">
+  <Dialog id="createDialog" title="Create battery passport" contentWidth="42rem" stretch="{device>/system/phone}">
+    <content>
+      <Panel headerText="General" expandable="true" expanded="true">
+        <f:SimpleForm editable="true" layout="ResponsiveGridLayout"
+                      labelSpanXL="4" labelSpanL="4" labelSpanM="4"
+                      columnsXL="1" columnsL="1" columnsM="1">
+          <f:content>
+            <Label text="Passport ID"/>
+            <Input value="{create>/passportId}"/>
+            <Label text="Manufacturer ID"/>
+            <Input value="{create>/manufacturerId}"/>
+            <Label text="Category"/>
+            <Select selectedKey="{create>/batteryCategory}">
+              <core:Item key="EV" text="EV"/>
+              <core:Item key="INDUSTRIAL" text="Industrial"/>
+              <core:Item key="LMT" text="LMT"/>
+            </Select>
+            <Label text="Model"/>
+            <Input value="{create>/model}"/>
+            <Label text="Manufacture date"/>
+            <Input value="{create>/manufactureDate}" placeholder="YYYY-MM-DD"/>
+            <Label text="Weight (kg)"/>
+            <Input value="{create>/weightKg}" type="Number"/>
+            <Label text="Performance class"/>
+            <Input value="{create>/performanceClass}" maxLength="1"/>
+          </f:content>
+        </f:SimpleForm>
+      </Panel>
+
+      <Panel headerText="Cell / battery" expandable="true" expanded="true">
+        <f:SimpleForm editable="true" layout="ResponsiveGridLayout"
+                      labelSpanXL="4" labelSpanL="4" labelSpanM="4"
+                      columnsXL="1" columnsL="1" columnsM="1">
+          <f:content>
+            <Label text="Serial number"/>
+            <Input value="{create>/battery/serialNumber}"/>
+            <Label text="Cell chemistry"/>
+            <Input value="{create>/battery/cellChemistry}"/>
+            <Label text="Capacity (kWh)"/>
+            <Input value="{create>/battery/capacityKwh}" type="Number"/>
+            <Label text="Carbon footprint (kg CO2/kWh)"/>
+            <Input value="{create>/battery/carbonFootprintKgCO2}" type="Number"/>
+            <Label text="Recycled content (%)"/>
+            <Input value="{create>/battery/recycledContentPct}" type="Number"/>
+            <Label text="Cycle life (cycles)"/>
+            <Input value="{create>/battery/cycleLife}" type="Number"/>
+            <Label text="Round-trip efficiency (%)"/>
+            <Input value="{create>/battery/roundTripEfficiencyPct}" type="Number"/>
+            <Label text="Lead content (ppm)"/>
+            <Input value="{create>/battery/leadContentPpm}" type="Number"/>
+            <Label text="Supplier"/>
+            <Input value="{create>/battery/supplierName}"/>
+          </f:content>
+        </f:SimpleForm>
+      </Panel>
+
+      <Panel headerText="Due diligence" expandable="true" expanded="false">
+        <f:SimpleForm editable="true" layout="ResponsiveGridLayout"
+                      labelSpanXL="4" labelSpanL="4" labelSpanM="4"
+                      columnsXL="1" columnsL="1" columnsM="1">
+          <f:content>
+            <Label text="Document type"/>
+            <Input value="{create>/diligenceDocType}"/>
+          </f:content>
+        </f:SimpleForm>
+      </Panel>
+
+      <Panel headerText="Recycled materials" expandable="true" expanded="false">
+        <Table items="{create>/recycled}">
+          <columns>
+            <Column><Text text="Material"/></Column>
+            <Column><Text text="Recycled %"/></Column>
+            <Column><Text text="Source supplier"/></Column>
+          </columns>
+          <items>
+            <ColumnListItem>
+              <cells>
+                <Input value="{create>material}"/>
+                <Input value="{create>recycledPercentage}" type="Number"/>
+                <Input value="{create>sourceSupplierName}"/>
+              </cells>
+            </ColumnListItem>
+          </items>
+        </Table>
+      </Panel>
+    </content>
+    <beginButton>
+      <Button text="Save" type="Emphasized" press="onCreateSave"/>
+    </beginButton>
+    <endButton>
+      <Button text="Cancel" press="onCreateCancel"/>
+    </endButton>
+  </Dialog>
+</core:FragmentDefinition>

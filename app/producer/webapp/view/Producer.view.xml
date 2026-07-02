@@ -1,0 +1,67 @@
+<mvc:View
+  controllerName="producer.controller.Producer"
+  xmlns:mvc="sap.ui.core.mvc"
+  xmlns="sap.m">
+  <Page title="Battery Passports" showNavButton="false">
+    <headerContent>
+      <ObjectStatus text="{= 'wallet: ' + ${session>/ownerShort} }" state="Success" visible="{session>/connected}"/>
+      <Button text="Connect wallet" type="Emphasized" icon="sap-icon://wallet" press="onConnectWallet" visible="{= !${session>/connected} }"/>
+      <Button text="Create passport" type="Emphasized" icon="sap-icon://add" press="onCreate" enabled="{session>/connected}"/>
+      <Button text="Register partner" icon="sap-icon://add-employee" press="onRegisterPartner"/>
+      <Button icon="sap-icon://refresh" tooltip="Refresh" press="onRefresh"/>
+    </headerContent>
+    <content>
+      <Table id="passportTable" items="{path: '/Passports', parameters: {'$count': true}}" growing="true" growingThreshold="50"
+             mode="None" itemPress="onOpen" visible="{session>/connected}">
+        <headerToolbar>
+          <OverflowToolbar>
+            <Title text="{= 'Passports (' + (${session>/passportCount} || 0) + ')' }"/>
+            <ToolbarSpacer/>
+          </OverflowToolbar>
+        </headerToolbar>
+        <columns>
+          <Column><Text text="Passport ID"/></Column>
+          <Column><Text text="Model"/></Column>
+          <Column demandPopin="true" minScreenWidth="Tablet"><Text text="Category"/></Column>
+          <Column><Text text="Status"/></Column>
+          <Column demandPopin="true" minScreenWidth="Desktop"><Text text="Attestation tx"/></Column>
+        </columns>
+        <items>
+          <ColumnListItem type="Navigation">
+            <cells>
+              <ObjectIdentifier title="{passportId}" text="{manufacturerId}"/>
+              <Text text="{model}"/>
+              <Text text="{batteryCategory}"/>
+              <ObjectStatus text="{status}"
+                state="{= ${status} === 'anchored' ? 'Success' : ${status} === 'failed' ? 'Error' : ${status} === 'anchoring' ? 'Warning' : 'None' }"/>
+              <Link text="{= ${attestationTxHash} ? ${attestationTxHash} : 'not anchored' }"
+                    href="{= ${attestationTxHash} ? 'https://preview.midnightexplorer.com/transactions/0x' + ${attestationTxHash} : '' }"
+                    target="_blank" enabled="{= !!${attestationTxHash} }"/>
+            </cells>
+          </ColumnListItem>
+        </items>
+      </Table>
+
+      <Panel headerText="Registered dataspace partners" expandable="true" expanded="true" class="sapUiMediumMarginTop">
+        <Table id="partnersTable" items="{/Partners}">
+          <columns>
+            <Column><Text text="Name"/></Column>
+            <Column><Text text="Role"/></Column>
+            <Column demandPopin="true" minScreenWidth="Tablet"><Text text="DID / BPN"/></Column>
+            <Column demandPopin="true" minScreenWidth="Desktop"><Text text="granteeId"/></Column>
+          </columns>
+          <items>
+            <ColumnListItem>
+              <cells>
+                <ObjectIdentifier title="{name}"/>
+                <ObjectStatus text="{role}" state="{= ${role} === 'authority' ? 'Warning' : 'Information' }"/>
+                <Text text="{did}"/>
+                <Text text="{granteeId}"/>
+              </cells>
+            </ColumnListItem>
+          </items>
+        </Table>
+      </Panel>
+    </content>
+  </Page>
+</mvc:View>

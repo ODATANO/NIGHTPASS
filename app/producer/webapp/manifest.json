@@ -1,0 +1,71 @@
+{
+  "_version": "1.65.0",
+  "sap.app": {
+    "id": "producer",
+    "type": "application",
+    "title": "NIGHTPASS - Producer Cockpit",
+    "description": "Manufacturer/ERP cockpit: create battery passports, submit on-chain, manage disclosure levels, and prove values in zero-knowledge.",
+    "applicationVersion": { "version": "1.0.0" },
+    "dataSources": {
+      "producerService": {
+        "uri": "/api/v1/producer/",
+        "type": "OData",
+        "settings": { "odataVersion": "4.0" }
+      }
+    }
+  },
+  "sap.ui": {
+    "technology": "UI5",
+    "deviceTypes": { "desktop": true, "tablet": true, "phone": true }
+  },
+  "sap.ui5": {
+    "rootView": {
+      "viewName": "producer.view.App",
+      "type": "XML",
+      "id": "appView",
+      "async": true
+    },
+    "models": {
+      "": {
+        "dataSource": "producerService",
+        "type": "sap.ui.model.odata.v4.ODataModel",
+        "settings": {
+          "synchronizationMode": "None",
+          "operationMode": "Server",
+          "autoExpandSelect": true,
+          "groupId": "$auto"
+        }
+      }
+    },
+    "routing": {
+      "config": {
+        "routerClass": "sap.m.routing.Router",
+        "type": "View",
+        "viewType": "XML",
+        "viewPath": "producer.view",
+        "controlId": "appNavContainer",
+        "controlAggregation": "pages",
+        "async": true
+      },
+      "routes": [
+        { "name": "main",   "pattern": "",                    "target": "main" },
+        { "name": "detail", "pattern": "passport/{key}", "target": "detail" }
+      ],
+      "targets": {
+        "main":   { "viewName": "Producer" },
+        "detail": { "viewName": "Detail" }
+      }
+    },
+    "dependencies": {
+      "minUI5Version": "1.120.0",
+      "libs": {
+        "sap.m": {},
+        "sap.f": {},
+        "sap.tnt": {},
+        "sap.ui.layout": {},
+        "sap.ui.unified": {},
+        "sap.ui.table": {}
+      }
+    }
+  }
+}

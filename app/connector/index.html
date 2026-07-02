@@ -305,8 +305,8 @@
       <h2>Live-verified on Preview <span style="font-weight:400;color:var(--muted);font-size:.85rem">(2026-06-30)</span></h2>
       <p class="sub">Full prove → balance → submit → finalize round-trip, both transactions submitted from the funded Lace wallet through the same wallet adapter.</p>
       <dl class="kv">
-        <dt>Deployed vault</dt><dd><a class="mono" href="https://preview.midnightexplorer.com/contracts/0x89a952c62503e714ec59e7d1e5d6e54dc5d22bb87234bd62108cb0f684765280" target="_blank" rel="noopener">89a952c62503e714ec59e7d1e5d6e54dc5d22bb87234bd62108cb0f684765280 ↗</a></dd>
-        <dt>Deploy tx (block 1399183)</dt><dd><a class="mono" href="https://preview.midnightexplorer.com/transactions/0x50017232b3c1e21f42a06e844765249932897f62b4340e8930c0f21f06617c66" target="_blank" rel="noopener">50017232b3c1e21f42a06e844765249932897f62b4340e8930c0f21f06617c66 ↗</a></dd>
+        <dt>Deployed vault</dt><dd><a class="mono" href="https://preview.midnightexplorer.com/contracts/0x93f0c359aaaaedcf213f0945003e985f0045c12b8c46cba6d620ec6f9f6109b1" target="_blank" rel="noopener">93f0c359aaaaedcf213f0945003e985f0045c12b8c46cba6d620ec6f9f6109b1 ↗</a></dd>
+        <dt>Deploy tx (block 1425388)</dt><dd><a class="mono" href="https://preview.midnightexplorer.com/transactions/0x577b94c221f3ecc00014be56c5bc298871a88d80fa3a0419faf467c76ef02b2e" target="_blank" rel="noopener">577b94c221f3ecc00014be56c5bc298871a88d80fa3a0419faf467c76ef02b2e ↗</a></dd>
         <dt>attest tx (block 1399202)</dt><dd><a class="mono" href="https://preview.midnightexplorer.com/transactions/0x1f0f6b108041f17733acf35b547da2ca727aea6081c3d509397a6c453e73b463" target="_blank" rel="noopener">1f0f6b108041f17733acf35b547da2ca727aea6081c3d509397a6c453e73b463 ↗</a></dd>
         <dt>Indexer</dt><dd><span class="mono">indexer.preview.midnight.network/api/v4/graphql</span></dd>
       </dl>
@@ -325,10 +325,12 @@
     let walletAddr = null;
     const confirmed = {}; // label -> { txId, hash, block, status, explorer } from on-chain verify
 
-    // Load the bundle dynamically so a load error is visible on the page.
+    // Load the prebuilt lib bundle (npm run build:connector-lib) so the page
+    // works under CAP static serving — the raw ./connector.mjs source uses bare
+    // specifiers (e.g. 'buffer') the browser can't resolve without a bundler.
     let mod;
     try {
-      mod = await import('./connector.mjs');
+      mod = await import('./lib/nightpass-connector.js');
     } catch (e) {
       document.getElementById('wallets').textContent = 'bundle failed to load, see console / log';
       log('BUNDLE LOAD ERROR: ' + (e?.stack || e?.message || e));

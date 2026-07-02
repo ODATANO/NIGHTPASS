@@ -1,0 +1,13 @@
+<core:FragmentDefinition
+  xmlns:core="sap.ui.core"
+  xmlns="sap.m">
+  <Dialog id="walletLogDialog" title="{wallet>/title}" contentWidth="40rem" busy="{wallet>/busy}" busyIndicatorDelay="0">
+    <content>
+      <TextArea id="walletLog" value="{wallet>/log}" editable="false" width="100%" rows="16"
+        growing="false" class="sapUiSmallMargin"/>
+    </content>
+    <buttons>
+      <Button text="Close" press="onWalletLogClose"/>
+    </buttons>
+  </Dialog>
+</core:FragmentDefinition>
