@@ -11,41 +11,21 @@ NIGHTPASS implements the EU Battery Passport. One dataset is exposed with a diff
 
 It consumes [`@odatano/nightgate`](https://github.com/ODATANO/NIGHTGATE) as a CAP plugin (`cds.requires.nightgate`).
 
-## Disclosure tiers
+## How it works, in short
 
-The regulation puts conflicting disclosure rules on one dataset, so a single passport answers different audiences with different views:
+- **Disclosure tiers** (Annex XIII): consumer sees public metadata, recycler additionally chemistry / capacity / recycled shares, authority everything including supplier identities. Enforced server-side by `after READ` handlers; an active on-chain disclosure grant elevates a partner's tier per passport.
+- **Field-bound ZK predicates**: claims like `carbon footprint <= threshold` are proven on-chain without revealing the value, bound to a Merkle root over the passport's fields anchored at attest time, so the proven value provably comes from *this* passport.
+- **One contract**, `attestation-vault` (shipped by the plugin): attest, passport binding, disclosure ACL, content-root anchoring, field-bound predicates.
+- **Two submit paths** to the same contract: server (NIGHTGATE worker wallet, async jobs) or wallet (the user's own Lace via DApp-Connector). Offline-first: without a session or contract, actions land as local log rows and everything still works.
+- **Catena-X**: the cockpit exports the CX-0143 battery-passport aspect JSON and a **Predicate Attestation Credential (PAC)**, carrying the proven predicates with `valueDisclosed: false`. That predicate capability is what Tractus-X currently lacks.
 
-| Tier | Audience | Annex XIII scope |
-|---|---|---|
-| consumer | public / phone scan | Point 1 public metadata + QR |
-| recycler | legitimate-interest parties | + cell chemistry, capacity, recycled-material shares (Points 2/3) |
-| authority | regulators | + supplier identities, carbon footprint, due-diligence docs, on-chain lineage |
+## Documentation
 
-The tier is enforced server-side by `after READ` handlers in `srv/passport-service.ts` that redact restricted fields. An active on-chain disclosure grant elevates a requester's tier above their login role, scoped per passport (by `payloadHash`), and degrades to the login role on any lookup failure.
-
-## Field-bound zero-knowledge predicates
-
-Some claims must be provable without disclosing the value, which reveal-or-hide credentials cannot express. NIGHTPASS proves them and binds the proven value to the passport's actual field, so a verifier knows the value came from **this** passport and not an arbitrary number.
-
-How it works:
-
-1. At attest time the producer anchors a **content root**: a Merkle tree over the passport's provable fields, each leaf `persistentHash(fieldKey, scaledValue)`. The off-chain tree is built with the contract's exported `pureCircuits`, so it hashes identically to the circuit.
-2. To prove a claim, `proveFieldPredicate(payloadHash, fieldKey, threshold, op)` recomputes the field's Merkle leaf from witnessed value plus inclusion path, folds it to a root, asserts that root equals the anchored `content_root`, then asserts the predicate (`value <= threshold` or `value >= threshold`).
-3. The transaction only lands if both asserts hold, so a successful tx is the proof. The value stays a witness and never goes on-chain.
-
-Provable fields (all commercially sensitive, all with a regulatory or buyer-relevant bound):
-
-| Field | Example bound |
+| Doc | Contents |
 |---|---|
-| carbon footprint (kg CO2/kWh) | value <= class threshold |
-| capacity (kWh) | value >= rated |
-| recycled content % | value >= Art. 8 minimum |
-| cycle life (cycles) | value >= floor |
-| round-trip efficiency % | value >= floor |
-| lead content (ppm) | value <= limit |
-| recycled cobalt / lithium / nickel % | value >= Art. 8 minimum (per material) |
-
-The off-chain Merkle builder lives in `srv/lib/passport-anchor.ts` (`buildContentRoot`, `PROVABLE_FIELDS`); the circuits live in the plugin's `attestation-vault` contract.
+| [docs/producer-flow.md](docs/producer-flow.md) | Step-by-step lifecycle: which steps produce transactions and why, how to read them in the explorer, live Preview transactions, glossary |
+| [docs/producer-walkthrough.md](docs/producer-walkthrough.md) | Producer cockpit with screenshots, tab by tab |
+| [docs/architecture.md](docs/architecture.md) | Layers, data flow, security model, field-bound proof construction, plugin build & deploy |
 
 ## Quick start
 
@@ -69,47 +49,9 @@ Open http://localhost:4004/ for the launchpad.
 | PassportService | `/api/v1/passport` |
 | NightgateService (+ indexer / analytics / admin) | `/api/v1/nightgate` |
 
-Step-by-step producer flow with screenshots: [docs/producer-walkthrough.md](docs/producer-walkthrough.md).
-
 ### Login (custom auth, `srv/auth.js`)
 
-Anonymous resolves to consumer. Built-in demo users: `producer`/`producer`, `recycler`/`recycler`, `authority`/`authority`. Dataspace partners log in with their BPN plus secret (from `passport.Partners`) and see only passports granted to them, at the granted level. BPNs are used instead of DIDs because the colon in `did:web:...` breaks HTTP Basic auth.
-
-## Two ways to submit on-chain
-
-Both target the same `attestation-vault` contract on the same chain. They differ only in who holds the key.
-
-- **Server path** (background, no wallet popups): `ProducerService` actions run through NIGHTGATE's worker wallet as async jobs. Needs a signing session (`PRODUCER_VIEWING_KEY` plus `PRODUCER_WALLET_MNEMONIC` or `PRODUCER_WALLET_SEED_HEX`) and `PASSPORT_CONTRACT_ADDRESS`. Without them, actions land as offline log rows.
-- **Wallet path** (in-app, interactive): the producer cockpit and the connector page drive the same operations from the user's own Lace wallet over the DApp-Connector, using NIGHTGATE's `@odatano/nightgate/browser` building blocks. The connector code is bundled to a self-contained lib via `npm run build:connector-lib`.
-
-The cockpit's Wallet / Server toggle selects the mode per passport; the [producer walkthrough](docs/producer-walkthrough.md) covers the step-by-step flow with screenshots.
-
-Offline-first everywhere: without a session or contract, actions write local tracking rows (`PassportTransactions`, `DisclosureGrantLog`, `PredicateProofLog`) so the cockpit and the read gate work without the chain.
-
-## Contract (Compact / Midnight)
-
-There is one contract, `attestation-vault`, shipped by the plugin and registered under `cds.requires.nightgate.contracts`. It carries the tiered-disclosure ACL (`attest`, `grantDisclosure`, `revokeDisclosure`), the passport binding (`bindPassport`: `passportId -> payloadHash`), the numeric-commitment predicate (`commitValue`, `provePredicate`), and the field-bound predicate (`anchorContentRoot`, `proveFieldPredicate`) plus the exported pure hashes `leafHash` / `nodeHash`. Compact cannot inherit ledger state across contracts, so everything lives in this one contract (the former separate `passport-attestation` was folded in).
-
-Source and managed artifacts ship in `@odatano/nightgate`; recompiling needs the Compact toolchain in WSL (compactc 0.31.0).
-
-### Live verification (Preview)
-
-Full round-trip proven live on the Midnight Preview network via Lace, all transactions from a funded wallet:
-
-| Step | On-chain result |
-|---|---|
-| Deploy `attestation-vault` | contract [`0x93f0c359…6109b1`](https://preview.midnightexplorer.com/contracts/0x93f0c359aaaaedcf213f0945003e985f0045c12b8c46cba6d620ec6f9f6109b1) · tx [`0x577b94c2…f02b2e`](https://preview.midnightexplorer.com/transactions/0x577b94c221f3ecc00014be56c5bc298871a88d80fa3a0419faf467c76ef02b2e) (block 1425388) |
-| `attest` | tx [`0x4775a800…f9bdd`](https://preview.midnightexplorer.com/transactions/0x4775a800ab048228e3b9b44a6f94b292a38b5067048f20d84eb305c9b51f9bdd) (block 1425593) |
-| `anchorContentRoot` | tx [`0x8cea99f5…b6591`](https://preview.midnightexplorer.com/transactions/0x8cea99f5611de5b8dd65848c840772278c2a104a089cb48eae2e084aa11b6591) (block 1425602) |
-| `proveFieldPredicate` (carbon <= threshold) | tx [`0x7e405996…6b2278`](https://preview.midnightexplorer.com/transactions/0x7e4059961cb78b0c4aab8aacb8b047789f79d8ec112117a422e8da21346b2278) (block 1425633) |
-
-Runtime notes: the network follows the wallet (Lace `getConfiguration()` supplies the indexer and network id; `NETWORK` in `connector.mjs` is `preview`). Prove runs against a local proof server at `http://localhost:6300` because the hosted one omits the CORS header on the POST response. `submitTx` returns the transaction identifier (not the serialized tx), derived via `ledger.Transaction.deserialize(...).identifiers()[0]`.
-
-## Catena-X / Tractus-X
-
-The Battery Passport is Catena-X use case CX-0143. Tractus-X has no predicate or range-proof capability (its closest, AAC-SD, only reveals or hides attributes via BBS+). NIGHTPASS fills that gap with a **Predicate Attestation Credential (PAC)**: the `zkPredicate` mode that proves `value <= threshold` without revealing the value. Verification is indexer-trust: a consumer confirms the proof transaction was included and succeeded (a successful tx is the proof). The PAC glue lives in `tractusx/`; the ZK primitive lives in the plugin.
-
-The producer cockpit surfaces this on a Catena-X tab: Generate JSON (aspect via `passportAspectJson`) and Build PAC (W3C-VC / CX-0143 via `passportCredential`, `valueDisclosed: false`). See the [producer walkthrough](docs/producer-walkthrough.md).
+Anonymous resolves to consumer. Built-in demo users: `producer`/`producer`, `recycler`/`recycler`, `authority`/`authority`. Dataspace partners log in with their BPN plus secret (from `passport.Partners`) and see only passports granted to them, at the granted level.
 
 ## Repository layout
 
@@ -124,7 +66,7 @@ app/producer/webapp/              producer cockpit (SAPUI5)
 app/passport/webapp/              consumer viewer, one app / three tiers
 app/connector/                    Lace DApp-Connector page + connector.mjs (Vite lib bundle)
 tractusx/pac/                     Predicate Attestation Credential glue + verify demo
-docs/                             architecture.md/svg/png
+docs/                             producer-flow.md, producer-walkthrough.md, architecture.md/svg/png
 ```
 
 ## Scripts
@@ -136,10 +78,3 @@ docs/                             architecture.md/svg/png
 | `npm run build:connector-lib` | Build the connector into `app/connector/lib` (self-contained ESM, WASM inlined) |
 | `npm run producer:smoke` | Producer cockpit offline-path smoke test |
 | `npm run pac:demo` | Build a PAC and verify it (`tractusx/pac/`) |
-
-## Glossary
-
-- **PAC** (Predicate Attestation Credential): the credential NIGHTPASS introduces, a zero-knowledge predicate proof (for example "recycled share >= X%") that proves the statement without disclosing the value.
-- **AAC** (Attribute Attestation Credential, AAC-SD): the Tractus-X credential profile that reveals or hides attributes via BBS+, with no predicate mode.
-- **EDC** (Eclipse Dataspace Connector): the standard component for sovereign data exchange; PAC is delivered over its data plane.
-- **content root**: a Merkle root over a passport's provable fields, anchored on-chain, that a field-bound predicate proof binds the proven value to.

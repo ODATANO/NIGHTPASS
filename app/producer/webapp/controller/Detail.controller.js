@@ -12,22 +12,22 @@ sap.ui.define([
 
     onInit: function () {
       this._router().getRoute("detail").attachPatternMatched(this._onMatched, this);
-      // Submit mode for the top action buttons + whether the passport is anchored
-      // on-chain (Grant/Revoke/Prove gate; the Page context does not reliably
-      // reach headerContent buttons, so drive it from an absolute named-model flag).
-      this.getView().setModel(new JSONModel({ mode: "wallet", anchored: false }), "ui");
+      // Whether the passport is anchored on-chain (Grant/Revoke/Prove gate; the
+      // Page context does not reliably reach headerContent buttons, so drive it
+      // from an absolute named-model flag).
+      this.getView().setModel(new JSONModel({ anchored: false }), "ui");
       // Catena-X tab: generated aspect JSON + built PAC.
       this.getView().setModel(new JSONModel({ aspect: "", pac: "" }), "cx");
     },
 
-    // The top action buttons route to the wallet (Lace) or server handler based
-    // on the selected mode. The per-tab forms (partner/level, field/threshold)
-    // supply the inputs; the buttons live in the page header.
-    _mode: function () { return this.getView().getModel("ui").getProperty("/mode"); },
-    onAttest:       function () { return this._mode() === "server" ? this.onSubmit()  : this.onSignWithLace(); },
-    onGrantAction:  function () { return this._mode() === "server" ? this.onGrant()   : this.onGrantWithLace(); },
-    onRevokeAction: function () { return this._mode() === "server" ? this.onRevoke()  : this.onRevokeWithLace(); },
-    onProveAction:  function () { return this._mode() === "server" ? this.onProve()   : this.onProveWithLace(); },
+    // The top action buttons run the wallet (Lace) flow. The server on-chain
+    // handlers (onSubmit/onGrant/onRevoke/onProve) stay below but are not wired
+    // to the UI. The per-tab forms (partner/level, field/threshold) supply the
+    // inputs; the buttons live in the page header.
+    onAttest:       function () { return this.onSignWithLace(); },
+    onGrantAction:  function () { return this.onGrantWithLace(); },
+    onRevokeAction: function () { return this.onRevokeWithLace(); },
+    onProveAction:  function () { return this.onProveWithLace(); },
 
     _onMatched: function (oEvent) {
       var sKey = decodeURIComponent(oEvent.getParameter("arguments").key);
@@ -169,12 +169,6 @@ sap.ui.define([
         that.toast("prove: " + res.mode + (res.result === true ? " · ✓ proven" : res.result === false ? " · false" : ""));
         that._refreshAll();
       }).catch(function (e) { that.error(e); });
-    },
-
-    _randHex32: function () {
-      var b = new Uint8Array(32);
-      window.crypto.getRandomValues(b);
-      return Array.from(b, function (x) { return x.toString(16).padStart(2, "0"); }).join("");
     },
 
     // Per-field predicate presets (human units; the value is scaled ×1000 in the
@@ -382,12 +376,19 @@ sap.ui.define([
     onShareGrant: function () {
       var oShare = this.getView().getModel("share");
       var sGrantee = (oShare.getProperty("/grantee") || "").trim();
-      if (!sGrantee) { return this.toast("enter the supplier's grantee (32-byte hex)"); }
+      if (!sGrantee) { return this.toast("select the supplier partner"); }
+      var lvl = parseInt(oShare.getProperty("/level"), 10);
+      var ph = oShare.getProperty("/payloadHash") || "";
+      if (!ph) { return this.toast("attest the passport with Lace first"); }
       var that = this;
-      this.callAction("/grantPassportDisclosure", {
-        passportId: this._pid(), grantee: sGrantee, level: parseInt(oShare.getProperty("/level"), 10)
-      }).then(function (res) { that.toast("supplier granted (" + res.mode + ")"); that._refreshAll(); })
-        .catch(function (e) { that.error(e); });
+      this._lace("Grant supplier with Lace", async function (mod, api, append) {
+        append("granting disclosure level " + lvl + " on-chain…");
+        await mod.grantDisclosure(api, { contractAddress: that._VAULT, payloadHash: ph, grantee: sGrantee, level: lvl }, append);
+        var r = await that._resolveHash(mod, append);
+        append("saving grant in cockpit…");
+        await that.callAction("/recordWalletDisclosure", { passportId: that._pid(), grantee: sGrantee, level: lvl, op: "grant", txHash: r.hash });
+        that._refreshAll(); append("done."); that.toast("supplier granted via Lace");
+      });
     },
 
     onCopyLink: function () {
@@ -399,11 +400,11 @@ sap.ui.define([
     },
 
     onDownloadCredential: function () {
-      var sHash = this.getView().getModel("share").getProperty("/payloadHash");
       var that = this;
-      // passportCredential is a function returning the credential JSON string.
+      // passportCredential is a function returning the credential JSON string
+      // (the ProducerService variant is keyed by passportId).
       var oOp = this._model().bindContext("/passportCredential(...)");
-      oOp.setParameter("payloadHash", sHash);
+      oOp.setParameter("passportId", this._pid());
       this.setBusy(true);
       oOp.invoke().then(function () {
         var oRes = oOp.getBoundContext().getObject();

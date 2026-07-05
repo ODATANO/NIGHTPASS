@@ -34,8 +34,7 @@ sap.ui.define([
         { material: "Li", recycledPercentage: 8.25, sourceSupplierName: "LiLoop Recycling BV" },
         { material: "Ni", recycledPercentage: 12.0, sourceSupplierName: "NickelBack Materials Oy" }
       ],
-      diligenceDocType: "supply-chain-due-diligence-report",
-      submit: false
+      diligenceDocType: "supply-chain-due-diligence-report"
     };
   }
 
@@ -210,9 +209,11 @@ sap.ui.define([
       });
 
       var that = this;
+      // Always save as an off-chain draft; anchoring happens wallet-driven
+      // (Attest with Lace) in the detail cockpit.
       this.callAction("/createPassport", {
         passportJson: passportJson,
-        submit: !!d.submit,
+        submit: false,
         owner: this._session().getProperty("/owner")
       }).then(function (res) {
         that.byId("createDialog").close();
