@@ -3,6 +3,7 @@ import QRCode from 'qrcode';
 import { Passport, Passports, PredicateProofLog, Partners } from '#cds-models/passport';
 import { hashPayload, blake2b256Hex, encryptPayload, anchorPassport } from './lib/passport-anchor';
 import { granteeIdForDid } from './lib/grantee';
+import { rowToBatch, type Batch, type GoodsReceiptRow } from './lib/goods-receipt';
 
 const { INSERT, SELECT, UPDATE } = cds.ql;
 
@@ -85,11 +86,13 @@ async function effectiveGrantsFor(grantees: string[]): Promise<Map<string, numbe
         for (const g of rows as Record<string, unknown>[]) bump(g.payloadHash, g.level);
     } catch { /* plugin tables absent */ }
     // (b) offline producer log: latest op per (passport, grantee); if it's a
-    // `grant`, map passport_ID → payloadHash and count it.
+    // `grant`, map passport_ID → payloadHash and count it. Only settled rows count
+    // (`succeeded` = chain-verified, `offline` = no-chain demo grant); a `pending`
+    // wallet grant must NOT elevate a tier before its tx is verified on-chain.
     try {
         const rows = await SELECT.from('passport.DisclosureGrantLog')
             .columns('grantee', 'level', 'op', 'createdAt', 'passport_ID')
-            .where({ grantee: { in: grantees } })
+            .where({ grantee: { in: grantees }, status: { in: ['succeeded', 'offline'] } })
             .orderBy('createdAt asc');
         const latest = new Map<string, Record<string, unknown>>();
         for (const r of rows as Record<string, unknown>[]) latest.set(`${r.passport_ID}|${r.grantee}`, r);
@@ -239,9 +242,9 @@ export default class PassportService extends cds.ApplicationService {
         const { batchId, sessionId } = req.data as { batchId?: string; sessionId?: string };
         if (!batchId) return req.reject(400, 'batchId is required');
 
-        // 1. Fetch batch data. T21 (mock SAP) will replace this; the seam keeps
-        //    the contract stable. For now resolve a demo batch by id.
-        const batch = resolveBatch(batchId);
+        // 1. Fetch batch data from the mock SAP goods-receipt feed (T21). The row
+        //    carries the public header + the shielded payload; rowToBatch parses it.
+        const batch = await resolveBatch(batchId);
         if (!batch) return req.reject(404, `batch '${batchId}' not found`);
         const passportId = batch.passportId;
 
@@ -299,6 +302,10 @@ export default class PassportService extends cds.ApplicationService {
             attestationTxHash
         });
 
+        // Mark the goods-receipt consumed so the feed reflects that this batch
+        // was turned into a passport (best-effort; the passport row is the SoT).
+        await UPDATE.entity('mocksap.GoodsReceipts').set({ status: 'consumed' }).where({ batchId });
+
         // 7. Return the action result, incl. the QR as a data-URL PNG (T23).
         const qrCodePng = await QRCode.toDataURL(qrCodeUrl, { width: 320, margin: 1 });
         return { passportId, attestationTxHash, qrCodeUrl, qrCodePng };
@@ -322,7 +329,9 @@ export default class PassportService extends cds.ApplicationService {
             contractAddress:   row.contractAddress,
             attestationTxHash: row.attestationTxHash,
             status:            row.status,
-            verified:          row.status === 'anchored' && !!row.attestationTxHash,
+            // DB-state assertion only (anchored + tx present); NOT a live on-chain
+            // re-verification. A verifier resolves attestationTxHash to confirm.
+            locallyAnchored:   row.status === 'anchored' && !!row.attestationTxHash,
             viewerUrl:         `${demoHost}/resolve/${raw}`
         };
     };
@@ -356,7 +365,8 @@ export default class PassportService extends cds.ApplicationService {
                     contractAddress: p.contractAddress ? `0x${String(p.contractAddress).replace(/^0x/, '')}` : null,
                     transactionHash: p.attestationTxHash ? `0x${String(p.attestationTxHash).replace(/^0x/, '')}` : null,
                     status: p.status,
-                    verified: p.status === 'anchored' && !!p.attestationTxHash,
+                    // DB-state assertion only; a verifier resolves transactionHash on-chain.
+                    locallyAnchored: p.status === 'anchored' && !!p.attestationTxHash,
                     explorer: explorer(p.attestationTxHash)
                 },
                 predicateProofs: (proofs as Record<string, unknown>[]).map((pr) => ({
@@ -386,12 +396,15 @@ export default class PassportService extends cds.ApplicationService {
         const r = role === 'authority' ? 'authority' : 'recycler';
         const granteeId = granteeIdForDid(d);
 
+        // A DID/BPN is claimed once. Re-registration must NOT rotate the secret of
+        // an existing partner: that would let anyone reset the credential of a
+        // partner who already holds grants and then read as them. Reject instead;
+        // a change to an existing partner is an out-of-band / admin operation. The
+        // action itself is producer-gated (@requires in passport-service.cds), so
+        // registration is producer-led, not anonymous self-service.
         const existing = await SELECT.one.from(Partners).where({ did: d });
-        if (existing) {
-            await UPDATE.entity(Partners).set({ name, role: r, granteeId, secret }).where({ did: d });
-        } else {
-            await INSERT.into(Partners).entries({ did: d, name, role: r, granteeId, secret } as any);
-        }
+        if (existing) return req.reject(409, `partner '${d}' already registered`);
+        await INSERT.into(Partners).entries({ did: d, name, role: r, granteeId, secret } as any);
 
         // Bind DID → granteeId in the plugin's GranteeIdentities (global scope),
         // so granteesOf(req) resolves this partner at read time. Idempotent.
@@ -412,53 +425,18 @@ export default class PassportService extends cds.ApplicationService {
     };
 }
 
-// --- Batch source (T21 seam) -------------------------------------------------
-
-interface Batch {
-    passportId: string;
-    public: {
-        manufacturerId: string;
-        batteryCategory: string;
-        model: string;
-        manufactureDate: string;
-        weightKg: number;
-        performanceClass: string;
-    };
-    /** Shielded payload (Annex XIII Points 2-4). Hashed and encrypted, never public. */
-    payload: Record<string, unknown>;
-}
+// --- Batch source (T21 mock SAP goods-receipt feed) --------------------------
 
 /**
- * Resolve a goods-receipt batch by id. Placeholder for T21 (mock SAP service);
- * returns a demo batch matching the T17 seed so the flow is exercisable now.
+ * Resolve a goods-receipt batch by id from the mock SAP feed
+ * (mocksap.GoodsReceipts, served by MockSapService). Rows are emitted by the
+ * deterministic generator, not hard-coded; rowToBatch parses the stored public
+ * header + shielded payload back into the batch shape generatePassport consumes.
+ * Returns null when the batch id is unknown.
  */
-function resolveBatch(batchId: string): Batch | null {
-    if (batchId !== 'BATCH-PREVIEW-0001') return null;
-    return {
-        passportId: 'BAT-PREVIEW-0001',
-        public: {
-            manufacturerId:   'DE-CELLCO-001',
-            batteryCategory:  'EV',
-            model:            'PowerCell EV-75',
-            manufactureDate:  '2026-03-15',
-            weightKg:         432.5,
-            performanceClass: 'B'
-        },
-        payload: {
-            batteries: [{
-                serialNumber: 'SN-AX-0001',
-                cellChemistry: 'NMC-811',
-                capacityKwh: 75.0,
-                carbonFootprintKgCO2: 3412.75,
-                supplierName: 'CathodeWorks GmbH'
-            }],
-            recycledMaterials: [
-                { material: 'Co', recycledPercentage: 16.5, sourceSupplierName: 'ReCobalt Recyclers SA' },
-                { material: 'Li', recycledPercentage: 8.25, sourceSupplierName: 'LiLoop Recycling BV' },
-                { material: 'Ni', recycledPercentage: 12.0, sourceSupplierName: 'NickelBack Materials Oy' }
-            ],
-            diligenceDocs: [{ docType: 'supply-chain-due-diligence-report' }]
-        }
-    };
+async function resolveBatch(batchId: string): Promise<Batch | null> {
+    const row = await SELECT.one.from('mocksap.GoodsReceipts').where({ batchId });
+    if (!row) return null;
+    return rowToBatch(row as GoodsReceiptRow);
 }
 

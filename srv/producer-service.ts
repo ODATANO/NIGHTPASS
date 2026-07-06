@@ -7,14 +7,20 @@ import {
     hashPayload, blake2b256Hex, encryptPayload, anchorPassport, waitForJob,
     buildContentRoot, fieldKeyHex, BATTERY_PROVABLE_FIELDS
 } from './lib/passport-anchor';
+import { verifyContractTx, type ChainVerdict } from './lib/chain-verify';
 
 const CONTRACT_REF = 'attestation-vault';
 
 const { INSERT, SELECT, UPDATE } = cds.ql;
 
 const EXPLORER = 'https://preview.midnightexplorer.com';
+const norm = (h?: string | null): string => String(h ?? '').replace(/^0x/, '');
 function txExplorerUrl(hash?: string | null): string | null {
     return hash ? `${EXPLORER}/transactions/0x${String(hash).replace(/^0x/, '')}` : null;
+}
+/** Map a chain verdict to the cockpit-facing row status. */
+function walletStatus(v: ChainVerdict): 'succeeded' | 'failed' | 'pending' {
+    return v === 'confirmed' ? 'succeeded' : v === 'failed' ? 'failed' : 'pending';
 }
 
 interface PassportInput {
@@ -189,26 +195,53 @@ export default class ProducerService extends cds.ApplicationService {
         return { passportId: r.passportId, mode: r.mode, txHash: r.txHash };
     };
 
-    /** Persist a wallet-driven (in-app Lace) attest tx into the cockpit. */
+    /**
+     * Persist a wallet-driven (in-app Lace) attest tx into the cockpit.
+     *
+     * The browser hands us a txHash after it submits. That is a CLAIM, not proof:
+     * the row lands `pending` and the passport `anchoring`. It is only marked
+     * `anchored` once the tx is structurally verified on-chain (found, SUCCESS,
+     * and acting on the AttestationVault). See settleWalletTx / verifyContractTx.
+     */
     private recordWalletAttest = async (req: cds.Request) => {
         const { passportId, txHash, identifier, contractAddress } = req.data as
             { passportId?: string; txHash?: string; identifier?: string; contractAddress?: string };
         const row: any = await this.passportRef(String(passportId ?? ''));
         if (!row) return req.reject(404, `passport '${passportId}' not found`);
-        const hash = String(txHash ?? '').replace(/^0x/, '');
+        const hash = norm(txHash);
+        const contract = contractAddress || row.contractAddress || this.contractAddress();
+        const txRowId = cds.utils.uuid();
         await INSERT.into(PassportTransactions).entries({
-            passport_ID: row.ID, kind: 'attest', txHash: hash || null, identifier: identifier || null,
-            status: 'succeeded', explorerUrl: hash ? txExplorerUrl(hash) : null
+            ID: txRowId, passport_ID: row.ID, kind: 'attest', txHash: hash || null, identifier: identifier || null,
+            status: 'pending', explorerUrl: hash ? txExplorerUrl(hash) : null
         } as any);
         await UPDATE.entity(Passports).set({
-            status: 'anchored',
+            status: 'anchoring',
             attestationTxHash: hash || row.attestationTxHash,
-            contractAddress: contractAddress || row.contractAddress
+            contractAddress: contract || row.contractAddress
         }).where({ ID: row.ID });
-        return { ok: true, txHash: hash };
+
+        const verdict = await this.settleWalletTx({
+            txHash: hash, contractAddress: contract,
+            onConfirmed: async () => {
+                await UPDATE.entity(PassportTransactions).set({ status: 'succeeded' }).where({ ID: txRowId });
+                await UPDATE.entity(Passports).set({ status: 'anchored' }).where({ ID: row.ID });
+            },
+            onFailed: async () => {
+                await UPDATE.entity(PassportTransactions).set({ status: 'failed', errorMessage: 'tx not verified on-chain' }).where({ ID: txRowId });
+                await UPDATE.entity(Passports).set({ status: 'failed' }).where({ ID: row.ID });
+            }
+        });
+        return { ok: verdict !== 'failed', txHash: hash, status: walletStatus(verdict) };
     };
 
-    /** Persist a wallet-driven (in-app Lace) disclosure grant/revoke. */
+    /**
+     * Persist a wallet-driven (in-app Lace) disclosure grant/revoke.
+     *
+     * Held at `pending` until the tx is verified on-chain, so an unverified
+     * grant never elevates a partner's read tier (the read gate counts only
+     * succeeded/offline grants, not pending ones).
+     */
     private recordWalletDisclosure = async (req: cds.Request) => {
         const { passportId, grantee, level, op, txHash } = req.data as
             { passportId?: string; grantee?: string; level?: number; op?: string; txHash?: string };
@@ -216,15 +249,30 @@ export default class ProducerService extends cds.ApplicationService {
         const row: any = await this.passportRef(String(passportId ?? ''));
         if (!row) return req.reject(404, `passport '${passportId}' not found`);
         const o = op === 'revoke' ? 'revoke' : 'grant';
-        const hash = String(txHash ?? '').replace(/^0x/, '');
+        const hash = norm(txHash);
+        const contract = row.contractAddress || this.contractAddress();
+        const grantLogId = cds.utils.uuid();
+        const txRowId = cds.utils.uuid();
         await INSERT.into(DisclosureGrantLog).entries({
-            passport_ID: row.ID, grantee, level: Number(level ?? 0), op: o, txHash: hash || null, status: 'succeeded'
+            ID: grantLogId, passport_ID: row.ID, grantee, level: Number(level ?? 0), op: o, txHash: hash || null, status: 'pending'
         } as any);
         await INSERT.into(PassportTransactions).entries({
-            passport_ID: row.ID, kind: o === 'grant' ? 'grantDisclosure' : 'revokeDisclosure',
-            txHash: hash || null, status: 'succeeded', explorerUrl: hash ? txExplorerUrl(hash) : null
+            ID: txRowId, passport_ID: row.ID, kind: o === 'grant' ? 'grantDisclosure' : 'revokeDisclosure',
+            txHash: hash || null, status: 'pending', explorerUrl: hash ? txExplorerUrl(hash) : null
         } as any);
-        return { ok: true, txHash: hash };
+
+        const verdict = await this.settleWalletTx({
+            txHash: hash, contractAddress: contract,
+            onConfirmed: async () => {
+                await UPDATE.entity(DisclosureGrantLog).set({ status: 'succeeded' }).where({ ID: grantLogId });
+                await UPDATE.entity(PassportTransactions).set({ status: 'succeeded' }).where({ ID: txRowId });
+            },
+            onFailed: async () => {
+                await UPDATE.entity(DisclosureGrantLog).set({ status: 'failed' }).where({ ID: grantLogId });
+                await UPDATE.entity(PassportTransactions).set({ status: 'failed', errorMessage: 'tx not verified on-chain' }).where({ ID: txRowId });
+            }
+        });
+        return { ok: verdict !== 'failed', txHash: hash, status: walletStatus(verdict) };
     };
 
     /**
@@ -338,7 +386,9 @@ export default class ProducerService extends cds.ApplicationService {
                     contractAddress: hex0x(p.contractAddress),
                     transactionHash: hex0x(p.attestationTxHash),
                     status: p.status,
-                    verified: p.status === 'anchored' && !!p.attestationTxHash,
+                    // `locallyAnchored` is a DB-state assertion (anchored + tx present),
+                    // NOT an on-chain re-verification. A verifier should resolve the tx.
+                    locallyAnchored: p.status === 'anchored' && !!p.attestationTxHash,
                     explorer: explorer(p.attestationTxHash)
                 },
                 predicateProofs: proofs.map((pr) => ({
@@ -358,28 +408,106 @@ export default class ProducerService extends cds.ApplicationService {
         return JSON.stringify(credential, null, 2);
     };
 
-    /** Persist a wallet-driven (in-app Lace) predicate proof. */
+    /**
+     * Persist a wallet-driven (in-app Lace) predicate proof.
+     *
+     * A predicate that does not hold is rejected in-circuit (no tx lands), so a
+     * claimed `result:false` is recorded `failed` immediately. A claimed success
+     * is held `pending` until the proof tx is structurally verified on-chain, so
+     * a fabricated txHash never surfaces as a proven claim in the PAC.
+     */
     private recordWalletPredicate = async (req: cds.Request) => {
         const { passportId, sourceField, predicate, threshold, unit, txHash, result } = req.data as
             { passportId?: string; sourceField?: string; predicate?: string; threshold?: number; unit?: string; txHash?: string; result?: boolean };
         const row: any = await this.passportRef(String(passportId ?? ''));
         if (!row) return req.reject(404, `passport '${passportId}' not found`);
         const pred = predicate === 'greaterOrEqual' ? 'greaterOrEqual' : 'lessOrEqual';
-        const hash = String(txHash ?? '').replace(/^0x/, '');
-        // A predicate that does not hold is rejected in-circuit (no tx lands), so
-        // result:false => a 'failed' log entry (visible as "false" in the cockpit).
-        const proven = result !== false;
-        const st = proven ? 'succeeded' : 'failed';
+        const hash = norm(txHash);
+        const contract = row.contractAddress || this.contractAddress();
+        const proofLogId = cds.utils.uuid();
+        const txRowId = cds.utils.uuid();
+
+        if (result === false) {
+            await INSERT.into(PredicateProofLog).entries({
+                ID: proofLogId, passport_ID: row.ID, sourceField, predicate: pred, threshold: Number(threshold ?? 0),
+                unit, txHash: hash || null, status: 'failed', result: false
+            } as any);
+            await INSERT.into(PassportTransactions).entries({
+                ID: txRowId, passport_ID: row.ID, kind: 'provePredicate', txHash: hash || null,
+                status: 'failed', explorerUrl: hash ? txExplorerUrl(hash) : null
+            } as any);
+            return { ok: true, txHash: hash, status: 'failed' };
+        }
+
         await INSERT.into(PredicateProofLog).entries({
-            passport_ID: row.ID, sourceField, predicate: pred, threshold: Number(threshold ?? 0),
-            unit, txHash: hash || null, status: st, result: proven
+            ID: proofLogId, passport_ID: row.ID, sourceField, predicate: pred, threshold: Number(threshold ?? 0),
+            unit, txHash: hash || null, status: 'pending', result: true
         } as any);
         await INSERT.into(PassportTransactions).entries({
-            passport_ID: row.ID, kind: 'provePredicate', txHash: hash || null,
-            status: st, explorerUrl: hash ? txExplorerUrl(hash) : null
+            ID: txRowId, passport_ID: row.ID, kind: 'provePredicate', txHash: hash || null,
+            status: 'pending', explorerUrl: hash ? txExplorerUrl(hash) : null
         } as any);
-        return { ok: true, txHash: hash };
+
+        const verdict = await this.settleWalletTx({
+            txHash: hash, contractAddress: contract,
+            onConfirmed: async () => {
+                await UPDATE.entity(PredicateProofLog).set({ status: 'succeeded' }).where({ ID: proofLogId });
+                await UPDATE.entity(PassportTransactions).set({ status: 'succeeded' }).where({ ID: txRowId });
+            },
+            onFailed: async () => {
+                await UPDATE.entity(PredicateProofLog).set({ status: 'failed', result: false }).where({ ID: proofLogId });
+                await UPDATE.entity(PassportTransactions).set({ status: 'failed', errorMessage: 'tx not verified on-chain' }).where({ ID: txRowId });
+            }
+        });
+        return { ok: verdict !== 'failed', txHash: hash, status: walletStatus(verdict) };
     };
+
+    // --- wallet-tx settlement -------------------------------------------------
+
+    /** Run a DB op in its own short root transaction (commits immediately). */
+    private runDetached<T>(fn: () => Promise<T>): Promise<T> {
+        return (cds as any).tx({}, fn);
+    }
+
+    /**
+     * Structurally verify a wallet-submitted tx, then finalize the row.
+     *
+     * Runs one inline check. On `confirmed` it finalizes now; on `failed` it marks
+     * the row failed; on `unknown` (indexer disabled or lagging) it leaves the row
+     * PENDING and retries detached for a bounded window before giving up. A row is
+     * never promoted to succeeded on the client's word alone.
+     */
+    private async settleWalletTx(o: {
+        txHash: string;
+        contractAddress?: string | null;
+        onConfirmed: () => Promise<void>;
+        onFailed: () => Promise<void>;
+    }): Promise<ChainVerdict> {
+        const check = (): Promise<ChainVerdict> => verifyContractTx(o.txHash, { contractAddress: o.contractAddress });
+        let verdict: ChainVerdict = 'unknown';
+        try { verdict = await check(); } catch { verdict = 'unknown'; }
+        if (verdict === 'confirmed') { await o.onConfirmed(); return verdict; }
+        if (verdict === 'failed') { await o.onFailed(); return verdict; }
+        // unknown: the indexer may just be lagging. Retry off the request path.
+        if (o.txHash) this.trackWalletTx(check, o.onConfirmed, o.onFailed);
+        return verdict;
+    }
+
+    /** Detached bounded poll: re-verify until the indexer resolves, else stay pending. */
+    private trackWalletTx(
+        check: () => Promise<ChainVerdict>, onConfirmed: () => Promise<void>, onFailed: () => Promise<void>
+    ): void {
+        setImmediate(async () => {
+            for (let i = 0; i < 12; i++) {
+                await new Promise((r) => setTimeout(r, 5000));
+                let verdict: ChainVerdict = 'unknown';
+                try { verdict = await check(); } catch { /* keep polling */ }
+                if (verdict === 'confirmed') { await this.runDetached(onConfirmed); return; }
+                if (verdict === 'failed') { await this.runDetached(onFailed); return; }
+            }
+            // Never confirmed within the window (e.g. crawler disabled): stays pending.
+        });
+    }
 
     /** Shared anchor+persist: attest + bindPassport, log each tx, update status. */
     private async anchorRow(

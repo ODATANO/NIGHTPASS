@@ -49,8 +49,8 @@ grants and predicate proofs are further circuit calls.
 
 1. Server path: `ProducerService` runs the calls through NIGHTGATE's worker wallet
    as async jobs (no UI, no wallet popups), polling `getJobStatus`.
-2. Wallet path: the cockpit and the connector page run the same calls from the
-   user's Lace wallet over the DApp-Connector, using `@odatano/nightgate/browser`.
+2. Wallet path: the cockpit runs the same calls in-app from the user's Lace wallet
+   over the DApp-Connector, using `@odatano/nightgate/browser`.
 
 Offline-first: without a signing session or contract, actions write local tracking
 rows so the cockpit and read gate work without the chain.
@@ -189,5 +189,5 @@ offline path (hash, encrypt, persist, QR, local log rows) still runs.
 - Services: `ProducerService` (`/api/v1/producer`), `PassportService` (`/api/v1/passport`), `NightgateService` (`/api/v1/nightgate`).
 - Contract: one `attestation-vault` (plugin-shipped): tiered disclosure, passport binding, numeric predicate, and field-bound predicate.
 - Crypto: blake2b-256 integrity hash, AES-256-GCM + HKDF-SHA256 payload encryption, persistentHash Merkle content root, ZK-proof authorization.
-- UI: producer cockpit, consumer viewer (three tiers), Lace connector page, QR resolver at `/p/:passportId`.
+- UI: producer cockpit (with in-app Lace wallet flow), consumer viewer (three tiers), QR resolver at `/p/:passportId`.
 - Chain: Midnight Preview: public metadata, hash, binding, content root, disclosure and predicate results only.

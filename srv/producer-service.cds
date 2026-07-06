@@ -66,6 +66,7 @@ service ProducerService {
     ) returns {
         ok:     Boolean;
         txHash: String;
+        status: String;   // pending until the tx is verified on-chain (then succeeded/failed)
     };
 
     /**
@@ -125,6 +126,7 @@ service ProducerService {
     ) returns {
         ok:     Boolean;
         txHash: String;
+        status: String;   // pending until the tx is verified on-chain (then succeeded/failed)
     };
 
     /**
@@ -143,6 +145,7 @@ service ProducerService {
     ) returns {
         ok:     Boolean;
         txHash: String;
+        status: String;   // pending until the tx is verified on-chain (then succeeded/failed)
     };
 
     /** Grant a disclosure level (0=public, 1=recycler, 2=authority) to a grantee. */

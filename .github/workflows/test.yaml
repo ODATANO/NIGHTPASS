@@ -1,0 +1,100 @@
+name: NIGHTPASS Tests
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightpass-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # =========================================================================
+  # Node: cds-typer -> type check -> the offline unit suite (node:test via
+  # tsx). Pure lib tests, no chain / server / secrets: the goods-receipt
+  # generator, the DID->grantee derivation and the passport hashing/crypto.
+  # =========================================================================
+  test:
+    name: Node ${{ matrix.node-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [22.x, 24.x]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v5
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate CDS types
+        run: npm run gen:types
+
+      - name: Type check
+        run: npm run typecheck
+
+      - name: Run unit tests with coverage
+        env:
+          NODE_ENV: test
+        run: npm run test:coverage
+
+      - name: Upload coverage to Codecov
+        if: matrix.node-version == '22.x'
+        uses: codecov/codecov-action@v5
+        with:
+          files: ./coverage/lcov.info
+          flags: node-${{ matrix.node-version }}
+          name: node-${{ matrix.node-version }}
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
+
+  # =========================================================================
+  # CDS: the full model (domain schema + mock SAP feed + the three services,
+  # merged with the NIGHTGATE plugin) must still compile and expose the
+  # load-bearing definitions. A silent CDS break would ship a service that
+  # 404s at runtime, so this gate is worth its seconds.
+  # =========================================================================
+  cds-compile:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22.x
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Validate CDS model compiles
+        run: |
+          node -e '
+            const cds = require("@sap/cds");
+            (async () => {
+              await cds.plugins;
+              const m = await cds.load("*");
+              const need = ["MockSapService", "PassportService", "ProducerService", "mocksap.GoodsReceipts"];
+              const missing = need.filter((n) => !m.definitions[n]);
+              if (missing.length) {
+                console.error("::error::missing CDS definitions: " + missing.join(", "));
+                process.exit(1);
+              }
+              console.log("CDS model compiles; all expected definitions present");
+            })().catch((e) => { console.error("::error::" + e.message); process.exit(1); });
+          '

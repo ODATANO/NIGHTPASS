@@ -37,6 +37,9 @@ mta_archives/
 # @cap-js/cds-typer
 @cds-models
 
+# test coverage output
+coverage/
+
 # secrets / local env
 .env
 
@@ -64,7 +67,6 @@ tractusx/pac/verify-via-nightgate.mts
 # empty-dir placeholders (unused)
 .gitkeep
 # Connector browser bundle (build artifact, large WASM)
-app/connector/dist/
 app/connector/lib/
 
 # Personal/local-only notes (not for GitHub)

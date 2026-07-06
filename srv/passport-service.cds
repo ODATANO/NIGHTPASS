@@ -25,11 +25,17 @@ service PassportService {
     @readonly entity Partners as projection on passport.Partners excluding { secret };
 
     /**
-     * Self-service partner registration (Catena-X-style): a recycler / authority
-     * registers a DID/BPN + a login secret and receives its `granteeId`
-     * (sha256(did)). Also binds the DID → granteeId in the plugin's
-     * GranteeIdentities so the read gate resolves the partner at read time.
+     * Partner registration (Catena-X-style): register a dataspace partner's
+     * DID/BPN + a login secret and receive its `granteeId` (sha256(did)). Also
+     * binds the DID → granteeId in the plugin's GranteeIdentities so the read gate
+     * resolves the partner at read time.
+     *
+     * Producer-gated: partner onboarding is producer-led, not anonymous. This
+     * prevents an attacker from (re)setting the secret of a DID that already holds
+     * grants and then reading as that partner. An existing partner is rejected
+     * (409); the secret is never rotated through this action.
      */
+    @(requires: 'producer')
     action registerPartner(
         did:    String,
         name:   String,
@@ -73,7 +79,7 @@ service PassportService {
         contractAddress:   String;
         attestationTxHash: String;
         status:            String;
-        verified:          Boolean;   // anchored on-chain (attest tx present)
+        locallyAnchored:   Boolean;   // DB state: anchored + attest tx present (NOT a live chain re-check)
         viewerUrl:         String;    // /resolve/<hash> — tier-gated landing
     };
 

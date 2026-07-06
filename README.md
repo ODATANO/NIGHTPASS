@@ -2,9 +2,11 @@
 
 **EU Battery Regulation 2023/1542 Digital Product Passport with three disclosure tiers, backed by zero-knowledge attestations on Midnight.**
 
+[![Tests](https://github.com/ODATANO/NIGHTPASS/actions/workflows/test.yaml/badge.svg)](https://github.com/ODATANO/NIGHTPASS/actions/workflows/test.yaml)
+[![codecov](https://codecov.io/gh/ODATANO/NIGHTPASS/branch/main/graph/badge.svg)](https://codecov.io/gh/ODATANO/NIGHTPASS)
+[![@odatano/nightgate](https://img.shields.io/npm/v/@odatano/nightgate?logo=npm&label=%40odatano%2Fnightgate)](https://www.npmjs.com/package/@odatano/nightgate)
 [![SAP CAP](https://img.shields.io/badge/SAP%20CAP-%40sap%2Fcds%20%5E9-0faaff?logo=sap)](https://cap.cloud.sap/)
 [![Midnight](https://img.shields.io/badge/Midnight-preview-2b2b6f)](https://midnight.network/)
-[![NIGHTGATE](https://img.shields.io/badge/plugin-%40odatano%2Fnightgate%200.4.3-6f42c1)](https://github.com/ODATANO/NIGHTGATE)
 [![Catena-X](https://img.shields.io/badge/Catena--X-CX--0143-009f4d)](https://catena-x.net/)
 
 NIGHTPASS implements the EU Battery Passport. One dataset is exposed with a different view per audience (consumer, recycler, authority), and sensitive numbers (for example "recycled cobalt share is at least the legal minimum") can be **proven without revealing the value**. Only a payload hash and public metadata are anchored on-chain; everything else stays encrypted off-chain, and the disclosure tier is enforced in the API layer.
@@ -42,9 +44,9 @@ Open http://localhost:4004/ for the launchpad.
 
 | Surface | Path |
 |---|---|
-| Producer cockpit (create, attest, disclose, prove) | `/producer/webapp/index.html` |
+| Producer cockpit (create, attest, disclose, prove; in-app Lace wallet flow) | `/producer/webapp/index.html` |
 | Consumer passport viewer (3 tiers) | `/passport/webapp/` |
-| Wallet connector (deploy, attest, prove via Lace) | `/connector/` |
+| MockSapService (goods-receipt feed) | `/api/v1/mock-sap` |
 | ProducerService | `/api/v1/producer` |
 | PassportService | `/api/v1/passport` |
 | NightgateService (+ indexer / analytics / admin) | `/api/v1/nightgate` |
@@ -57,14 +59,18 @@ Anonymous resolves to consumer. Built-in demo users: `producer`/`producer`, `rec
 
 ```
 db/passport-schema.cds            Passports / Batteries / RecycledMaterials / DiligenceDoc + tracking tables
+db/mock-sap-schema.cds            mock SAP goods-receipt feed (GoodsReceipts)
 db/data/passport-*.csv            CSV seeds (partners, batteries, recycled materials, grantee identities)
 srv/passport-service.{cds,ts}     consumer read side: tier gating, QR resolve, credential export
 srv/producer-service.{cds,ts}     producer cockpit write side: create, submit, disclose, prove
+srv/mock-sap-service.{cds,ts}     mock SAP goods-receipt source (triggerGoodsReceipt feeds generatePassport)
+srv/lib/goods-receipt.ts          deterministic goods-receipt generator + row/batch mapping
 srv/lib/passport-anchor.ts        canonical hashing, encryption, anchor sequence, content-root Merkle builder
+srv/lib/chain-verify.ts           structural on-chain verification of wallet-reported tx hashes
 srv/auth.js                       custom CAP auth (demo users + BPN partners)
-app/producer/webapp/              producer cockpit (SAPUI5)
+app/producer/webapp/              producer cockpit (SAPUI5), in-app Lace wallet flow
 app/passport/webapp/              consumer viewer, one app / three tiers
-app/connector/                    Lace DApp-Connector page + connector.mjs (Vite lib bundle)
+app/connector/                    in-app Lace connector library (connector.mjs, Vite lib bundle)
 tractusx/pac/                     Predicate Attestation Credential glue + verify demo
 docs/                             producer-flow.md, producer-walkthrough.md, architecture.md/svg/png
 ```

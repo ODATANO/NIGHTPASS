@@ -1,16 +1,17 @@
-// NIGHTPASS wallet-connector flow (Lace) — bundled to app/connector/dist by esbuild.
+// NIGHTPASS wallet-connector flow (Lace). Bundled to app/connector/lib by vite
+// (npm run build:connector-lib); the producer cockpit dynamic-imports it in-app.
 //
 // Uses NIGHTGATE's verified browser building blocks (@odatano/nightgate/browser)
 // + the DApp-Connector wallet (window.midnight, e.g. Lace) to attest / grant /
-// revoke on the AttestationVault — the human-attester path. attest+grant+revoke
+// revoke on the AttestationVault. This is the human-attester path. attest+grant+revoke
 // all run with the SAME wallet-derived attester secret, so a full self-contained
 // cycle works (a server-created grant uses a different secret and would fail the
-// on-chain "not attester" assert — Phase-0 cross-path caveat).
+// on-chain "not attester" assert; a Phase-0 cross-path caveat).
 //
 // Verified building blocks (NIGHTGATE Phases 1-4): manifest discovery,
 // FetchZkConfigProvider, providers assembly, attester-secret derivation, typed
 // call inputs. The FINAL prove+balance+submit round-trip
-// (makeConnectorWalletAdapter) is the live-integration boundary — finalize it
+// (makeConnectorWalletAdapter) is the live-integration boundary. Finalize it
 // against real Lace + chain.
 
 // Node-global polyfills for the browser. Parts of the Midnight SDK (tx/zswap
@@ -150,7 +151,7 @@ async function fetchManifest() {
 
 // App-managed attester secret.
 //
-// The Midnight DApp Connector (Lace v4) does NOT implement message signing —
+// The Midnight DApp Connector (Lace v4) does NOT implement message signing.
 // `api.signData(...)` throws `Method not implemented.` So the attester identity
 // cannot be derived from a wallet signature (the FR open-question-#1 fallback:
 // "else a consumer-owned secret"). We generate a random 32-byte secret once,
@@ -159,7 +160,7 @@ async function fetchManifest() {
 //
 // Cross-path caveat (Phase 0): this identity differs from the server's
 // seed-HMAC identity, so a server-created grant can't be revoked here and vice
-// versa — run a full attest→grant→revoke cycle in-browser with the same wallet.
+// versa. Run a full attest to grant to revoke cycle in-browser with the same wallet.
 const STORE_PREFIX = 'nightgate:attester-secret:v1:';
 
 function toHex(bytes) {
@@ -231,7 +232,7 @@ function txStringToBytes(s) {
 /**
  * Recover a transaction's identifiers from its serialized (balanced) form. The
  * indexer's watchForTxData(txId) matches `offset.identifier` against a tx's
- * `identifiers`, so this is what submitTx must return — NOT the serialized tx.
+ * `identifiers`, so this is what submitTx must return, NOT the serialized tx.
  * A fully built+balanced contract tx is signature/proof/binding; we try a few
  * marker combos defensively. Returns null if none deserialize.
  */
@@ -307,7 +308,7 @@ function makeConnectorWalletAdapter(api, walletKeys, ledger, log) {
                 log(`using pre-balance identifiers as fallback (${ids.length})`);
             }
             const txId = ids && ids[0];
-            log(`watch txId: ${txId ?? '(none — watch will fail)'}`);
+            log(`watch txId: ${txId ?? '(none, watch will fail)'}`);
             let res;
             try {
                 res = await api.submitTransaction(serialized);
@@ -329,7 +330,7 @@ function makeConnectorWalletAdapter(api, walletKeys, ledger, log) {
 /**
  * Assemble providers + load the SDK + set the network + build the wallet adapter
  * and the witness-bound compiled contract. Shared by deploy and call. `witnesses`
- * is the AttestationVault witness object (attester secret, etc.) — for deploy it
+ * is the AttestationVault witness object (attester secret, etc.). For deploy it
  * binds the deployer identity, for a call it satisfies the circuit witnesses.
  */
 async function prepareSdkContext(api, witnesses, log) {
@@ -380,7 +381,7 @@ async function prepareSdkContext(api, witnesses, log) {
     // midnight-js-contracts@4.1.0 expects a compact-js `CompiledContract`
     // (tagged + witnesses), not a raw `new Contract(witnesses)` instance. Wrap
     // our classic compactc artifact: make(tag, ctor) attaches the constructor,
-    // withWitnesses attaches the witnesses — the SDK then does
+    // withWitnesses attaches the witnesses, and the SDK then does
     // `new ctor(witnesses)` internally. (Without this the SDK passes `undefined`
     // to compact-js getContractContext → "reading 'Symbol()'" crash.)
     const compiledContract = CompiledContract.withWitnesses(
@@ -422,7 +423,7 @@ async function runPreparedCall(api, contractAddress, call, log) {
 /**
  * Deploy a fresh AttestationVault from the connected (funded) wallet. Returns
  * the deployed contract address. Uses the SAME app-managed attester secret as
- * attest/grant/revoke so the deployer-bound attester identity matches — a vault
+ * attest/grant/revoke so the deployer-bound attester identity matches: a vault
  * deployed here can be attested + disclosure-managed by this same wallet.
  *
  * This is also the first real exercise of makeConnectorWalletAdapter's
@@ -465,7 +466,7 @@ export async function attest(api, { contractAddress, payloadHash, metadataHash }
     return runPreparedCall(api, contractAddress, prepareAttest({ payloadHash, metadataHash, attestationSecret }), L);
 }
 
-/** grantDisclosure(payload_hash, grantee, level) — level 0=public,1=legit,2=authority */
+/** grantDisclosure(payload_hash, grantee, level): level 0=public,1=legit,2=authority */
 export async function grantDisclosure(api, { contractAddress, payloadHash, grantee, level }, log = console.log) {
     const L = mklog(log);
     L('grant: loading browser SDK…');
@@ -487,16 +488,16 @@ export async function revokeDisclosure(api, { contractAddress, payloadHash, gran
 
 // --- Predicate Attestation (value ≤ / ≥ threshold, value stays off-chain) ----
 // Two-step PAC flow on the AttestationVault:
-//   1) commitValue(payload_hash)            — pins a Pedersen-style commitment to
+//   1) commitValue(payload_hash): pins a Pedersen-style commitment to
 //      the hidden value+salt on-chain (the value itself is a witness, never sent).
-//   2) provePredicate(payload_hash, threshold, op) — proves value ≤ threshold
+//   2) provePredicate(payload_hash, threshold, op): proves value ≤ threshold
 //      (op 0) or value ≥ threshold (op 1) against that commitment in-circuit; the
 //      tx only lands if the assert holds, so a successful tx IS the proof, and
 //      the chain records predicate_results[claim]=true WITHOUT the value.
 // Both witness attested_value()+value_salt(), so the SAME value+salt must be used
 // for commit and prove (and the payload must already be attested by this wallet).
 
-/** commitValue(payload_hash) — attach a hidden numeric commitment. */
+/** commitValue(payload_hash): attach a hidden numeric commitment. */
 export async function commitValue(api, { contractAddress, payloadHash, value, valueSalt }, log = console.log) {
     const L = mklog(log);
     L('commitValue: loading browser SDK…');
@@ -512,7 +513,7 @@ export async function commitValue(api, { contractAddress, payloadHash, value, va
     return runPreparedCall(api, contractAddress, call, L);
 }
 
-/** provePredicate(payload_hash, threshold, op) — op 0 = value ≤ threshold, 1 = value ≥ threshold. */
+/** provePredicate(payload_hash, threshold, op): op 0 = value ≤ threshold, 1 = value ≥ threshold. */
 export async function provePredicate(api, { contractAddress, payloadHash, value, valueSalt, threshold, op }, log = console.log) {
     const L = mklog(log);
     L('provePredicate: loading browser SDK…');
@@ -527,7 +528,7 @@ export async function provePredicate(api, { contractAddress, payloadHash, value,
     };
     L(`proving ${value} ${opNum === 0 ? '≤' : '≥'} ${threshold} in zero-knowledge (the value never leaves the browser)…`);
     const result = await runPreparedCall(api, contractAddress, call, L);
-    L(`✓ predicate proven on-chain: ${value} ${opNum === 0 ? '≤' : '≥'} ${threshold} holds — verified without revealing ${value}.`);
+    L(`✓ predicate proven on-chain: ${value} ${opNum === 0 ? '≤' : '≥'} ${threshold} holds, verified without revealing ${value}.`);
     return result;
 }
 
@@ -535,14 +536,14 @@ export async function provePredicate(api, { contractAddress, payloadHash, value,
 // Hardened flow that answers "is this the value from THIS passport?". The value
 // is proven to be a leaf in a Merkle content-root anchored at attest time, so it
 // can't be swapped for an arbitrary number:
-//   1) anchorContentRoot(payload_hash, content_root) — pins the root over the
+//   1) anchorContentRoot(payload_hash, content_root): pins the root over the
 //      passport's provable fields (done once, typically right after attest).
-//   2) proveFieldPredicate(payload_hash, field_key, threshold, op) — recomputes
+//   2) proveFieldPredicate(payload_hash, field_key, threshold, op): recomputes
 //      the field's Merkle leaf from the witnessed value + inclusion path, asserts
 //      it folds to the anchored root, THEN asserts the predicate. A successful tx
 //      proves the predicate holds for THIS passport's field, value still hidden.
 
-/** anchorContentRoot(payload_hash, content_root) — pin the field Merkle root. */
+/** anchorContentRoot(payload_hash, content_root): pin the field Merkle root. */
 export async function anchorContentRoot(api, { contractAddress, payloadHash, contentRoot }, log = console.log) {
     const L = mklog(log);
     L('anchorContentRoot: loading browser SDK…');
@@ -559,7 +560,7 @@ export async function anchorContentRoot(api, { contractAddress, payloadHash, con
 }
 
 /**
- * proveFieldPredicate(payload_hash, field_key, threshold, op) — field-bound proof.
+ * proveFieldPredicate(payload_hash, field_key, threshold, op): field-bound proof.
  * `merkleProof` = { fieldValue (scaled decimal string), siblings (4 × 64-hex),
  * dirs (4 booleans) }. op 0 = value ≤ threshold, 1 = value ≥ threshold.
  */
@@ -575,7 +576,7 @@ export async function proveFieldPredicate(api, { contractAddress, payloadHash, f
         args: [fromHex(payloadHash), fromHex(fieldKey), BigInt(threshold), BigInt(opNum)],
         witnesses: buildAttestationVaultWitnesses({ attestationSecret, merkleProof: { fieldValue: String(fieldValue), siblings, dirs } })
     };
-    L(`proving field ${fieldValue} ${opNum === 0 ? '≤' : '≥'} ${threshold} — bound to this passport's content root, value hidden…`);
+    L(`proving field ${fieldValue} ${opNum === 0 ? '≤' : '≥'} ${threshold}, bound to this passport's content root, value hidden…`);
     const result = await runPreparedCall(api, contractAddress, call, L);
     L(`✓ field-bound predicate proven on-chain: the passport's own value ${opNum === 0 ? '≤' : '≥'} ${threshold} holds.`);
     return result;
@@ -669,7 +670,7 @@ export async function checkVaultExists(address, opts = {}, log = console.log, on
             L(`check: ✓ contract present (${kind})`);
             return { exists: true, kind, blockHeight: height };
         }
-        onStatus('fail', 'not deployed on this network — deploy one');
+        onStatus('fail', 'not deployed on this network; deploy one');
         L('check: contract not found');
         return { exists: false };
     } catch (e) {

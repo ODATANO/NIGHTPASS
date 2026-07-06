@@ -17,5 +17,12 @@
         "./@cds-models/*"
       ]
     }
-  }
+  },
+  "include": [
+    "srv/**/*.ts"
+  ],
+  "exclude": [
+    "node_modules",
+    "@cds-models"
+  ]
 }
