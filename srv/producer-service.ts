@@ -8,6 +8,7 @@ import {
     buildContentRoot, fieldKeyHex, BATTERY_PROVABLE_FIELDS
 } from './lib/passport-anchor';
 import { verifyContractTx, type ChainVerdict } from './lib/chain-verify';
+import { verifyAttestState, verifyGrantState, verifyPredicateState } from './lib/state-verify';
 
 const CONTRACT_REF = 'attestation-vault';
 
@@ -223,6 +224,8 @@ export default class ProducerService extends cds.ApplicationService {
 
         const verdict = await this.settleWalletTx({
             txHash: hash, contractAddress: contract,
+            // Crawler-free: confirm the payload hash is anchored in the vault.
+            stateCheck: () => verifyAttestState({ contractAddress: contract, payloadHash: row.payloadHash }),
             onConfirmed: async () => {
                 await UPDATE.entity(PassportTransactions).set({ status: 'succeeded' }).where({ ID: txRowId });
                 await UPDATE.entity(Passports).set({ status: 'anchored' }).where({ ID: row.ID });
@@ -263,6 +266,9 @@ export default class ProducerService extends cds.ApplicationService {
 
         const verdict = await this.settleWalletTx({
             txHash: hash, contractAddress: contract,
+            // Crawler-free: reindex the on-chain disclosures ACL, then confirm this
+            // grant/revoke is reflected for (contract, payloadHash, grantee).
+            stateCheck: () => verifyGrantState({ contractAddress: contract, payloadHash: row.payloadHash, grantee, op: o }),
             onConfirmed: async () => {
                 await UPDATE.entity(DisclosureGrantLog).set({ status: 'succeeded' }).where({ ID: grantLogId });
                 await UPDATE.entity(PassportTransactions).set({ status: 'succeeded' }).where({ ID: txRowId });
@@ -450,6 +456,13 @@ export default class ProducerService extends cds.ApplicationService {
 
         const verdict = await this.settleWalletTx({
             txHash: hash, contractAddress: contract,
+            // Crawler-free (NIGHTGATE 0.5.1): confirm the vault recorded a true result
+            // for this field-bound claim. The cockpit sends the already-scaled
+            // threshold that the proof hashed, so it is passed straight through.
+            stateCheck: () => verifyPredicateState({
+                contractAddress: contract, payloadHash: row.payloadHash,
+                fieldKey: fieldKeyHex(String(sourceField ?? '')), predicate: pred, threshold: Number(threshold ?? 0)
+            }),
             onConfirmed: async () => {
                 await UPDATE.entity(PredicateProofLog).set({ status: 'succeeded' }).where({ ID: proofLogId });
                 await UPDATE.entity(PassportTransactions).set({ status: 'succeeded' }).where({ ID: txRowId });
@@ -470,26 +483,43 @@ export default class ProducerService extends cds.ApplicationService {
     }
 
     /**
-     * Structurally verify a wallet-submitted tx, then finalize the row.
+     * Verify a wallet-submitted action's on-chain effect, then finalize the row.
      *
-     * Runs one inline check. On `confirmed` it finalizes now; on `failed` it marks
-     * the row failed; on `unknown` (indexer disabled or lagging) it leaves the row
-     * PENDING and retries detached for a bounded window before giving up. A row is
-     * never promoted to succeeded on the client's word alone.
+     * Prefers crawler-free STATE verification (NIGHTGATE 0.5.0: `stateCheck` reads
+     * the AttestationVault ledger via `queryContractState`, so it confirms the
+     * outcome with the block crawler off, which is the demo default). It falls back to the
+     * tx-based indexer check (`verifyContractTx`) only when the state check is
+     * absent or inconclusive; that tx path is also the only one that can return a
+     * definitive `failed` (an indexed tx whose result is FAILURE or wrong target).
+     *
+     * On `confirmed` it finalizes now; on `failed` it marks the row failed; on
+     * `unknown` (nothing confirms yet: effect not settled, no live provider, or
+     * indexer lagging) it leaves the row PENDING and retries detached for a bounded
+     * window. A row is never promoted to succeeded on the client's word alone.
      */
     private async settleWalletTx(o: {
         txHash: string;
         contractAddress?: string | null;
+        stateCheck?: () => Promise<ChainVerdict>;
         onConfirmed: () => Promise<void>;
         onFailed: () => Promise<void>;
     }): Promise<ChainVerdict> {
-        const check = (): Promise<ChainVerdict> => verifyContractTx(o.txHash, { contractAddress: o.contractAddress });
+        const check = async (): Promise<ChainVerdict> => {
+            if (o.stateCheck) {
+                let state: ChainVerdict = 'unknown';
+                try { state = await o.stateCheck(); } catch { state = 'unknown'; }
+                if (state === 'confirmed' || state === 'failed') return state;
+            }
+            try { return await verifyContractTx(o.txHash, { contractAddress: o.contractAddress }); }
+            catch { return 'unknown'; }
+        };
         let verdict: ChainVerdict = 'unknown';
         try { verdict = await check(); } catch { verdict = 'unknown'; }
         if (verdict === 'confirmed') { await o.onConfirmed(); return verdict; }
         if (verdict === 'failed') { await o.onFailed(); return verdict; }
-        // unknown: the indexer may just be lagging. Retry off the request path.
-        if (o.txHash) this.trackWalletTx(check, o.onConfirmed, o.onFailed);
+        // unknown: the effect may not have settled / the indexer may be lagging.
+        // Retry off the request path.
+        if (o.txHash || o.stateCheck) this.trackWalletTx(check, o.onConfirmed, o.onFailed);
         return verdict;
     }
 
