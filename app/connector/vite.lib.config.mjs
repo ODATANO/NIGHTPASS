@@ -3,12 +3,13 @@
 // producer cockpit) can dynamic-import them and run the Lace flow IN-APP —
 // instead of redirecting to the standalone connector page.
 //
-// Same WASM handling as vite.config.mjs (vite-plugin-wasm + top-level-await +
-// ledger-v8 dedupe). Output → app/connector/lib, served by CAP at /connector/lib/.
+// WASM via vite-plugin-wasm + ledger-v8 dedupe. No top-level-await plugin:
+// the output is an ES module with target es2022, where TLA is native, and the
+// plugin's rollup peer dependency breaks fresh installs under rolldown-vite 8.
+// Output → app/connector/lib, served by CAP at /connector/lib/.
 // Run via `npm run build:connector-lib`.
 import { defineConfig } from 'vite';
 import wasm from 'vite-plugin-wasm';
-import topLevelAwait from 'vite-plugin-top-level-await';
 
 export default defineConfig({
     base: '/connector/lib/',
@@ -27,5 +28,5 @@ export default defineConfig({
     resolve: {
         dedupe: ['@midnight-ntwrk/ledger-v8']
     },
-    plugins: [wasm(), topLevelAwait()]
+    plugins: [wasm()]
 });
