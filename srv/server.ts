@@ -1,5 +1,7 @@
 import cds from '@sap/cds';
 import QRCode from 'qrcode';
+import crypto from 'node:crypto';
+import express from 'express';
 
 const { SELECT } = cds.ql;
 
@@ -43,6 +45,54 @@ cds.on('bootstrap', (app: any) => {
             res.status(500).end(String(e?.message ?? e));
         }
     });
+
+    // --- ERP event ingest: POST /api/v1/passport/erp-events ------------------
+    // Inbound webhook for the EQUINOX agent (or any ERP-side event source).
+    // Auth is the HMAC signature over the raw body (shared secret via
+    // ERP_WEBHOOK_SECRET), not a CAP user: the sender is a machine, and the
+    // handler runs createPassport privileged AFTER the signature check.
+    // Idempotent on passportId. ERP_AUTO_ANCHOR=true additionally submits
+    // on-chain via the server signing session (PRODUCER_* env), otherwise the
+    // passport lands as an offline draft.
+    app.post('/api/v1/passport/erp-events',
+        express.raw({ type: ['application/cloudevents+json', 'application/json'], limit: '256kb' }),
+        async (req: any, res: any) => {
+            const secret = process.env.ERP_WEBHOOK_SECRET;
+            if (!secret) return res.status(503).json({ error: 'erp ingest not configured (ERP_WEBHOOK_SECRET unset)' });
+
+            const raw: Buffer = Buffer.isBuffer(req.body) ? req.body : Buffer.from('');
+            const given = String(req.headers['x-equinox-signature'] ?? '');
+            const expected = 'sha256=' + crypto.createHmac('sha256', secret).update(raw).digest('hex');
+            const a = Buffer.from(given), b = Buffer.from(expected);
+            if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+                return res.status(401).json({ error: 'invalid or missing x-equinox-signature' });
+            }
+
+            let event: any;
+            try { event = JSON.parse(raw.toString('utf8')); }
+            catch { return res.status(400).json({ error: 'body is not JSON' }); }
+            if (event?.type !== 'com.odatano.equinox.goodsreceipt.created' || typeof event?.data !== 'object') {
+                return res.status(400).json({ error: `unsupported event type '${event?.type ?? ''}'` });
+            }
+            const passportId = String(event.data?.passportId ?? '').trim();
+            if (!passportId) return res.status(400).json({ error: 'data.passportId is required' });
+
+            try {
+                const existing: any = await SELECT.one.from('passport.Passports').columns('ID').where({ passportId });
+                if (existing) return res.status(200).json({ status: 'duplicate', passportId });
+
+                const producer: any = await cds.connect.to('ProducerService');
+                const result = await producer.tx({ user: (cds.User as any).privileged }).send('createPassport', {
+                    passportJson: JSON.stringify(event.data),
+                    submit: process.env.ERP_AUTO_ANCHOR === 'true'
+                });
+                cds.log('erp-ingest').info(`event ${event.id ?? '?'} -> passport ${passportId} (${result?.mode})`);
+                return res.status(201).json({ status: 'created', passportId, mode: result?.mode ?? 'offline' });
+            } catch (e: any) {
+                cds.log('erp-ingest').error('ingest failed:', e?.message ?? e);
+                return res.status(500).json({ error: String(e?.message ?? e) });
+            }
+        });
 
     // --- Supplier resolve by on-chain hash: GET /resolve/:payloadHash --------
     // A supplier handed only the passport payloadHash resolves the exact battery:

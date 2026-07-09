@@ -1,6 +1,8 @@
-# @odatano/passport (NIGHTPASS)
+# NIGHTPASS - Digital Battery Passport on Midnight
 
-**EU Battery Regulation 2023/1542 Digital Product Passport with three disclosure tiers, backed by zero-knowledge attestations on Midnight.**
+![alt text](/docs/readme_header.png)
+
+**EU Battery Regulation 2023/1542 Digital Battery Passport with three disclosure tiers, backed by zero-knowledge attestations on Midnight.**
 
 [![Tests](https://github.com/ODATANO/NIGHTPASS/actions/workflows/test.yaml/badge.svg)](https://github.com/ODATANO/NIGHTPASS/actions/workflows/test.yaml)
 [![codecov](https://codecov.io/gh/ODATANO/NIGHTPASS/branch/main/graph/badge.svg)](https://codecov.io/gh/ODATANO/NIGHTPASS)
