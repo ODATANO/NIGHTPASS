@@ -33,8 +33,10 @@ It consumes [`@odatano/nightgate`](https://github.com/ODATANO/NIGHTGATE) as a CA
 
 ## Quick start
 
+Requires Node.js >= 22 (see `.nvmrc`).
+
 ```bash
-npm install
+npm install            # postinstall generates @cds-models and builds the connector lib
 cp .env.example .env   # set ENCRYPTION_KEY (.env is gitignored)
 npm run deploy         # creates db/passport.db: domain tables + the midnight_* plugin tables
 npm start              # cds-tsx serve  ->  http://localhost:4004

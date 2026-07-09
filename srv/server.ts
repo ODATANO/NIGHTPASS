@@ -46,6 +46,23 @@ cds.on('bootstrap', (app: any) => {
         }
     });
 
+    // --- Runtime config for the browser connector -----------------------------
+    // Issue #2 (JAlbertCode): the wallet connector must anchor to the SAME
+    // network as the server worker. This exposes the server's effective
+    // NIGHTGATE network (same precedence as the plugin: env override first,
+    // then cds.requires.nightgate.network) so the client derives instead of
+    // hardcoding. Indexer URLs follow the same precedence with the public
+    // per-network hosts as default.
+    app.get('/api/v1/passport/runtime-config', (_req: any, res: any) => {
+        const cfg: any = (cds.env as any).requires?.nightgate ?? {};
+        const network = process.env.NIGHTGATE_NETWORK?.trim() || cfg.network || 'preview';
+        const indexerHttpUrl = process.env.NIGHTGATE_INDEXER_HTTP_URL?.trim() || cfg.indexerHttpUrl
+            || `https://indexer.${network}.midnight.network/api/v4/graphql`;
+        const indexerWsUrl = process.env.NIGHTGATE_INDEXER_WS_URL?.trim() || cfg.indexerWsUrl
+            || `wss://indexer.${network}.midnight.network/api/v4/graphql/ws`;
+        res.json({ network, indexerHttpUrl, indexerWsUrl });
+    });
+
     // --- ERP event ingest: POST /api/v1/passport/erp-events ------------------
     // Inbound webhook for the EQUINOX agent (or any ERP-side event source).
     // Auth is the HMAC signature over the raw body (shared secret via

@@ -28,7 +28,11 @@
     "vite-plugin-top-level-await": "^1.6.0",
     "vite-plugin-wasm": "^3.6.0"
   },
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
+    "postinstall": "npm run gen:types && npm run build:connector-lib",
     "start": "cds-tsx serve",
     "build:connector-lib": "vite build app/connector -c app/connector/vite.lib.config.mjs",
     "deploy": "node -e \"const cds=require('@sap/cds');(async()=>{await cds.plugins;const m=await cds.load('*');await cds.deploy(m).to('db');console.log('deployed to db/passport.db')})().catch(e=>{console.error(e);process.exit(1)})\"",

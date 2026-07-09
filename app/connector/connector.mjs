@@ -28,7 +28,6 @@ if (typeof globalThis.global === 'undefined') globalThis.global = globalThis;
 const loadBrowserSdk = () => import('@odatano/nightgate/browser');
 const loadVaultContract = () => import('@odatano/nightgate/browser/attestation-vault');
 
-const NETWORK = 'preview';
 const CONTRACT = 'attestation-vault';
 const PRIVATE_STATE_ID = 'attestationVaultPrivateState';
 
@@ -41,10 +40,27 @@ const PRIVATE_STATE_ID = 'attestationVaultPrivateState';
 // server to be running.
 const LOCAL_PROVER_URL = 'http://localhost:6300';
 
-// Fallback Preview indexer for on-chain verification when no wallet config has
-// been seen yet. Overridden at runtime by the connector's reported indexerUri
-// (so verification follows whatever network the wallet is on).
-const PREVIEW_INDEXER_HTTP = 'https://indexer.preview.midnight.network/api/v4/graphql';
+// Network + indexer come from the SERVER at runtime (issue #2): the browser
+// wallet must anchor to the same chain as the server worker, so the single
+// source of truth is the server's effective NIGHTGATE config, exposed at
+// /api/v1/passport/runtime-config. Falls back to preview when the endpoint is
+// unreachable (e.g. static hosting without the CAP server).
+let _runtimeConfig = null;
+async function runtimeConfig() {
+    if (_runtimeConfig) return _runtimeConfig;
+    try {
+        const r = await fetch('/api/v1/passport/runtime-config');
+        if (r.ok) {
+            const cfg = await r.json();
+            if (cfg?.network) { _runtimeConfig = cfg; return _runtimeConfig; }
+        }
+    } catch { /* no server config reachable, use the fallback below */ }
+    _runtimeConfig = {
+        network: 'preview',
+        indexerHttpUrl: 'https://indexer.preview.midnight.network/api/v4/graphql'
+    };
+    return _runtimeConfig;
+}
 let _lastIndexerUri = null;
 let _lastSubmittedTxId = null;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -140,7 +156,8 @@ export function listWallets() {
 export async function connect(walletKey) {
     const initial = window.midnight?.[walletKey];
     if (!initial) throw new Error(`wallet '${walletKey}' not found in window.midnight`);
-    return initial.connect(NETWORK); // v4 ConnectedAPI
+    const { network } = await runtimeConfig();
+    return initial.connect(network); // v4 ConnectedAPI
 }
 
 async function fetchManifest() {
@@ -598,7 +615,7 @@ const VERIFY_TX_QUERY = `query VerifyTx($offset: TransactionOffset!) {
 export async function verifyTxOnChain(txId, opts = {}, log = console.log, onStatus = () => {}) {
     const L = mklog(log);
     if (!txId) { onStatus('fail', 'no tx id'); throw new Error('verifyTxOnChain: txId required'); }
-    const url = opts.indexerUrl || _lastIndexerUri || PREVIEW_INDEXER_HTTP;
+    const url = opts.indexerUrl || _lastIndexerUri || (await runtimeConfig()).indexerHttpUrl;
     const attempts = opts.attempts ?? 20;
     const delayMs = opts.delayMs ?? 2000;
     L(`verify: scanning chain for tx ${String(txId).slice(0, 18)}… via ${url}`);
@@ -652,7 +669,7 @@ export async function checkVaultExists(address, opts = {}, log = console.log, on
     const L = mklog(log);
     const addr = String(address || '').trim().replace(/^0x/, '');
     if (!/^[0-9a-fA-F]{64}$/.test(addr)) { onStatus('fail', 'enter a 64-hex contract address'); return { exists: false }; }
-    const url = opts.indexerUrl || _lastIndexerUri || PREVIEW_INDEXER_HTTP;
+    const url = opts.indexerUrl || _lastIndexerUri || (await runtimeConfig()).indexerHttpUrl;
     onStatus('scanning', 'checking chain…');
     L(`check: looking up contract ${addr.slice(0, 16)}… via ${url}`);
     try {
