@@ -99,10 +99,23 @@ cds.on('bootstrap', (app: any) => {
                 if (existing) return res.status(200).json({ status: 'duplicate', passportId });
 
                 const producer: any = await cds.connect.to('ProducerService');
-                const result = await producer.tx({ user: (cds.User as any).privileged }).send('createPassport', {
+                // A fixed technical user, NOT cds.User.privileged: NIGHTGATE's
+                // auth hardening binds wallet sessions to the userId, and the
+                // whole chain (connectWallet -> signing session -> anchor job
+                // polls) must run under the SAME user or the session lookups
+                // fail. Use 'producer' (the same principal as the HTTP cockpit
+                // path) so the cached server signing session is shared instead
+                // of colliding across principals.
+                const erpUser = new (cds.User as any)({ id: 'producer', roles: ['producer'] });
+                // Managed tx (callback form), NOT `.tx({user}).send(...)`: only a
+                // managed tx commits and fires the request's 'succeeded' event,
+                // which anchorRow uses to start the detached on-chain runner.
+                // With the unmanaged form the passport row lands but the anchor
+                // never starts (row stuck in 'anchoring').
+                const result = await (producer as any).tx({ user: erpUser }, (tx: any) => tx.send('createPassport', {
                     passportJson: JSON.stringify(event.data),
                     submit: process.env.ERP_AUTO_ANCHOR === 'true'
-                });
+                }));
                 cds.log('erp-ingest').info(`event ${event.id ?? '?'} -> passport ${passportId} (${result?.mode})`);
                 return res.status(201).json({ status: 'created', passportId, mode: result?.mode ?? 'offline' });
             } catch (e: any) {

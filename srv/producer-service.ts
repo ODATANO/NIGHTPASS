@@ -48,6 +48,10 @@ interface PassportInput {
  */
 export default class ProducerService extends cds.ApplicationService {
     private serverSessionId: string | null = null;
+    /** Pending facade prewarm for the server session; awaited once by the
+     *  first detached anchor run (submitting before the facade exists fails
+     *  with "No facade for sessionId"). */
+    private serverPrewarmJobId: string | null = null;
 
     override async init(): Promise<void> {
         this.on('createPassport', this.createPassport);
@@ -70,7 +74,19 @@ export default class ProducerService extends cds.ApplicationService {
         return process.env.PASSPORT_CONTRACT_ADDRESS ?? null;
     }
 
-    /** Lazy server signing session from env (PRODUCER_VIEWING_KEY + mnemonic/seed). */
+    /**
+     * Lazy server signing session from env (PRODUCER_VIEWING_KEY + mnemonic/seed).
+     *
+     * BARE `srv.send()` on purpose: it joins the caller's AMBIENT request tx,
+     * so NIGHTGATE's session writes ride on the same sqlite transaction (no
+     * cross-tx write-lock conflict) and inherit the request's user, which
+     * NIGHTGATE binds the session to. Callers must therefore run inside a
+     * proper request context with an authenticated user: HTTP requests have
+     * one anyway; programmatic callers (ERP ingest) must use the MANAGED
+     * `srv.tx({user}, fn)` form. Both a wrapper `nightgate.tx({user},...)` and
+     * `sendDetached` were tried here and deadlock (SQLITE_BUSY) against the
+     * caller's open request tx.
+     */
     private async serverSigningSession(): Promise<string | null> {
         if (this.serverSessionId) return this.serverSessionId;
         const viewingKey = process.env.PRODUCER_VIEWING_KEY;
@@ -81,13 +97,22 @@ export default class ProducerService extends cds.ApplicationService {
             const nightgate = await cds.connect.to('NightgateService');
             const conn: any = await nightgate.send('connectWallet', { viewingKey });
             const sessionId = String(conn.sessionId);
-            await nightgate.send('connectWalletForSigning', {
+            const signing: any = await nightgate.send('connectWalletForSigning', {
                 sessionId, ...(mnemonic ? { mnemonic } : { seedHex })
             });
+            // Remember the prewarm job: the detached anchor runner must await it
+            // before its first submission (the facade does not exist until then).
+            this.serverPrewarmJobId = signing?.prewarmJobId ? String(signing.prewarmJobId) : null;
             this.serverSessionId = sessionId;
             return sessionId;
-        } catch (e) {
-            cds.log('producer').warn('server signing session unavailable:', (e as Error)?.message);
+        } catch (e: any) {
+            // Log the FULL error shape: CAP OData rejections often carry the
+            // detail in e.code/e.reason/e.cause rather than e.message.
+            cds.log('producer').warn('server signing session unavailable:',
+                e?.message || '(no message)',
+                '| code:', e?.code ?? '-',
+                '| cause:', e?.cause?.message ?? e?.reason ?? '-',
+                '| raw:', (() => { try { return JSON.stringify(e).slice(0, 300); } catch { return String(e); } })());
             return null;
         }
     }
@@ -595,6 +620,17 @@ export default class ProducerService extends cds.ApplicationService {
         const log = cds.log('producer');
         try {
             const nightgate = await cds.connect.to('NightgateService');
+            // First anchor after a fresh server signing session: the facade is
+            // still being built/synced by the prewarm job; submitting earlier
+            // fails with "No facade for sessionId". Await it once (detached
+            // context, short read polls only).
+            if (this.serverPrewarmJobId && sessionId === this.serverSessionId) {
+                const prewarmJob = this.serverPrewarmJobId;
+                this.serverPrewarmJobId = null;
+                log.info(`awaiting server-session prewarm ${prewarmJob} before first anchor...`);
+                await waitForJob(nightgate, prewarmJob, sessionId, user);
+                log.info('server-session prewarm complete');
+            }
             const { attestationTxHash } = await anchorPassport(nightgate, {
                 payloadHash, passportId, passportIdHash, contractAddress, sessionId, user, contentRoot,
                 onStep: async (s) => {
