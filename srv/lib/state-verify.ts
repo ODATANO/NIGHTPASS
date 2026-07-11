@@ -42,7 +42,7 @@ export async function verifyAttestState(o: {
     const payloadHash = norm(o.payloadHash);
     if (!contractAddress || !payloadHash) return 'unknown';
     try {
-        const nightgate = await cds.connect.to('nightgate');
+        const nightgate = await cds.connect.to('NightgateService');
         const res: any = await nightgate.send('verifyAttestationState', {
             contractAddress,
             payloadHash,
@@ -73,7 +73,7 @@ export async function verifyGrantState(o: {
     const grantee = String(o.grantee ?? '');
     if (!contractAddress || !payloadHash || !grantee) return 'unknown';
     try {
-        const nightgate = await cds.connect.to('nightgate');
+        const nightgate = await cds.connect.to('NightgateService');
         await nightgate.send('reindexDisclosures', { contractAddress, compiledArtifactRef: CONTRACT_REF });
     } catch {
         return 'unknown'; // No live provider. Leave the row pending; a later retry re-checks.
@@ -113,7 +113,7 @@ export async function verifyPredicateState(o: {
     const payloadHash = norm(o.payloadHash);
     if (!contractAddress || !payloadHash) return 'unknown';
     try {
-        const nightgate = await cds.connect.to('nightgate');
+        const nightgate = await cds.connect.to('NightgateService');
         const res: any = await nightgate.send('verifyPredicateState', {
             contractAddress,
             payloadHash,

@@ -5,6 +5,7 @@ import {
 } from '#cds-models/passport';
 import {
     hashPayload, blake2b256Hex, encryptPayload, anchorPassport, waitForJob,
+    detachedFromRequest, sendDetached,
     buildContentRoot, fieldKeyHex, BATTERY_PROVABLE_FIELDS
 } from './lib/passport-anchor';
 import { verifyContractTx, type ChainVerdict } from './lib/chain-verify';
@@ -77,7 +78,7 @@ export default class ProducerService extends cds.ApplicationService {
         const seedHex = process.env.PRODUCER_WALLET_SEED_HEX;
         if (!viewingKey || !(mnemonic || seedHex)) return null;
         try {
-            const nightgate = await cds.connect.to('nightgate');
+            const nightgate = await cds.connect.to('NightgateService');
             const conn: any = await nightgate.send('connectWallet', { viewingKey });
             const sessionId = String(conn.sessionId);
             await nightgate.send('connectWalletForSigning', {
@@ -539,15 +540,27 @@ export default class ProducerService extends cds.ApplicationService {
         });
     }
 
-    /** Shared anchor+persist: attest + bindPassport, log each tx, update status. */
+    /**
+     * Shared anchor entry: mark the row 'anchoring' and run the on-chain
+     * sequence (attest + bindPassport + contentRoot) DETACHED from this
+     * request, after its transaction committed.
+     *
+     * Waiting inline would deadlock the very work we wait on: this handler's
+     * request tx holds a pooled SQLite connection and the write lock, and the
+     * NIGHTGATE background job needs both to even start. The job would only
+     * run after our own timeout rolled the request back (observed live as
+     * "10-15 minutes per anchor step"; the real anchor takes seconds). So the
+     * action returns mode 'anchoring' immediately; every detached step commits
+     * its own short tx; clients poll the Passports row until 'anchored' or
+     * 'failed' and read PassportTransactions for the per-step tx hashes.
+     */
     private async anchorRow(
         req: cds.Request, ID: string, passportId: string, payloadHash: string,
         passportIdHash: string, contractAddress: string, sessionId: string, includePayloadHash: boolean
     ) {
         await UPDATE.entity(Passports).set({ status: 'anchoring' }).where({ ID });
-        const nightgate = await cds.connect.to('nightgate');
-        // Build the content root over the passport's provable fields so the
-        // anchor sequence also pins it on-chain (enables field-bound proofs).
+        // Content-root inputs must be read HERE: the row's children may still be
+        // uncommitted in this request's tx and invisible to a detached reader.
         let contentRoot: string | undefined;
         try {
             const values = await this.fieldValuesFor(ID);
@@ -555,24 +568,58 @@ export default class ProducerService extends cds.ApplicationService {
         } catch (e) {
             cds.log('producer').warn('content-root build skipped:', (e as Error)?.message);
         }
+        // 'succeeded' fires after the request tx committed, so the detached
+        // runner never contends with this request for the write lock. The
+        // user is captured NOW: the NIGHTGATE calls must carry the caller's
+        // identity (wallet sessions are bound to the owning userId).
+        const user = req.user;
+        (req as any).on('succeeded', () => {
+            void detachedFromRequest(() =>
+                this.runAnchorDetached(ID, passportId, payloadHash, passportIdHash, contractAddress, sessionId, user, contentRoot)
+            ).catch((e: unknown) =>
+                cds.log('producer').error(`detached anchor runner crashed for ${passportId}:`, e));
+        });
+        return { passportId, payloadHash: includePayloadHash ? payloadHash : undefined, mode: 'anchoring', txHash: '' };
+    }
+
+    /**
+     * The long-running on-chain leg of anchorRow. Runs with no ambient tx;
+     * every DB write is its own short root tx (runDetached). Failures land on
+     * the row (status 'failed') plus a failed PassportTransactions entry, not
+     * on an HTTP response: the request that started this is long gone.
+     */
+    private async runAnchorDetached(
+        ID: string, passportId: string, payloadHash: string, passportIdHash: string,
+        contractAddress: string, sessionId: string, user: unknown, contentRoot?: string
+    ): Promise<void> {
+        const log = cds.log('producer');
         try {
+            const nightgate = await cds.connect.to('NightgateService');
             const { attestationTxHash } = await anchorPassport(nightgate, {
-                payloadHash, passportId, passportIdHash, contractAddress, sessionId, contentRoot,
+                payloadHash, passportId, passportIdHash, contractAddress, sessionId, user, contentRoot,
                 onStep: async (s) => {
-                    await INSERT.into(PassportTransactions).entries({
-                        passport_ID: ID, kind: s.kind, jobId: s.jobId, txHash: s.txHash,
-                        status: 'succeeded', explorerUrl: txExplorerUrl(s.txHash)
-                    } as any);
+                    await this.runDetached(async () => {
+                        await INSERT.into(PassportTransactions).entries({
+                            passport_ID: ID, kind: s.kind, jobId: s.jobId, txHash: s.txHash,
+                            status: 'succeeded', explorerUrl: txExplorerUrl(s.txHash)
+                        } as any);
+                    });
+                    log.info(`anchor step ${s.kind} for ${passportId}: ${s.txHash}`);
                 }
             });
-            await UPDATE.entity(Passports).set({ status: 'anchored', attestationTxHash, contractAddress }).where({ ID });
-            return { passportId, payloadHash: includePayloadHash ? payloadHash : undefined, mode: 'onchain', txHash: attestationTxHash };
+            await this.runDetached(async () => {
+                await UPDATE.entity(Passports).set({ status: 'anchored', attestationTxHash, contractAddress }).where({ ID });
+            });
+            log.info(`passport ${passportId} anchored: ${attestationTxHash}`);
         } catch (e) {
-            await UPDATE.entity(Passports).set({ status: 'failed' }).where({ ID });
-            await INSERT.into(PassportTransactions).entries({
-                passport_ID: ID, kind: 'attest', status: 'failed', errorMessage: String((e as Error)?.message ?? e)
-            } as any);
-            return req.reject(502, `on-chain anchor failed: ${(e as Error)?.message ?? e}`);
+            const msg = String((e as Error)?.message || (e as Error)?.name || e);
+            log.warn(`on-chain anchor failed for ${passportId}:`, e);
+            await this.runDetached(async () => {
+                await UPDATE.entity(Passports).set({ status: 'failed' }).where({ ID });
+                await INSERT.into(PassportTransactions).entries({
+                    passport_ID: ID, kind: 'attest', status: 'failed', errorMessage: msg
+                } as any);
+            }).catch(() => { /* status update is best-effort */ });
         }
     }
 
@@ -601,15 +648,19 @@ export default class ProducerService extends cds.ApplicationService {
             await INSERT.into(DisclosureGrantLog).entries({ passport_ID: row.ID, grantee, level, op, status: 'offline' } as any);
             return { mode: 'offline', txHash: '' };
         }
-        const nightgate = await cds.connect.to('nightgate');
+        const nightgate = await cds.connect.to('NightgateService');
         const action = op === 'grant' ? 'grantDisclosure' : 'revokeDisclosure';
         const args: Record<string, unknown> = {
             payloadHash: row.payloadHash, grantee, sessionId: session,
             contractAddress, compiledArtifactRef: CONTRACT_REF
         };
         if (op === 'grant') args.level = level;
-        const res: any = await nightgate.send(action, args);
-        const txHash = await waitForJob(nightgate, res.jobId, session);
+        // Detached send + detached polling: this request only READS before the
+        // wait, so it never holds the write lock, but the NIGHTGATE job still
+        // needs its own pooled connection and committed job row to make
+        // progress (see detachedFromRequest in passport-anchor).
+        const res: any = await sendDetached(nightgate, action, args, req.user);
+        const txHash = await waitForJob(nightgate, res.jobId, session, req.user);
         await INSERT.into(DisclosureGrantLog).entries({ passport_ID: row.ID, grantee, level, op, txHash, status: 'succeeded' } as any);
         await INSERT.into(PassportTransactions).entries({
             passport_ID: row.ID, kind: op === 'grant' ? 'grantDisclosure' : 'revokeDisclosure',
@@ -657,16 +708,18 @@ export default class ProducerService extends cds.ApplicationService {
         const proof = tree.proofFor(field);
         if (!proof) return req.reject(400, `field '${field}' is not a provable field`);
 
-        const nightgate = await cds.connect.to('nightgate');
+        const nightgate = await cds.connect.to('NightgateService');
         try {
-            const res: any = await nightgate.send('issueFieldPredicateAttestation', {
+            // Detached for the same reason as in disclosure(): the job must be
+            // able to run while this request is still open.
+            const res: any = await sendDetached(nightgate, 'issueFieldPredicateAttestation', {
                 payloadHash: row.payloadHash, fieldKey: proof.fieldKey, value: proof.value,
                 contentRoot: tree.contentRoot,
                 siblingsJson: JSON.stringify(proof.siblings), dirsJson: JSON.stringify(proof.dirs),
                 predicate: pred, threshold: thresholdScaled, unit: useUnit,
                 sessionId: session, contractAddress, compiledArtifactRef: CONTRACT_REF
-            });
-            const txHash = await waitForJob(nightgate, res.jobId, session);
+            }, req.user);
+            const txHash = await waitForJob(nightgate, res.jobId, session, req.user);
             await INSERT.into(PredicateProofLog).entries({
                 passport_ID: row.ID, sourceField: field, predicate: pred, threshold: thresholdScaled,
                 unit: useUnit, predicateAttestationId: res.predicateAttestationId, txHash, status: 'succeeded', result: true

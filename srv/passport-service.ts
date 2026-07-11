@@ -276,9 +276,9 @@ export default class PassportService extends cds.ApplicationService {
                 return req.reject(400,
                     'PASSPORT_CONTRACT_ADDRESS env is required for on-chain anchoring (a deployed passport-attestation address)');
             }
-            const nightgate = await cds.connect.to('nightgate');
+            const nightgate = await cds.connect.to('NightgateService');
             ({ attestationTxHash } = await anchorPassport(nightgate, {
-                payloadHash, passportId, passportIdHash, contractAddress, sessionId
+                payloadHash, passportId, passportIdHash, contractAddress, sessionId, user: req.user
             }));
         }
 

@@ -14,9 +14,10 @@
 //
 // Phase B (PASSPORT_CONTRACT_ADDRESS set): the actual passport anchor test.
 //   connectWallet -> connectWalletForSigning (warm restore) ->
-//   producer/createPassport(submit:true)  [attest + bindPassport + contentRoot]
-//   -> asserts mode=onchain + tx hash, reads back row status + tx log, and
-//   crawler-free-confirms via nightgate/verifyAttestationState.
+//   producer/createPassport(submit:true) returns mode=anchoring immediately;
+//   the server anchors DETACHED (attest + bindPassport + contentRoot). This
+//   script then polls the Passports row until status=anchored, prints the
+//   per-step tx log, and crawler-free-confirms via verifyAttestationState.
 //
 // Env knobs:
 //   NIGHTPASS_BASE            default http://localhost:4004
@@ -25,6 +26,14 @@
 //   LIVE_SKIP_DUST=1          skip dust registration (already registered)
 //   LIVE_DUST_WAIT_SECONDS    default 120, wait after a fresh registration
 //   LIVE_PREWARM_TIMEOUT_MIN  default 240 (cold sync upper bound)
+
+// createPassport now returns immediately (the anchor runs detached), but the
+// prewarm/getJobStatus polls can still be slow calls on a busy server. Disable
+// undici's dispatcher-level 5 min headersTimeout so no long response gets
+// killed regardless of the per-request AbortSignal (same workaround as
+// NIGHTGATE's run-deploy-e2e.mjs).
+import { Agent, setGlobalDispatcher } from 'undici';
+setGlobalDispatcher(new Agent({ headersTimeout: 0, bodyTimeout: 0, connectTimeout: 30_000 }));
 
 const BASE = process.env.NIGHTPASS_BASE || 'http://localhost:4004';
 const NG = `${BASE}/api/v1/nightgate`;
@@ -153,41 +162,55 @@ async function phaseA(sessionId) {
 }
 
 async function phaseB(sessionId) {
-    const passportId = `BAT-LIVE-${new Date().toISOString().slice(0, 19).replace(/[-:T]/g, '')}`;
-    step(`createPassport(${passportId}, submit:true) - attest + bindPassport + contentRoot (can take several minutes)`);
+    // runTag makes BOTH the passportId AND the private payload unique per run.
+    // The payload hash is computed over the batteries/recycledMaterials/
+    // diligenceDocs content only; a constant payload would hit the vault's
+    // "already attested" assert on every run after the first.
+    const runTag = new Date().toISOString().slice(0, 19).replace(/[-:T]/g, '');
+    const passportId = `BAT-LIVE-${runTag}`;
+    step(`createPassport(${passportId}, submit:true) - server anchors detached`);
     const r = await post(PROD, '/createPassport', {
         submit: true,
         sessionId,
         passportJson: JSON.stringify({
             passportId, manufacturerId: 'DE-CELLCO-001', batteryCategory: 'EV',
             model: 'PowerCell EV-75', manufactureDate: '2026-07-01', weightKg: 432.5, performanceClass: 'B',
-            batteries: [{ serialNumber: 'SN-LIVE-1', cellChemistry: 'NMC-811', capacityKwh: 75, carbonFootprintKgCO2: 3412.75, supplierName: 'CathodeWorks' }],
+            batteries: [{ serialNumber: `SN-LIVE-${runTag}`, cellChemistry: 'NMC-811', capacityKwh: 75, carbonFootprintKgCO2: 3412.75, supplierName: 'CathodeWorks' }],
             recycledMaterials: [{ material: 'Co', recycledPercentage: 16.5, sourceSupplierName: 'ReCobalt' }],
             diligenceDocs: [{ docType: 'dd-report' }]
         })
     });
     if (r.status >= 400) fail(`createPassport -> HTTP ${r.status}: ${pretty(r.body)}`);
     console.log(`OK   response: ${pretty(r.body)}`);
-    if (r.body?.mode !== 'onchain') fail(`expected mode=onchain, got '${r.body?.mode}' (is PASSPORT_CONTRACT_ADDRESS set in the SERVER's env?)`);
-    if (!/^[0-9a-f]{64}$/i.test(String(r.body?.txHash ?? ''))) fail(`expected a 64-hex txHash, got '${r.body?.txHash}'`);
+    if (r.body?.mode !== 'anchoring') fail(`expected mode=anchoring, got '${r.body?.mode}' (is PASSPORT_CONTRACT_ADDRESS set in the SERVER's env?)`);
 
-    step('Read back row + transaction log');
-    const rows = await get(PROD, `/Passports?$filter=passportId eq '${passportId}'&$select=ID,passportId,status,attestationTxHash,payloadHash,contractAddress`);
-    const row = rows.value?.[0];
+    step('Poll passport row until anchored (attest + bindPassport + contentRoot; expect ~1-3 min)');
+    const rowUrl = `/Passports?$filter=passportId eq '${passportId}'&$select=ID,passportId,status,attestationTxHash,payloadHash,contractAddress`;
+    const deadline = Date.now() + 20 * 60_000;
+    let row = null;
+    let lastStatus = null;
+    while (Date.now() < deadline) {
+        row = (await get(PROD, rowUrl)).value?.[0];
+        const status = row?.status ?? '(no row yet)';
+        if (status !== lastStatus) { process.stdout.write(`\n     [anchor] status=${status}`); lastStatus = status; }
+        else process.stdout.write('.');
+        if (status === 'anchored' || status === 'failed') break;
+        await new Promise(r2 => setTimeout(r2, POLL_MS));
+    }
+    process.stdout.write('\n');
     if (!row) fail('passport row not found after createPassport');
-    console.log(`row: ${pretty(row)}`);
-    const txs = await get(PROD, `/PassportTransactions?$filter=passport_ID eq ${row.ID}&$select=kind,status,txHash`);
-    for (const t of txs.value ?? []) console.log(`  tx: ${t.kind.padEnd(18)} ${t.status.padEnd(10)} ${t.txHash ?? ''}`);
-    const anchored = row.status === 'anchored';
-    if (!anchored) console.log(`WARN passport status is '${row.status}' (expected 'anchored')`);
+
+    step('Transaction log');
+    const txs = await get(PROD, `/PassportTransactions?$filter=passport_ID eq ${row.ID}&$select=kind,status,txHash,errorMessage`);
+    for (const t of txs.value ?? []) console.log(`  tx: ${t.kind.padEnd(18)} ${t.status.padEnd(10)} ${t.txHash ?? t.errorMessage ?? ''}`);
+    if (row.status !== 'anchored') fail(`passport status is '${row.status}' (expected 'anchored')`);
+    if (!/^[0-9a-f]{64}$/i.test(String(row.attestationTxHash ?? ''))) fail(`expected a 64-hex attestationTxHash, got '${row.attestationTxHash}'`);
 
     step('Crawler-free on-chain confirm: verifyAttestationState');
-    const v = await post(NG, '/verifyAttestationState', {
-        contractAddress: row.contractAddress, payloadHash: row.payloadHash,
-        compiledArtifactRef: 'attestation-vault'
-    }, 5 * 60_000);
-    console.log(`verifyAttestationState -> HTTP ${v.status}: ${pretty(v.body)}`);
-    if (v.status !== 200 || v.body?.verified !== true) fail('on-chain state did NOT confirm the attested payload hash');
+    // OData FUNCTION (GET with inline parameters), not an action: POST gets 405.
+    const v = await get(NG, `/verifyAttestationState(contractAddress='${row.contractAddress}',payloadHash='${row.payloadHash}',compiledArtifactRef='attestation-vault')`);
+    console.log(`verifyAttestationState -> ${pretty(v)}`);
+    if (v?.verified !== true) fail('on-chain state did NOT confirm the attested payload hash');
 
     console.log('\nPHASE B PASSED. Passport anchored on preprod and state-verified crawler-free.');
     console.log(`Passport:  ${passportId}`);

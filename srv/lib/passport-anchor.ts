@@ -204,12 +204,50 @@ export function encryptPayload(plaintext: string, passportId: string): Buffer {
 // --- NIGHTGATE job polling ---------------------------------------------------
 
 /**
- * Poll a NIGHTGATE async job to completion and return its tx hash.
- * Throws on job failure. ~2.5 min cap (30 × 5s); proof and submit are slow.
+ * Run `fn` with the ambient CAP transaction context cleared.
+ *
+ * Every NIGHTGATE job flow (send the action, then poll getJobStatus) MUST run
+ * outside the calling request's transaction. NIGHTGATE detaches its job work
+ * to cds.spawn, and that work needs a free pooled connection plus (on SQLite)
+ * the single write lock. A caller that keeps its own request tx open while
+ * waiting inline starves exactly the job it is waiting on: the job can only
+ * start once the caller times out and releases the connection. Live-diagnosed
+ * on preprod 2026-07-10: the "10-15 minutes per anchor step" were precisely
+ * the caller's own waitForJob timeout; the attest itself completes in seconds
+ * once the job is allowed to start.
  */
-export async function waitForJob(nightgate: cds.Service, jobId: string, sessionId: string): Promise<string> {
-    for (let i = 0; i < 30; i++) {
-        const job: any = await nightgate.send('getJobStatus', { jobId, sessionId });
+export function detachedFromRequest<T>(fn: () => Promise<T>): Promise<T> {
+    return (cds as any)._with(undefined, fn);
+}
+
+/**
+ * `srv.send` with NO ambient transaction at all, but WITH the caller's user
+ * identity carried explicitly on the request.
+ *
+ * Why not `srv.tx({user}, ...)`: that wrapper holds a root tx (and, after the
+ * handler's first INSERT, the sqlite write lock) for the whole action call.
+ * NIGHTGATE >=0.6.3 commits its BackgroundJobs row DETACHED inside startJob,
+ * on a second connection, synchronously within the same handler: with a
+ * write-holding wrapper both sides wait on each other until the busy timeout
+ * fires as "database is locked". So the context is cleared (every db.run in
+ * the handler becomes its own short tx) and the user rides on the request
+ * itself, which keeps NIGHTGATE's session-to-userId binding satisfied.
+ */
+export function sendDetached(nightgate: cds.Service, action: string, args: Record<string, unknown>, user?: unknown): Promise<any> {
+    return detachedFromRequest(() =>
+        (nightgate as any).send({ event: action, data: args, user }) as Promise<any>);
+}
+
+/**
+ * Poll a NIGHTGATE async job to completion and return its tx hash.
+ * Throws on job failure. 10 min cap (120 x 5s): the ZK proof takes 1.5-3s and
+ * block inclusion a few seconds more, so the cap only covers proof-server
+ * queueing. Each poll runs in its own short root tx so it sees the job's
+ * committed status updates.
+ */
+export async function waitForJob(nightgate: cds.Service, jobId: string, sessionId: string, user?: unknown): Promise<string> {
+    for (let i = 0; i < 120; i++) {
+        const job: any = await sendDetached(nightgate, 'getJobStatus', { jobId, sessionId }, user);
         if (job.status === 'succeeded') {
             const result = job.result ? JSON.parse(job.result) : {};
             return String(result.txHash ?? '');
@@ -220,6 +258,35 @@ export async function waitForJob(nightgate: cds.Service, jobId: string, sessionI
         await new Promise(r => setTimeout(r, 5000));
     }
     throw new Error(`job ${jobId} did not complete within timeout`);
+}
+
+/**
+ * Run one anchor step (send + poll) with a bounded retry on Substrate 1014.
+ *
+ * Back-to-back contract calls from the same wallet can race the wallet's own
+ * dust-state update: the next tx balances against a dust note the previous tx
+ * just spent, and the node rejects the submission as invalid (1014). The
+ * wallet state settles as soon as its indexer stream delivers the previous
+ * block, so a short backoff plus a freshly built tx resolves it. Only 1014 is
+ * retried: that code means the pool rejected the tx outright, so a retry can
+ * never double-anchor.
+ */
+async function runStep(kind: string, fn: () => Promise<string>): Promise<string> {
+    let lastErr: unknown;
+    for (let attempt = 0; attempt < 3; attempt++) {
+        if (attempt > 0) await new Promise(r => setTimeout(r, 15_000));
+        try { return await fn(); }
+        catch (e) {
+            lastErr = e;
+            const msg = String((e as Error)?.message ?? e);
+            // Retryable: 1014 (pool rejected the tx outright, wallet dust state
+            // settling) and sqlite write contention (a facade-persist of the
+            // multi-MB dust blob can hold the write lock past the busy timeout).
+            if (!/\b1014\b|database is locked/i.test(msg)) break;
+            cds.log('producer').warn(`anchor step ${kind} hit a retryable error (${msg.slice(0, 60)}), retrying...`);
+        }
+    }
+    throw new Error(`${kind}: ${String((lastErr as Error)?.message ?? lastErr)}`);
 }
 
 // --- On-chain anchor sequence ------------------------------------------------
@@ -242,6 +309,12 @@ export interface AnchorOpts {
      * with `buildContentRoot(...)`. Omit to skip the anchor step.
      */
     contentRoot?: string;
+    /**
+     * The CAP user the NIGHTGATE calls run as (usually the original req.user).
+     * Required with detached sends: NIGHTGATE binds wallet sessions to the
+     * owning userId, so the calls must carry the same identity.
+     */
+    user?: unknown;
     /** Called after each successful step, so callers can log a tx row. */
     onStep?: (step: AnchorStep) => Promise<void> | void;
 }
@@ -257,39 +330,51 @@ const CONTRACT_REF = 'attestation-vault';
  * fires per step for transaction logging.
  */
 export async function anchorPassport(nightgate: cds.Service, opts: AnchorOpts): Promise<{ attestationTxHash: string }> {
-    const { payloadHash, passportId, passportIdHash, contractAddress, sessionId, contentRoot, onStep } = opts;
+    const { payloadHash, passportId, passportIdHash, contractAddress, sessionId, contentRoot, user, onStep } = opts;
 
-    const anchor: any = await nightgate.send('anchorDocument', {
-        sha256:              payloadHash,
-        storageRef:          `passport://${passportId}`,
-        sessionId,
-        contractAddress,
-        contentType:         'application/json',
-        compiledArtifactRef: CONTRACT_REF
-    });
-    const attestationTxHash = await waitForJob(nightgate, anchor.jobId, sessionId);
-    await onStep?.({ kind: 'attest', jobId: String(anchor.jobId ?? ''), txHash: attestationTxHash });
-
-    const bind: any = await nightgate.send('submitContractCall', {
-        contractAddress,
-        circuit:             'bindPassport',
-        compiledArtifactRef: CONTRACT_REF,
-        sessionId,
-        args:                JSON.stringify([passportIdHash, payloadHash])
-    });
-    const bindTxHash = await waitForJob(nightgate, bind.jobId, sessionId);
-    await onStep?.({ kind: 'bindPassport', jobId: String(bind.jobId ?? ''), txHash: bindTxHash });
-
-    if (contentRoot) {
-        const root: any = await nightgate.send('submitContractCall', {
+    let attestJobId = '';
+    const attestationTxHash = await runStep('attest', async () => {
+        const anchor: any = await sendDetached(nightgate, 'anchorDocument', {
+            sha256:              payloadHash,
+            storageRef:          `passport://${passportId}`,
+            sessionId,
             contractAddress,
-            circuit:             'anchorContentRoot',
+            contentType:         'application/json',
+            compiledArtifactRef: CONTRACT_REF
+        }, user);
+        attestJobId = String(anchor.jobId ?? '');
+        return waitForJob(nightgate, anchor.jobId, sessionId, user);
+    });
+    await onStep?.({ kind: 'attest', jobId: attestJobId, txHash: attestationTxHash });
+
+    let bindJobId = '';
+    const bindTxHash = await runStep('bindPassport', async () => {
+        const bind: any = await sendDetached(nightgate, 'submitContractCall', {
+            contractAddress,
+            circuit:             'bindPassport',
             compiledArtifactRef: CONTRACT_REF,
             sessionId,
-            args:                JSON.stringify([payloadHash, contentRoot])
+            args:                JSON.stringify([passportIdHash, payloadHash])
+        }, user);
+        bindJobId = String(bind.jobId ?? '');
+        return waitForJob(nightgate, bind.jobId, sessionId, user);
+    });
+    await onStep?.({ kind: 'bindPassport', jobId: bindJobId, txHash: bindTxHash });
+
+    if (contentRoot) {
+        let rootJobId = '';
+        const rootTxHash = await runStep('anchorContentRoot', async () => {
+            const root: any = await sendDetached(nightgate, 'submitContractCall', {
+                contractAddress,
+                circuit:             'anchorContentRoot',
+                compiledArtifactRef: CONTRACT_REF,
+                sessionId,
+                args:                JSON.stringify([payloadHash, contentRoot])
+            }, user);
+            rootJobId = String(root.jobId ?? '');
+            return waitForJob(nightgate, root.jobId, sessionId, user);
         });
-        const rootTxHash = await waitForJob(nightgate, root.jobId, sessionId);
-        await onStep?.({ kind: 'anchorContentRoot', jobId: String(root.jobId ?? ''), txHash: rootTxHash });
+        await onStep?.({ kind: 'anchorContentRoot', jobId: rootJobId, txHash: rootTxHash });
     }
 
     return { attestationTxHash };

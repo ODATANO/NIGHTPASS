@@ -9,7 +9,7 @@
     "url": "https://github.com/ODATANO/NIGHTPASS"
   },
   "dependencies": {
-    "@odatano/nightgate": "^0.6.0",
+    "@odatano/nightgate": "^0.6.5",
     "@sap/cds": "^9",
     "express": "^4",
     "qrcode": "^1.5.4"
@@ -30,6 +30,10 @@
   "engines": {
     "node": ">=22"
   },
+  "overrides": {
+    "@midnight-ntwrk/ledger-v8": "8.1.0",
+    "@midnight-ntwrk/compact-js": "2.5.1"
+  },
   "scripts": {
     "postinstall": "npm run gen:types && npm run build:connector-lib",
     "start": "cds-tsx serve",
@@ -49,6 +53,12 @@
         "kind": "sqlite",
         "credentials": {
           "database": "db/passport.db"
+        },
+        "pool": {
+          "max": 4
+        },
+        "client": {
+          "timeout": 20000
         }
       },
       "nightgate": {
