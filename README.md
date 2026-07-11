@@ -23,6 +23,18 @@ It consumes [`@odatano/nightgate`](https://github.com/ODATANO/NIGHTGATE) as a CA
 - **Two submit paths** to the same contract: server (NIGHTGATE worker wallet, async jobs) or wallet (the user's own Lace via DApp-Connector). Offline-first: without a session or contract, actions land as local log rows and everything still works.
 - **Catena-X**: the cockpit exports the CX-0143 battery-passport aspect JSON and a **Predicate Attestation Credential (PAC)**, carrying the proven predicates with `valueDisclosed: false`. That predicate capability is what Tractus-X currently lacks.
 
+### Live example (Midnight preview, 2026-07-11)
+
+One ERP goods-receipt ingested end-to-end (signed webhook -> `createPassport` -> auto-anchor), passport `BAT-GR-0015`, three transactions on the preview network:
+
+| Step | Transaction |
+|---|---|
+| attest | [`67df45db...cc42d8e2`](https://preview.midnightexplorer.com/transactions/0x67df45db9a4c67d1b6af55cf5dbe0d874ecfe0e40ac57e80d5ad7abecc42d8e2) |
+| bindPassport | [`97c36cb5...bb5991bb`](https://preview.midnightexplorer.com/transactions/0x97c36cb573ed7ce9ed2d64f45986efa4023859b478ae9a283a0484a6bb5991bb) |
+| anchorContentRoot | [`6cce29ba...93020e16`](https://preview.midnightexplorer.com/transactions/0x6cce29baa9be9237782386ffda00eaebbfd1a18bf68abaf3b0ce9dab93020e16) |
+
+Vault contract: `dcd297ba6a335a5d64916a6f2e36151c7490baa119fd022c846944918d9cde69`. Reproduce with `node --env-file=.env test/integration/erp-ingest-e2e.mjs` against a running server (see [docs/producer-flow.md](docs/producer-flow.md) for how to read the transactions).
+
 ## Documentation
 
 | Doc | Contents |
