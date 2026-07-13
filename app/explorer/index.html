@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>NIGHTPASS Passport Explorer</title>
+  <meta name="description" content="Public explorer for EU battery passports anchored on Midnight. Live zero-knowledge attestation state, no account needed."/>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='14' fill='%230e0f13'/%3E%3Ccircle cx='16' cy='16' r='7' fill='none' stroke='%237aa2ff' stroke-width='3'/%3E%3C/svg%3E"/>
+  <link rel="stylesheet" href="style.css"/>
+</head>
+<body>
+  <header class="site-header">
+    <a class="brand" href="#/">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <span class="brand-name">NIGHTPASS<span class="brand-sub">Passport Explorer</span></span>
+    </a>
+    <form id="searchForm" class="search" role="search">
+      <input id="searchInput" type="search" autocomplete="off" spellcheck="false"
+             placeholder="Search passport ID, payload hash or attestation tx&hellip;" aria-label="Search"/>
+      <button type="submit">Search</button>
+    </form>
+    <span id="networkBadge" class="net-badge" title="Network this explorer verifies against">&hellip;</span>
+    <span id="netSwitch" class="net-switch" title="Explorers of the other networks"></span>
+  </header>
+
+  <main id="app" class="container" aria-live="polite">
+    <div class="loading">Loading anchors&hellip;</div>
+  </main>
+
+  <footer class="site-footer">
+    <span>EU Battery Regulation 2023/1542 Digital Product Passports, anchored on the
+      <strong>Midnight</strong> testnet. Payload hashes are public; battery data stays
+      encrypted off-chain behind tiered disclosure.</span>
+    <span class="foot-links">
+      <a href="/passport/webapp/index.html" target="_blank" rel="noopener">Passport Viewer</a>
+      <span aria-hidden="true">&middot;</span>
+      <a href="https://github.com/ODATANO/NIGHTPASS" target="_blank" rel="noopener">GitHub</a>
+    </span>
+  </footer>
+
+  <!-- Module script: app.js imports the locally vendored anime.js (CSP allows
+       only same-origin scripts). The app works without it (progressive
+       enhancement); the import failure path degrades to no animations. -->
+  <script type="module" src="app.js"></script>
+</body>
+</html>
