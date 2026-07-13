@@ -62,14 +62,42 @@ Open http://localhost:4004/ for the launchpad.
 |---|---|
 | Producer cockpit (create, attest, disclose, prove; in-app Lace wallet flow) | `/producer/webapp/index.html` |
 | Consumer passport viewer (3 tiers) | `/passport/webapp/` |
+| Passport Explorer (public, block-explorer style, live verification) | `/explorer/` |
 | MockSapService (goods-receipt feed) | `/api/v1/mock-sap` |
 | ProducerService | `/api/v1/producer` |
 | PassportService | `/api/v1/passport` |
 | NightgateService (+ indexer / analytics / admin) | `/api/v1/nightgate` |
 
+### Producer cockpit login (signing identity)
+
+The cockpit opens on a login screen that picks HOW this producer signs on-chain:
+
+- **Browser wallet (Lace)**: the user holds the keys; every attest / grant /
+  proof is signed in the extension and submitted from the browser.
+- **Server wallet**: NIGHTGATE holds the key and signs server-side. The picker
+  lists the configured wallets (`listServerWallets`), each an independent
+  Midnight account, so a demo can show several producers anchoring under their
+  own identity. Configure them via `PRODUCER_WALLETS` + `PRODUCER_<ID>_*`
+  (see `.env.example`); `npm run start:wallets` wires them up from the
+  gitignored secrets file in dev.
+
+Passports are scoped to the signing identity (`owner` = its shielded address),
+so each wallet sees only its own. "Switch wallet" returns to the login screen.
+
 ### Login (custom auth, `srv/auth.js`)
 
-Anonymous resolves to consumer. Built-in demo users: `producer`/`producer`, `recycler`/`recycler`, `authority`/`authority`. Dataspace partners log in with their BPN plus secret (from `passport.Partners`) and see only passports granted to them, at the granted level.
+Anonymous resolves to consumer. Built-in demo users: `producer`/`producer`, `recycler`/`recycler`, `authority`/`authority` (override the passwords via `DEMO_PASS_PRODUCER` / `DEMO_PASS_AUTHORITY` / `DEMO_PASS_RECYCLER` on a public host). Dataspace partners log in with their BPN plus secret (from `passport.Partners`) and see only passports granted to them, at the granted level.
+
+## Public demo hosting
+
+The viewer, QR resolver and the anonymous live on-chain verification
+(`verifyOnChain`, the "Verify on Midnight" button) can run on a public host so
+homepage visitors verify passports themselves. The standalone **Passport
+Explorer** at `/explorer/` is a public block-explorer-style app (search, stat
+tiles, anchor table, detail pages that verify live on open); the same overview
+also exists inside the viewer at `#/explorer`. Both are backed by the anonymous
+`anchorExplorer()` function. See `docs/public-demo.md` for the Docker image,
+environment, and the security checklist.
 
 ## Repository layout
 
@@ -86,9 +114,11 @@ srv/lib/chain-verify.ts           structural on-chain verification of wallet-rep
 srv/auth.js                       custom CAP auth (demo users + BPN partners)
 app/producer/webapp/              producer cockpit (SAPUI5), in-app Lace wallet flow
 app/passport/webapp/              consumer viewer, one app / three tiers
+app/explorer/                     public Passport Explorer (plain HTML/CSS/JS, no build step)
 app/connector/                    in-app Lace connector library (connector.mjs, Vite lib bundle)
 tractusx/pac/                     Predicate Attestation Credential glue + verify demo
-docs/                             producer-flow.md, producer-walkthrough.md, architecture.md/svg/png
+docs/                             producer-flow.md, producer-walkthrough.md, architecture.md/svg/png, public-demo.md
+Dockerfile                        public demo image (docs/public-demo.md)
 ```
 
 ## Scripts
