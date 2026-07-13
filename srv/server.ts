@@ -2,8 +2,9 @@ import cds from '@sap/cds';
 import QRCode from 'qrcode';
 import crypto from 'node:crypto';
 import express from 'express';
+import { verifyPeers, explorerLinks, passportSources } from './lib/passport-anchor';
 
-const { SELECT } = cds.ql;
+const { SELECT, INSERT, UPDATE } = cds.ql;
 
 /**
  * NIGHTPASS bootstrap extras (T23): the public QR landing resolver and the QR
@@ -16,9 +17,36 @@ const { SELECT } = cds.ql;
  * so the view preselects the battery.
  */
 cds.on('bootstrap', (app: any) => {
+    // --- Public-surface gate (PASSPORT_PUBLIC_SURFACE=explorer) --------------
+    // Deployment split: a PUBLIC instance serves ONLY the explorer surface
+    // (static app + anonymous GET read API + QR/resolver); cockpit, tiered
+    // viewer, webhook and every write stay on the internal work instance.
+    // Registered on bootstrap, so it runs before CAP's static/OData middlewares.
+    const surface = process.env.PASSPORT_PUBLIC_SURFACE?.trim() || '';
+    if (surface === 'explorer') {
+        app.use((req: any, res: any, next: any) => {
+            const p = String(req.path || '');
+            const allowed =
+                p === '/' ||
+                p.startsWith('/explorer') ||
+                p.startsWith('/qr/') ||
+                p.startsWith('/p/') ||
+                p.startsWith('/resolve/') ||
+                (p.startsWith('/api/v1/passport') && req.method === 'GET');
+            if (!allowed) return res.status(404).json({ error: 'not on this surface' });
+            next();
+        });
+        app.get('/', (_req: any, res: any) => res.redirect(302, '/explorer/'));
+    }
+
     // --- Tier resolver: GET /p/:passportId -----------------------------------
     app.get('/p/:passportId', (req: any, res: any) => {
         const passportId = String(req.params.passportId || '');
+        // On the public explorer surface the explorer detail IS the QR landing
+        // (the tiered viewer lives on the internal instance).
+        if (surface === 'explorer') {
+            return res.redirect(302, `/explorer/#/p/${encodeURIComponent(passportId)}`);
+        }
         const tier = tierFromAuth(req.headers.authorization);
         // The consumer route's pattern is "" (the SPA default), so it lives at the
         // empty hash. `#/consumer` matches NO route and renders a blank page, so only
@@ -60,7 +88,29 @@ cds.on('bootstrap', (app: any) => {
             || `https://indexer.${network}.midnight.network/api/v4/graphql`;
         const indexerWsUrl = process.env.NIGHTGATE_INDEXER_WS_URL?.trim() || cfg.indexerWsUrl
             || `wss://indexer.${network}.midnight.network/api/v4/graphql/ws`;
-        res.json({ network, indexerHttpUrl, indexerWsUrl });
+        // Capability flags for the explorer UIs: can verifyOnChain live-check
+        // rows anchored on ANOTHER network? `crossNetworkVerify` covers ANY
+        // network once the installed NIGHTGATE exposes the `network` override
+        // (FR verify-state-network-override, detected on the loaded model);
+        // `peerNetworks` lists networks covered by delegating peer instances
+        // (PASSPORT_VERIFY_PEERS) until then.
+        const crossNetworkVerify =
+            !!((cds.model as any)?.definitions?.['NightgateService.verifyAttestationState']?.params?.network);
+        const peerNetworks = Object.keys(verifyPeers());
+        // Where "Open in Passport Viewer" should point: an explicit base URL
+        // (internal work instance), same-origin ('') when the viewer is
+        // co-hosted, or null on a pure explorer surface (link hidden).
+        const viewerBase = process.env.PASSPORT_VIEWER_BASE?.trim()
+            || (surface === 'explorer' ? null : '');
+        res.json({
+            network, indexerHttpUrl, indexerWsUrl, crossNetworkVerify, peerNetworks,
+            // Browser-facing explorer URLs of the sibling per-network instances
+            // (PASSPORT_EXPLORER_LINKS); the explorer header renders them as
+            // network switch links.
+            explorerLinks: explorerLinks(),
+            surface,
+            viewerBase
+        });
     });
 
     // --- ERP event ingest: POST /api/v1/passport/erp-events ------------------
@@ -141,6 +191,62 @@ cds.on('bootstrap', (app: any) => {
             return res.status(500).end(String(e?.message ?? e));
         }
     });
+});
+
+// --- Federation sync: aggregate anchors from producer instances ---------------
+//
+// A PUBLIC explorer instance shows passports of MANY producers. Each producer
+// runs its own NIGHTPASS; PASSPORT_SOURCES lists their base URLs, and this loop
+// periodically pulls each one's anonymous anchorExplorer() surface (public
+// Point-1 fields + anchor metadata, nothing else exists there) into the local
+// Passports table, keyed by passportId. Verification never trusts this data:
+// verifyOnChain re-reads the vault state live from the chain indexer.
+cds.on('served', () => {
+    const sources = passportSources();
+    const names = Object.keys(sources);
+    if (!names.length) return;
+    const log = cds.log('explorer-sync');
+    const intervalMs = Math.max(15000, Number(process.env.PASSPORT_SYNC_INTERVAL_MS) || 60000);
+    const FIELDS = [
+        'model', 'manufacturerId', 'batteryCategory', 'manufactureDate', 'weightKg',
+        'performanceClass', 'qrCodeUrl', 'payloadHash', 'contractAddress',
+        'anchorNetwork', 'attestationTxHash', 'status'
+    ] as const;
+
+    async function syncOnce(): Promise<void> {
+        for (const name of names) {
+            try {
+                const r = await fetch(`${sources[name]}/api/v1/passport/anchorExplorer()`,
+                    { signal: AbortSignal.timeout(20000) });
+                if (!r.ok) throw new Error(`HTTP ${r.status}`);
+                const rows: any[] = ((await r.json()) as any)?.value ?? [];
+                let n = 0;
+                for (const row of rows) {
+                    const passportId = String(row?.passportId ?? '').trim();
+                    if (!passportId) continue;
+                    const data: Record<string, unknown> = {};
+                    for (const f of FIELDS) if (row[f] !== undefined) data[f] = row[f];
+                    const existing: any = await SELECT.one.from('passport.Passports')
+                        .columns('ID').where({ passportId });
+                    if (existing) {
+                        await UPDATE.entity('passport.Passports').set(data).where({ ID: existing.ID });
+                    } else {
+                        await INSERT.into('passport.Passports')
+                            .entries({ ID: cds.utils.uuid(), passportId, ...data });
+                    }
+                    n++;
+                }
+                log.info(`synced ${n} passports from '${name}' (${sources[name]})`);
+            } catch (e: any) {
+                log.warn(`source '${name}' unreachable:`, e?.message ?? e);
+            }
+        }
+    }
+
+    setTimeout(() => { void syncOnce(); }, 3000);
+    const t = setInterval(() => { void syncOnce(); }, intervalMs);
+    (t as any).unref?.();
+    log.info(`aggregating ${names.length} producer source(s) every ${intervalMs}ms: ${names.join(', ')}`);
 });
 
 /**

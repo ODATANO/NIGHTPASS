@@ -48,12 +48,14 @@
       "routes": [
         { "name": "consumer",  "pattern": "",          "target": "consumer" },
         { "name": "recycler",  "pattern": "recycler",  "target": "recycler" },
-        { "name": "authority", "pattern": "authority", "target": "authority" }
+        { "name": "authority", "pattern": "authority", "target": "authority" },
+        { "name": "explorer",  "pattern": "explorer",  "target": "explorer" }
       ],
       "targets": {
         "consumer":  { "viewName": "Consumer" },
         "recycler":  { "viewName": "Recycler" },
-        "authority": { "viewName": "Authority" }
+        "authority": { "viewName": "Authority" },
+        "explorer":  { "viewName": "Explorer" }
       }
     },
     "dependencies": {

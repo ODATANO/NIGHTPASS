@@ -5,14 +5,15 @@ sap.ui.define([
 ], function (Controller, Fragment, MessageToast) {
   "use strict";
 
-  // Which mocked role each tier needs. consumer is anonymous (public reads).
-  var TIER_ROLE = { consumer: null, recycler: "recycler", authority: "authority" };
+  // Which mocked role each tier needs. consumer and the anchor explorer are
+  // anonymous (public reads).
+  var TIER_ROLE = { consumer: null, recycler: "recycler", authority: "authority", explorer: null };
 
   return Controller.extend("passport.controller.App", {
 
     onInit: function () {
       var oRouter = this.getOwnerComponent().getRouter();
-      ["consumer", "recycler", "authority"].forEach(function (sTier) {
+      ["consumer", "recycler", "authority", "explorer"].forEach(function (sTier) {
         oRouter.getRoute(sTier).attachPatternMatched(this._onRouteMatched.bind(this, sTier));
       }.bind(this));
 

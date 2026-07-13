@@ -101,6 +101,16 @@
               state="{= ${attestationTxHash} ? 'Success' : 'None' }"
               class="npMono"/>
           </form:SimpleForm>
+
+          <!-- Live on-chain verification (anonymous verifyOnChain function). -->
+          <VBox class="sapUiSmallMarginTop npVerifyBox">
+            <Button text="Verify on Midnight" icon="sap-icon://chain-link"
+                    press="onVerifyPassport" busy="{verify>/busy}" busyIndicatorDelay="0"/>
+            <ObjectStatus text="{verify>/text}" state="{verify>/state}"
+                          visible="{= !!${verify>/text} }" class="sapUiTinyMarginTop"/>
+            <Link text="Open attestation transaction in the explorer" href="{verify>/explorerUrl}"
+                  target="_blank" visible="{= !!${verify>/explorerUrl} }" class="sapUiTinyMarginTop"/>
+          </VBox>
         </Panel>
       </VBox>
 

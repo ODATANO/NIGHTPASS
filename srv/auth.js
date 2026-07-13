@@ -11,15 +11,19 @@ const cds = require('@sap/cds');
  *     keep the cockpit + viewer flows working.
  *   - Anything else → anonymous (public consumer tier).
  *
- * Trust-based (no cryptographic proof the caller owns the DID) — the real
+ * Trust-based (no cryptographic proof the caller owns the DID). The real
  * dataspace does this with verifiable credentials; we mirror its shape.
  */
 const { SELECT } = cds.ql;
 
+// Built-in demo users. Locally the password equals the user name; on a PUBLIC
+// deployment set DEMO_PASS_* so nobody can log in with the well-known defaults
+// (see docs/public-demo.md). Setting the env var to a strong secret is enough;
+// the user name stays the same.
 const BUILTIN = {
-  producer:  { pass: 'producer',  roles: ['producer', 'authority', 'recycler'] },
-  authority: { pass: 'authority', roles: ['authority', 'recycler'] },
-  recycler:  { pass: 'recycler',  roles: ['recycler'] }
+  producer:  { pass: process.env.DEMO_PASS_PRODUCER  || 'producer',  roles: ['producer', 'authority', 'recycler'] },
+  authority: { pass: process.env.DEMO_PASS_AUTHORITY || 'authority', roles: ['authority', 'recycler'] },
+  recycler:  { pass: process.env.DEMO_PASS_RECYCLER  || 'recycler',  roles: ['recycler'] }
 };
 
 function decodeBasic(header) {

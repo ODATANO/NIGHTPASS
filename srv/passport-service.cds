@@ -14,6 +14,11 @@ using { passport } from '../db/passport-schema';
  * do NOT treat this as the disclosure boundary yet. `payloadCipher` is excluded
  * from the read projection so the encrypted blob isn't served.
  */
+// requires 'any': the viewer surface is deliberately PUBLIC (anonymous = the
+// consumer tier a cold QR scan gets). Without this, NODE_ENV=production makes
+// CAP demand an authenticated user for every request and the public demo host
+// answers 401 to visitors. Write actions below carry their own producer gates.
+@(requires: 'any')
 @path: '/api/v1/passport'
 service PassportService {
     @readonly entity Passports as projection on passport.Passports excluding { payloadCipher };
@@ -54,7 +59,11 @@ service PassportService {
      * connectWallet → connectWalletForSigning); when omitted, the deterministic
      * off-chain steps still run (hash, encrypt, row, QR) but no tx is submitted
      * and `attestationTxHash` is null. Useful for offline/dev runs.
+     *
+     * Producer-gated: passport creation is a producer write path. On a public
+     * demo host an anonymous visitor must not be able to insert rows.
      */
+    @(requires: 'producer')
     action generatePassport(
         batchId:   String,
         sessionId: UUID
@@ -80,7 +89,7 @@ service PassportService {
         attestationTxHash: String;
         status:            String;
         locallyAnchored:   Boolean;   // DB state: anchored + attest tx present (NOT a live chain re-check)
-        viewerUrl:         String;    // /resolve/<hash> — tier-gated landing
+        viewerUrl:         String;    // /resolve/<hash>, the tier-gated landing
     };
 
     /**
@@ -89,4 +98,52 @@ service PassportService {
      * zero-knowledge predicate proofs. The artifact a supplier verifies.
      */
     function passportCredential(payloadHash: String) returns LargeString;
+
+    /**
+     * LIVE on-chain verification for the public viewer: ask the Midnight indexer
+     * (crawler-free, NIGHTGATE `verifyAttestationState`) whether this passport's
+     * payload hash is anchored in the attestation vault right now. Anonymous by
+     * design so a QR visitor can verify a freshly created passport without an
+     * account. Unlike `resolveByHash.locallyAnchored` this is NOT a DB-state
+     * assertion; `verified` reflects the live ledger read.
+     */
+    function verifyOnChain(passportId: String) returns {
+        passportId:        String;
+        status:            String;    // producer lifecycle from the row
+        verified:          Boolean;   // live ledger read: payloadHash present in the vault
+        payloadHash:       String;
+        contractAddress:   String;
+        anchorNetwork:     String;    // network the row was anchored on (null on legacy rows)
+        serverNetwork:     String;    // network this host verifies against
+        checkedNetwork:    String;    // network the live read actually ran on (null = read skipped)
+        attestationTxHash: String;
+        explorerUrl:       String;    // attestation tx on the anchor network's explorer
+        checkedAt:         String;    // ISO timestamp of this live check
+    };
+
+    /**
+     * Public anchor explorer (showcase): every passport this demo issued and its
+     * Midnight anchoring state, anchored rows first. Only Point-1 identity plus
+     * the anchor metadata that is public by design (it lives on-chain and is
+     * already served anonymously by `verifyOnChain` / `resolveByHash`). Feeds
+     * the viewer's Explorer route; per-row live verification goes through
+     * `verifyOnChain`.
+     */
+    function anchorExplorer() returns array of {
+        passportId:        String;
+        model:             String;
+        manufacturerId:    String;
+        batteryCategory:   String;
+        manufactureDate:   String;         // Annex XIII Point 1 (public)
+        weightKg:          Decimal(10, 3); // Point 1
+        performanceClass:  String;         // Point 1
+        qrCodeUrl:         String;         // Point 1, public landing URL
+        status:            String;
+        payloadHash:       String;
+        contractAddress:   String;
+        anchorNetwork:     String;    // network the row was anchored on (null on legacy rows)
+        attestationTxHash: String;
+        explorerUrl:       String;
+        createdAt:         String;    // row creation (ISO)
+    };
 }

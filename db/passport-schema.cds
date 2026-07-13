@@ -3,7 +3,7 @@ using { midnight } from '@odatano/nightgate/db/schema';
 
 namespace passport;
 
-/**
+/*
  * NIGHTPASS domain schema (T17) for the EU Battery Regulation 2023/1542
  * Digital Product Passport.
  *
@@ -55,10 +55,10 @@ type PartnerRole : String enum { recycler; authority; }
  * credential (stands in for the real Catena-X SSI/credential layer).
  */
 entity Partners : managed {
-    key did      : String(200);              // DID or BPN — the partner identity + login user
+    key did      : String(200);              // DID or BPN, the partner identity + login user
     name         : String(200);
     role         : PartnerRole;
-    granteeId    : String(64);               // sha256(utf8(did)) — matches the disclosure grantee
+    granteeId    : String(64);               // sha256(utf8(did)); matches the disclosure grantee
     secret       : String(120);              // mock login password (demo only)
 }
 
@@ -92,6 +92,7 @@ entity Passports : cuid, managed {
     payloadHash       : String(64);          // hex, the on-chain attestationId
     passportIdHash    : String(64);          // hex blake2b-256(passportId); on-chain bindPassport key
     contractAddress   : String(120);         // PassportAttestation deployment
+    anchorNetwork     : String(20);          // Midnight network of the anchor (preview/preprod/mainnet)
     attestationTxHash : String(120);         // tx that anchored attest/bindPassport
     status            : PassportStatus default #draft;  // producer lifecycle (draft → anchored)
 
@@ -198,5 +199,5 @@ entity PredicateProofLog : cuid, managed {
     predicateAttestationId : String(64);
     txHash                 : String(120);
     status                 : TxStatus default #offline;
-    result                 : Boolean;        // proven true (tx SUCCESS) — value stays hidden
+    result                 : Boolean;        // proven true (tx SUCCESS); value stays hidden
 }

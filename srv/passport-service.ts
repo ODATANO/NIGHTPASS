@@ -1,7 +1,7 @@
 import cds from '@sap/cds';
 import QRCode from 'qrcode';
 import { Passport, Passports, PredicateProofLog, Partners } from '#cds-models/passport';
-import { hashPayload, blake2b256Hex, encryptPayload, anchorPassport } from './lib/passport-anchor';
+import { hashPayload, blake2b256Hex, encryptPayload, anchorPassport, effectiveNetwork, explorerTxUrl, verifyPeers } from './lib/passport-anchor';
 import { granteeIdForDid } from './lib/grantee';
 import { rowToBatch, type Batch, type GoodsReceiptRow } from './lib/goods-receipt';
 
@@ -67,8 +67,8 @@ async function granteesOf(req: cds.Request): Promise<string[]> {
 /**
  * Effective disclosure grants for a set of grantee ids → Map(payloadHash → maxLevel).
  * Unions two sources so the demo works offline and stays on-chain-ready:
- *   (a) on-chain indexed grants  (`midnight.DisclosureGrants`, active) — real ACL.
- *   (b) producer-side offline log (`passport.DisclosureGrantLog`) — latest op per
+ *   (a) on-chain indexed grants (`midnight.DisclosureGrants`, active), the real ACL.
+ *   (b) producer-side offline log (`passport.DisclosureGrantLog`): latest op per
  *       (payloadHash, grantee); counts only if the newest op is `grant`.
  */
 async function effectiveGrantsFor(grantees: string[]): Promise<Map<string, number>> {
@@ -133,13 +133,21 @@ function redactPassport(row: Record<string, unknown>, tier: Tier): void {
     if (tier !== 'authority') row.diligenceDocs = [];
 }
 
-/** carbonFootprint + supplierName are authority-only; the rest is legitimate interest. */
+/**
+ * carbonFootprint + supplierName are authority-only; the rest is legitimate
+ * interest, so a consumer sees nothing at all. That matters on DIRECT child
+ * reads (GET /Batteries): via a Passports $expand the consumer's children are
+ * already emptied, but the direct read must not leak Points 2/3 fields to
+ * anonymous callers on a public host.
+ */
 function redactBattery(row: Record<string, unknown>, tier: Tier): void {
+    if (tier === 'consumer') { strip(row, Object.keys(row)); return; }
     if (tier !== 'authority') strip(row, ['carbonFootprintKgCO2', 'supplierName']);
 }
 
-/** sourceSupplierName (supplier identity) is authority-only. */
+/** sourceSupplierName (supplier identity) is authority-only; consumers see nothing. */
 function redactRecycled(row: Record<string, unknown>, tier: Tier): void {
+    if (tier === 'consumer') { strip(row, Object.keys(row)); return; }
     if (tier !== 'authority') strip(row, ['sourceSupplierName']);
 }
 
@@ -181,6 +189,8 @@ export default class PassportService extends cds.ApplicationService {
         this.on('resolveByHash', this.resolveByHash);
         this.on('passportCredential', this.passportCredential);
         this.on('registerPartner', this.registerPartner);
+        this.on('verifyOnChain', this.verifyOnChain);
+        this.on('anchorExplorer', this.anchorExplorer);
 
         // Disclosure-tier gating (T20): redact restricted fields per requester
         // tier on every read (the Annex XIII boundary). Base tier is the
@@ -203,7 +213,7 @@ export default class PassportService extends cds.ApplicationService {
             const local = localTierOf(req);
             const grantees = await granteesOf(req);
             // A registered dataspace partner (DID login, role 'partner') has no
-            // local tier — the GRANT LEVEL per passport drives disclosure, and
+            // local tier; the GRANT LEVEL per passport drives disclosure, and
             // they see ONLY passports granted to them. Built-in demo users and
             // the producer keep role-based behavior (no list scoping).
             const isPartner = !!req.user?.is?.('partner');
@@ -299,6 +309,7 @@ export default class PassportService extends cds.ApplicationService {
             payloadHash,
             passportIdHash,
             contractAddress,
+            anchorNetwork:    contractAddress ? effectiveNetwork() : null,
             attestationTxHash
         });
 
@@ -336,18 +347,141 @@ export default class PassportService extends cds.ApplicationService {
         };
     };
 
+    /**
+     * Live on-chain verification for the public viewer (anonymous). Reads the
+     * vault state through the indexer via NIGHTGATE `verifyAttestationState`
+     * (crawler-free), so it works on a read-only public host without a wallet.
+     *
+     * NightgateService is service-level `@requires: 'authenticated-user'`, but
+     * this check is public by design (anyone holding the QR may verify), so the
+     * in-process call runs under a fixed technical principal. A failed or
+     * unreachable ledger read yields `verified:false`, never a 5xx.
+     */
+    private verifyOnChain = async (req: cds.Request) => {
+        const passportId = String((req.data as { passportId?: string }).passportId ?? '').trim();
+        if (!passportId) return req.reject(400, 'passportId is required');
+        const row = await SELECT.one.from(Passports)
+            .columns('passportId', 'payloadHash', 'contractAddress', 'anchorNetwork', 'attestationTxHash', 'status')
+            .where({ passportId });
+        if (!row) return req.reject(404, `passport '${passportId}' not found`);
+
+        const norm = (h: unknown) => String(h ?? '').replace(/^0x/, '').toLowerCase();
+        const payloadHash = norm(row.payloadHash);
+        const contractAddress = norm(row.contractAddress);
+
+        // A row anchored on a DIFFERENT Midnight network than this server queries
+        // needs the `network` override on NIGHTGATE's verifyAttestationState
+        // (FR verify-state-network-override). Feature-detect it on the loaded
+        // model: dormant on plugin versions without it (the doomed read is
+        // skipped and the caller shows the honest reason), active right after
+        // an upgrade with no NIGHTPASS change.
+        const serverNetwork = effectiveNetwork();
+        const anchorNetwork = (row as Record<string, unknown>).anchorNetwork as string | null ?? null;
+        const crossNetwork = !!anchorNetwork && anchorNetwork !== serverNetwork;
+        const canOverride = !!(cds.model?.definitions?.['NightgateService.verifyAttestationState'] as any)?.params?.network;
+
+        let verified = false;
+        let checkedNetwork: string | null = null;
+        const peerBase = crossNetwork && anchorNetwork ? verifyPeers()[anchorNetwork] : undefined;
+        if (payloadHash && contractAddress && (!crossNetwork || canOverride)) {
+            checkedNetwork = crossNetwork ? anchorNetwork : serverNetwork;
+            try {
+                const nightgate = await cds.connect.to('NightgateService');
+                const verifier = new (cds.User as any)({ id: 'passport-verifier' });
+                const res: any = await (nightgate as any).tx({ user: verifier }, (tx: any) =>
+                    tx.send('verifyAttestationState', {
+                        contractAddress,
+                        payloadHash,
+                        compiledArtifactRef: 'attestation-vault',
+                        ...(crossNetwork ? { network: anchorNetwork } : {})
+                    }));
+                verified = res?.verified === true;
+            } catch { /* indexer unreachable or contract unknown: stay unverified */ }
+        } else if (payloadHash && contractAddress && peerBase) {
+            // No plugin-side network override, but a PEER instance configured for
+            // the row's network exists (PASSPORT_VERIFY_PEERS): delegate the live
+            // check to it server-side over its public API. On any peer failure
+            // the read counts as NOT performed (checkedNetwork stays null), so
+            // the UI shows the honest "cannot check here" instead of a false
+            // negative.
+            try {
+                const url = `${peerBase}/api/v1/passport/verifyOnChain(passportId=${
+                    encodeURIComponent(`'${passportId.replace(/'/g, "''")}'`)})`;
+                // Generous timeout: the peer's FIRST state read builds its
+                // provider bundle (ESM import + indexer handshake) and can take
+                // north of 30s cold; warm reads answer in a few seconds.
+                const r = await fetch(url, { signal: AbortSignal.timeout(60000) });
+                if (!r.ok) throw new Error(`peer ${r.status}`);
+                const b: any = await r.json();
+                verified = b?.verified === true;
+                checkedNetwork = typeof b?.checkedNetwork === 'string' ? b.checkedNetwork : anchorNetwork;
+            } catch (e: any) {
+                cds.log('passport').warn(`peer verify (${anchorNetwork}) failed:`, e?.message ?? e);
+                verified = false;
+                checkedNetwork = null;
+            }
+        }
+        return {
+            passportId:        row.passportId,
+            status:            row.status,
+            verified,
+            payloadHash:       payloadHash || null,
+            contractAddress:   contractAddress || null,
+            anchorNetwork,
+            serverNetwork,
+            checkedNetwork,
+            attestationTxHash: row.attestationTxHash ?? null,
+            explorerUrl:       explorerTxUrl(row.attestationTxHash, anchorNetwork),
+            checkedAt:         new Date().toISOString()
+        };
+    };
+
+    /**
+     * Public anchor explorer: all passports with their anchoring state, anchored
+     * first, newest first within a status. DB-only (no ledger reads here); the
+     * UI verifies rows live via verifyOnChain on demand.
+     */
+    private anchorExplorer = async () => {
+        const rows = await SELECT.from(Passports)
+            .columns('passportId', 'model', 'manufacturerId', 'batteryCategory', 'status',
+                'manufactureDate', 'weightKg', 'performanceClass', 'qrCodeUrl',
+                'payloadHash', 'contractAddress', 'anchorNetwork', 'attestationTxHash', 'createdAt')
+            .orderBy('createdAt desc');
+        const norm = (h: unknown) => String(h ?? '').replace(/^0x/, '').toLowerCase();
+        const rank: Record<string, number> = { anchored: 0, anchoring: 1, failed: 2, draft: 3 };
+        return (rows as Record<string, unknown>[])
+            .sort((a, b) => (rank[String(a.status)] ?? 9) - (rank[String(b.status)] ?? 9))
+            .map((r) => ({
+                passportId:        r.passportId,
+                model:             r.model,
+                manufacturerId:    r.manufacturerId,
+                batteryCategory:   r.batteryCategory,
+                manufactureDate:   r.manufactureDate ?? null,
+                weightKg:          r.weightKg ?? null,
+                performanceClass:  r.performanceClass ?? null,
+                qrCodeUrl:         r.qrCodeUrl ?? null,
+                status:            r.status,
+                payloadHash:       r.payloadHash ? norm(r.payloadHash) : null,
+                contractAddress:   r.contractAddress ? norm(r.contractAddress) : null,
+                anchorNetwork:     r.anchorNetwork ?? null,
+                attestationTxHash: r.attestationTxHash ?? null,
+                explorerUrl:       explorerTxUrl(r.attestationTxHash as string | null, r.anchorNetwork as string | null),
+                createdAt:         r.createdAt ?? null
+            }));
+    };
+
     /** Build a W3C-VC-style Battery Passport Credential (JSON) for a supplier. */
     private passportCredential = async (req: cds.Request) => {
         const raw = String((req.data as { payloadHash?: string }).payloadHash ?? '').replace(/^0x/, '').toLowerCase();
         if (!/^[0-9a-f]{64}$/.test(raw)) return req.reject(400, 'payloadHash must be 32-byte hex');
         const p = await SELECT.one.from(Passports)
-            .columns('ID', 'passportId', 'manufacturerId', 'model', 'batteryCategory', 'contractAddress', 'attestationTxHash', 'status', 'payloadHash')
+            .columns('ID', 'passportId', 'manufacturerId', 'model', 'batteryCategory', 'contractAddress', 'anchorNetwork', 'attestationTxHash', 'status', 'payloadHash')
             .where({ payloadHash: raw });
         if (!p) return req.reject(404, 'no battery for that payloadHash');
         const proofs = await SELECT.from(PredicateProofLog)
             .columns('sourceField', 'predicate', 'threshold', 'unit', 'txHash', 'result', 'status')
             .where({ passport_ID: p.ID, status: 'succeeded' });
-        const explorer = (h: unknown) => (h ? `https://preview.midnightexplorer.com/transactions/0x${String(h).replace(/^0x/, '')}` : null);
+        const explorer = (h: unknown) => explorerTxUrl(h as string | null, (p as Record<string, unknown>).anchorNetwork as string | null);
         const credential = {
             '@context': ['https://www.w3.org/ns/credentials/v2', 'https://catena-x.net/schema/pac/v1'],
             type: ['VerifiableCredential', 'BatteryPassportCredential'],

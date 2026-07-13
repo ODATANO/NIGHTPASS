@@ -31,6 +31,7 @@
             <tnt:NavigationListItem text="Consumer" icon="sap-icon://customer" key="consumer"/>
             <tnt:NavigationListItem text="Recycler" icon="sap-icon://recycle" key="recycler"/>
             <tnt:NavigationListItem text="Authority" icon="sap-icon://official-service" key="authority"/>
+            <tnt:NavigationListItem text="Explorer" icon="sap-icon://chain-link" key="explorer"/>
           </tnt:NavigationList>
         </tnt:SideNavigation>
       </tnt:sideContent>

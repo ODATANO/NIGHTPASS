@@ -1,0 +1,60 @@
+<mvc:View
+  controllerName="passport.controller.Explorer"
+  xmlns:mvc="sap.ui.core.mvc"
+  xmlns="sap.m">
+
+  <Page id="explorerPage" title="Passport Explorer">
+    <MessageStrip
+      text="Every battery passport issued by this demo and its anchoring state on Midnight. Verification asks the public Midnight indexer live whether the payload hash is anchored in the attestation vault; no account needed."
+      type="Information" showIcon="true" class="sapUiSmallMargin"/>
+
+    <VBox class="sapUiContentPadding">
+      <Table id="anchorTable"
+             items="{explorer>/rows}"
+             busy="{explorer>/busy}"
+             busyIndicatorDelay="0"
+             sticky="ColumnHeaders"
+             noDataText="No passports issued yet.">
+        <headerToolbar>
+          <OverflowToolbar>
+            <Title text="Passports ({explorer>/count})"/>
+            <ToolbarSpacer/>
+            <Button text="Verify all on Midnight" icon="sap-icon://chain-link" type="Emphasized"
+                    press="onVerifyAll" busy="{explorer>/verifyingAll}" busyIndicatorDelay="0"/>
+            <Button icon="sap-icon://refresh" tooltip="Reload" press="onRefresh"/>
+          </OverflowToolbar>
+        </headerToolbar>
+        <columns>
+          <Column><Text text="Passport"/></Column>
+          <Column minScreenWidth="Tablet" demandPopin="true"><Text text="Model"/></Column>
+          <Column><Text text="Status"/></Column>
+          <Column minScreenWidth="Tablet" demandPopin="true"><Text text="Network"/></Column>
+          <Column minScreenWidth="Desktop" demandPopin="true"><Text text="Payload hash (anchor)"/></Column>
+          <Column minScreenWidth="Desktop" demandPopin="true"><Text text="Attestation tx"/></Column>
+          <Column><Text text="On-chain verification"/></Column>
+        </columns>
+        <ColumnListItem vAlign="Middle">
+          <cells>
+            <Link text="{explorer>passportId}"
+                  href="{ path: 'explorer>passportId', formatter: '.formatPassportLink' }"
+                  target="_blank" class="npMono"/>
+            <Text text="{explorer>model}"/>
+            <ObjectStatus text="{explorer>status}"
+                          state="{ path: 'explorer>status', formatter: '.formatStatusState' }"/>
+            <Text text="{explorer>anchorNetwork}" class="npMono"/>
+            <Text text="{ path: 'explorer>payloadHash', formatter: '.formatShortHash' }" class="npMono"/>
+            <Link text="{ path: 'explorer>attestationTxHash', formatter: '.formatShortHash' }"
+                  href="{explorer>explorerUrl}" target="_blank" class="npMono"/>
+            <HBox alignItems="Center">
+              <Button text="Verify" icon="sap-icon://chain-link"
+                      press="onVerifyRow" busy="{explorer>verifying}" busyIndicatorDelay="0"
+                      enabled="{explorer>verifiable}"/>
+              <ObjectStatus text="{explorer>verifyText}" state="{explorer>verifyState}"
+                            class="sapUiTinyMarginBegin"/>
+            </HBox>
+          </cells>
+        </ColumnListItem>
+      </Table>
+    </VBox>
+  </Page>
+</mvc:View>

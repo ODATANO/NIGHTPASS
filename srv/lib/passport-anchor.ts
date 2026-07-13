@@ -8,9 +8,77 @@ import { createCipheriv, hkdfSync, randomBytes } from 'node:crypto';
  * (`generatePassport`) and the producer cockpit (ProducerService). Extracted so
  * the proven hash / encrypt / anchor / poll logic lives in one place.
  *
- * Nothing here writes to the DB — callers own persistence and (for the producer)
+ * Nothing here writes to the DB; callers own persistence and (for the producer)
  * transaction-log rows via the `onStep` hook.
  */
+
+/**
+ * The Midnight network this server effectively runs on. Same precedence as the
+ * NIGHTGATE plugin and the /runtime-config endpoint: env override first, then
+ * cds.requires.nightgate.network. Rows store this at anchor time so a verifier
+ * can tell a cross-network anchor from a failed ledger read.
+ */
+export function effectiveNetwork(): string {
+    const cfg = ((cds.env as unknown as Record<string, any>).requires?.nightgate ?? {}) as { network?: string };
+    return process.env.NIGHTGATE_NETWORK?.trim() || cfg.network || 'preview';
+}
+
+/** Public explorer URL of a transaction on the given network (both testnets exist). */
+export function explorerTxUrl(txHash: string | null | undefined, network?: string | null): string | null {
+    if (!txHash) return null;
+    const net = network || effectiveNetwork();
+    return `https://${net}.midnightexplorer.com/transactions/0x${String(txHash).replace(/^0x/, '')}`;
+}
+
+/** Parse a `net=url,net=url` env var into a network → URL map. */
+function parseNetMap(envName: string): Record<string, string> {
+    const out: Record<string, string> = {};
+    for (const part of String(process.env[envName] ?? '').split(',')) {
+        const i = part.indexOf('=');
+        if (i > 0) {
+            const net = part.slice(0, i).trim();
+            const base = part.slice(i + 1).trim().replace(/\/+$/, '');
+            if (net && base) out[net] = base;
+        }
+    }
+    return out;
+}
+
+/**
+ * Peer NIGHTPASS instances that verify OTHER networks, from
+ * `PASSPORT_VERIFY_PEERS=preprod=http://localhost:4005,mainnet=https://...`.
+ * Each peer is a second instance of this very app configured for that network
+ * (shared or synced DB); verifyOnChain delegates cross-network rows to it
+ * server-side over its public API. Bridges the gap until NIGHTGATE ships the
+ * `network` override (FR verify-state-network-override), which then wins.
+ */
+export function verifyPeers(): Record<string, string> {
+    return parseNetMap('PASSPORT_VERIFY_PEERS');
+}
+
+/**
+ * BROWSER-facing explorer URLs of the sibling per-network instances, from
+ * `PASSPORT_EXPLORER_LINKS=preprod=https://preprod.demo.example/explorer`.
+ * Distinct from PASSPORT_VERIFY_PEERS on purpose: peers are server-to-server
+ * addresses (compose service names), these links must be reachable by the
+ * visitor's browser. The explorer header renders them as network switch links.
+ */
+export function explorerLinks(): Record<string, string> {
+    return parseNetMap('PASSPORT_EXPLORER_LINKS');
+}
+
+/**
+ * Producer instances a PUBLIC explorer aggregates, from
+ * `PASSPORT_SOURCES=cellco=https://passport.cellco.example,acme=https://...`.
+ * Each producer runs its own NIGHTPASS; the explorer periodically pulls their
+ * anonymous `anchorExplorer()` read surface (public Point-1 + anchor metadata,
+ * exactly what is public by design) into its own database and verifies anchors
+ * independently against the chain. The vault map is deliberately not
+ * enumerable on-chain, so this pull is what populates a cross-producer view.
+ */
+export function passportSources(): Record<string, string> {
+    return parseNetMap('PASSPORT_SOURCES');
+}
 
 // --- Canonical JSON + hashing ------------------------------------------------
 
