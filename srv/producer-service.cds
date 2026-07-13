@@ -44,12 +44,26 @@ service ProducerService {
         passportJson: LargeString,
         submit:       Boolean,
         sessionId:    UUID,
-        owner:        String   // producer wallet identity (shielded address)
+        owner:        String,  // producer wallet identity (shielded address)
+        walletId:     String   // optional: which SERVER wallet signs (see listServerWallets)
     ) returns {
         passportId:  String;
         payloadHash: String;
         mode:        String;
         txHash:      String;
+    };
+
+    /**
+     * The server-side producer wallets this deployment can sign with (cockpit
+     * login: "server wallet" mode). One entry per configured wallet, each an
+     * independent Midnight account; secrets never leave the server. Configured
+     * via `PRODUCER_WALLETS` + `PRODUCER_<ID>_*` env (srv/lib/producer-wallets.ts).
+     */
+    function listServerWallets() returns array of {
+        id:           String;   // pass as `walletId` to the on-chain actions
+        label:        String;   // display name
+        owner:        String;   // shielded address = the passports' owner scope
+        signingReady: Boolean;  // signing secrets present (can anchor)
     };
 
     /**
@@ -105,7 +119,8 @@ service ProducerService {
     /** Anchor an existing draft passport on-chain (attest + bindPassport). */
     action submitPassport(
         passportId: String,
-        sessionId:  UUID
+        sessionId:  UUID,
+        walletId:   String   // optional: which SERVER wallet signs
     ) returns {
         passportId: String;
         mode:       String;
@@ -153,7 +168,8 @@ service ProducerService {
         passportId: String,
         grantee:    String,
         level:      Integer,
-        sessionId:  UUID
+        sessionId:  UUID,
+        walletId:   String   // optional: which SERVER wallet signs
     ) returns {
         mode:   String;
         txHash: String;
@@ -163,7 +179,8 @@ service ProducerService {
     action revokePassportDisclosure(
         passportId: String,
         grantee:    String,
-        sessionId:  UUID
+        sessionId:  UUID,
+        walletId:   String   // optional: which SERVER wallet signs
     ) returns {
         mode:   String;
         txHash: String;
@@ -181,7 +198,8 @@ service ProducerService {
         predicate:   String,   // 'lessOrEqual' | 'greaterOrEqual'
         threshold:   Integer64,
         unit:        String,
-        sessionId:   UUID
+        sessionId:   UUID,
+        walletId:    String    // optional: which SERVER wallet signs
     ) returns {
         mode:                   String;
         txHash:                 String;

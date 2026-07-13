@@ -6,8 +6,10 @@ import {
 import {
     hashPayload, blake2b256Hex, encryptPayload, anchorPassport, waitForJob,
     detachedFromRequest, sendDetached,
-    buildContentRoot, fieldKeyHex, BATTERY_PROVABLE_FIELDS
+    buildContentRoot, fieldKeyHex, BATTERY_PROVABLE_FIELDS,
+    effectiveNetwork, explorerTxUrl
 } from './lib/passport-anchor';
+import { listProducerWallets, producerWalletSecrets } from './lib/producer-wallets';
 import { verifyContractTx, type ChainVerdict } from './lib/chain-verify';
 import { verifyAttestState, verifyGrantState, verifyPredicateState } from './lib/state-verify';
 
@@ -15,10 +17,11 @@ const CONTRACT_REF = 'attestation-vault';
 
 const { INSERT, SELECT, UPDATE } = cds.ql;
 
-const EXPLORER = 'https://preview.midnightexplorer.com';
 const norm = (h?: string | null): string => String(h ?? '').replace(/^0x/, '');
+// Cockpit tx rows happen on the server's CURRENT network, so the explorer link
+// derives from it (shared helper; per-row anchorNetwork is used on read paths).
 function txExplorerUrl(hash?: string | null): string | null {
-    return hash ? `${EXPLORER}/transactions/0x${String(hash).replace(/^0x/, '')}` : null;
+    return explorerTxUrl(hash);
 }
 /** Map a chain verdict to the cockpit-facing row status. */
 function walletStatus(v: ChainVerdict): 'succeeded' | 'failed' | 'pending' {
@@ -39,7 +42,7 @@ interface PassportInput {
 }
 
 /**
- * ProducerService — manufacturer / ERP cockpit write side. See producer-service.cds.
+ * ProducerService: manufacturer / ERP cockpit write side. See producer-service.cds.
  *
  * Every action is offline-first: it always persists the local row / log, and only
  * touches the chain when a signing session + contract are available (`mode`
@@ -47,15 +50,17 @@ interface PassportInput {
  * PassportService via srv/lib/passport-anchor.
  */
 export default class ProducerService extends cds.ApplicationService {
-    private serverSessionId: string | null = null;
-    /** Pending facade prewarm for the server session; awaited once by the
-     *  first detached anchor run (submitting before the facade exists fails
-     *  with "No facade for sessionId"). */
-    private serverPrewarmJobId: string | null = null;
+    /** walletId -> NIGHTGATE signing session (one per configured server wallet). */
+    private serverSessions = new Map<string, string>();
+    /** sessionId -> pending facade prewarm job; awaited once by the first
+     *  detached anchor run on that session (submitting before the facade
+     *  exists fails with "No facade for sessionId"). */
+    private serverPrewarmJobs = new Map<string, string>();
 
     override async init(): Promise<void> {
         this.on('createPassport', this.createPassport);
         this.on('submitPassport', this.submitPassport);
+        this.on('listServerWallets', this.listServerWallets);
         this.on('recordWalletAttest', this.recordWalletAttest);
         this.on('recordWalletDisclosure', this.recordWalletDisclosure);
         this.on('recordWalletPredicate', this.recordWalletPredicate);
@@ -87,28 +92,28 @@ export default class ProducerService extends cds.ApplicationService {
      * `sendDetached` were tried here and deadlock (SQLITE_BUSY) against the
      * caller's open request tx.
      */
-    private async serverSigningSession(): Promise<string | null> {
-        if (this.serverSessionId) return this.serverSessionId;
-        const viewingKey = process.env.PRODUCER_VIEWING_KEY;
-        const mnemonic = process.env.PRODUCER_WALLET_MNEMONIC;
-        const seedHex = process.env.PRODUCER_WALLET_SEED_HEX;
-        if (!viewingKey || !(mnemonic || seedHex)) return null;
+    private async serverSigningSession(walletId?: string): Promise<string | null> {
+        const secrets = producerWalletSecrets(walletId);
+        if (!secrets) return null;
+        const cached = this.serverSessions.get(secrets.id);
+        if (cached) return cached;
+        const { mnemonic, viewingKey } = secrets;
         try {
             const nightgate = await cds.connect.to('NightgateService');
             const conn: any = await nightgate.send('connectWallet', { viewingKey });
             const sessionId = String(conn.sessionId);
             const signing: any = await nightgate.send('connectWalletForSigning', {
-                sessionId, ...(mnemonic ? { mnemonic } : { seedHex })
+                sessionId, mnemonic
             });
             // Remember the prewarm job: the detached anchor runner must await it
             // before its first submission (the facade does not exist until then).
-            this.serverPrewarmJobId = signing?.prewarmJobId ? String(signing.prewarmJobId) : null;
-            this.serverSessionId = sessionId;
+            if (signing?.prewarmJobId) this.serverPrewarmJobs.set(sessionId, String(signing.prewarmJobId));
+            this.serverSessions.set(secrets.id, sessionId);
             return sessionId;
         } catch (e: any) {
             // Log the FULL error shape: CAP OData rejections often carry the
             // detail in e.code/e.reason/e.cause rather than e.message.
-            cds.log('producer').warn('server signing session unavailable:',
+            cds.log('producer').warn(`server signing session unavailable (wallet '${secrets.id}'):`,
                 e?.message || '(no message)',
                 '| code:', e?.code ?? '-',
                 '| cause:', e?.cause?.message ?? e?.reason ?? '-',
@@ -117,10 +122,19 @@ export default class ProducerService extends cds.ApplicationService {
         }
     }
 
-    /** Explicit arg session wins; otherwise fall back to the server session. */
-    private async effectiveSession(argSessionId?: string): Promise<string | null> {
-        return argSessionId || this.serverSigningSession();
+    /**
+     * Explicit arg session (the in-browser Lace flow supplies one) wins;
+     * otherwise open/reuse the session of the selected SERVER wallet. `walletId`
+     * selects which configured server wallet signs; omitted = the default one.
+     */
+    private async effectiveSession(argSessionId?: string, walletId?: string): Promise<string | null> {
+        return argSessionId || this.serverSigningSession(walletId);
     }
+
+    /** The configured server wallets the cockpit can sign with (no secrets). */
+    private listServerWallets = async () => {
+        return listProducerWallets();
+    };
 
     private async passportRef(passportId: string) {
         return SELECT.one.from(Passports)
@@ -154,8 +168,8 @@ export default class ProducerService extends cds.ApplicationService {
     // --- create + submit -----------------------------------------------------
 
     private createPassport = async (req: cds.Request) => {
-        const { passportJson, submit, sessionId, owner } = req.data as
-            { passportJson?: string; submit?: boolean; sessionId?: string; owner?: string };
+        const { passportJson, submit, sessionId, owner, walletId } = req.data as
+            { passportJson?: string; submit?: boolean; sessionId?: string; owner?: string; walletId?: string };
 
         let input: PassportInput;
         try { input = JSON.parse(String(passportJson ?? '')); }
@@ -194,13 +208,14 @@ export default class ProducerService extends cds.ApplicationService {
             payloadHash,
             passportIdHash,
             contractAddress,
+            anchorNetwork:    contractAddress ? effectiveNetwork() : null,
             status:           'draft',
             batteries:         batteries.map((b) => ({ ...b })),
             recycledMaterials: recycledMaterials.map((m) => ({ ...m })),
             diligenceDocs:     diligenceDocs.map((d) => ({ docType: d.docType }))
         } as any);
 
-        const session = submit ? await this.effectiveSession(sessionId) : null;
+        const session = submit ? await this.effectiveSession(sessionId, walletId) : null;
         if (submit && session && contractAddress) {
             return this.anchorRow(req, ID, passportId, payloadHash, passportIdHash, contractAddress, session, true);
         }
@@ -210,13 +225,14 @@ export default class ProducerService extends cds.ApplicationService {
     };
 
     private submitPassport = async (req: cds.Request) => {
-        const { passportId, sessionId } = req.data as { passportId?: string; sessionId?: string };
+        const { passportId, sessionId, walletId } = req.data as
+            { passportId?: string; sessionId?: string; walletId?: string };
         const row: any = await this.passportRef(String(passportId ?? ''));
         if (!row) return req.reject(404, `passport '${passportId}' not found`);
         const contractAddress = this.contractAddress() ?? row.contractAddress;
-        const session = await this.effectiveSession(sessionId);
+        const session = await this.effectiveSession(sessionId, walletId);
         if (!session || !contractAddress) {
-            return req.reject(400, 'no signing session / PASSPORT_CONTRACT_ADDRESS available — cannot submit on-chain');
+            return req.reject(400, 'no signing session / PASSPORT_CONTRACT_ADDRESS available; cannot submit on-chain');
         }
         const r = await this.anchorRow(req, row.ID, row.passportId, row.payloadHash, row.passportIdHash, contractAddress, session, false);
         return { passportId: r.passportId, mode: r.mode, txHash: r.txHash };
@@ -311,7 +327,7 @@ export default class ProducerService extends cds.ApplicationService {
      * Read a passport battery field value AND its field-bound inclusion proof,
      * for the in-app Lace predicate flow. Returns the raw value (display), the
      * scaled Uint<64> value (witness), the canonical fieldKey, the content root
-     * (to anchor), and the Merkle path (siblings/dirs as JSON) — everything the
+     * (to anchor), and the Merkle path (siblings/dirs as JSON): everything the
      * connector's anchorContentRoot + proveFieldPredicate need. The value stays
      * client-side; nothing here is a circuit arg.
      */
@@ -393,13 +409,13 @@ export default class ProducerService extends cds.ApplicationService {
         const { passportId } = req.data as { passportId?: string };
         const p: any = await SELECT.one.from(Passports)
             .columns('ID', 'passportId', 'manufacturerId', 'model', 'batteryCategory',
-                'contractAddress', 'attestationTxHash', 'status', 'payloadHash')
+                'contractAddress', 'anchorNetwork', 'attestationTxHash', 'status', 'payloadHash')
             .where({ passportId });
         if (!p) return req.reject(404, `passport '${passportId}' not found`);
         const proofs: any[] = await SELECT.from(PredicateProofLog)
             .columns('sourceField', 'predicate', 'threshold', 'unit', 'txHash', 'result')
             .where({ passport_ID: p.ID, status: 'succeeded' });
-        const explorer = (h: unknown) => (h ? `https://preview.midnightexplorer.com/transactions/0x${String(h).replace(/^0x/, '')}` : null);
+        const explorer = (h: unknown) => explorerTxUrl(h as string | null, p.anchorNetwork);
         const hex0x = (h: unknown) => (h ? `0x${String(h).replace(/^0x/, '')}` : null);
         const credential = {
             '@context': ['https://www.w3.org/ns/credentials/v2', 'https://catena-x.net/schema/pac/v1'],
@@ -624,9 +640,9 @@ export default class ProducerService extends cds.ApplicationService {
             // still being built/synced by the prewarm job; submitting earlier
             // fails with "No facade for sessionId". Await it once (detached
             // context, short read polls only).
-            if (this.serverPrewarmJobId && sessionId === this.serverSessionId) {
-                const prewarmJob = this.serverPrewarmJobId;
-                this.serverPrewarmJobId = null;
+            const prewarmJob = this.serverPrewarmJobs.get(sessionId);
+            if (prewarmJob) {
+                this.serverPrewarmJobs.delete(sessionId);
                 log.info(`awaiting server-session prewarm ${prewarmJob} before first anchor...`);
                 await waitForJob(nightgate, prewarmJob, sessionId, user);
                 log.info('server-session prewarm complete');
@@ -662,23 +678,23 @@ export default class ProducerService extends cds.ApplicationService {
     // --- disclosure ----------------------------------------------------------
 
     private grantPassportDisclosure = async (req: cds.Request) => {
-        const { passportId, grantee, level, sessionId } = req.data as
-            { passportId?: string; grantee?: string; level?: number; sessionId?: string };
-        return this.disclosure(req, 'grant', String(passportId ?? ''), String(grantee ?? ''), Number(level ?? 0), sessionId);
+        const { passportId, grantee, level, sessionId, walletId } = req.data as
+            { passportId?: string; grantee?: string; level?: number; sessionId?: string; walletId?: string };
+        return this.disclosure(req, 'grant', String(passportId ?? ''), String(grantee ?? ''), Number(level ?? 0), sessionId, walletId);
     };
 
     private revokePassportDisclosure = async (req: cds.Request) => {
-        const { passportId, grantee, sessionId } = req.data as
-            { passportId?: string; grantee?: string; sessionId?: string };
-        return this.disclosure(req, 'revoke', String(passportId ?? ''), String(grantee ?? ''), 0, sessionId);
+        const { passportId, grantee, sessionId, walletId } = req.data as
+            { passportId?: string; grantee?: string; sessionId?: string; walletId?: string };
+        return this.disclosure(req, 'revoke', String(passportId ?? ''), String(grantee ?? ''), 0, sessionId, walletId);
     };
 
-    private async disclosure(req: cds.Request, op: 'grant' | 'revoke', passportId: string, grantee: string, level: number, argSession?: string) {
+    private async disclosure(req: cds.Request, op: 'grant' | 'revoke', passportId: string, grantee: string, level: number, argSession?: string, walletId?: string) {
         if (!grantee) return req.reject(400, 'grantee is required');
         const row: any = await this.passportRef(passportId);
         if (!row) return req.reject(404, `passport '${passportId}' not found`);
         const contractAddress = this.contractAddress() ?? row.contractAddress;
-        const session = await this.effectiveSession(argSession);
+        const session = await this.effectiveSession(argSession, walletId);
 
         if (!session || !contractAddress) {
             await INSERT.into(DisclosureGrantLog).entries({ passport_ID: row.ID, grantee, level, op, status: 'offline' } as any);
@@ -708,9 +724,9 @@ export default class ProducerService extends cds.ApplicationService {
     // --- predicate proof -----------------------------------------------------
 
     private provePassportValue = async (req: cds.Request) => {
-        const { passportId, sourceField, predicate, threshold, unit, sessionId } = req.data as {
+        const { passportId, sourceField, predicate, threshold, unit, sessionId, walletId } = req.data as {
             passportId?: string; sourceField?: string; predicate?: string;
-            threshold?: number; unit?: string; sessionId?: string;
+            threshold?: number; unit?: string; sessionId?: string; walletId?: string;
         };
         const row: any = await this.passportRef(String(passportId ?? ''));
         if (!row) return req.reject(404, `passport '${passportId}' not found`);
@@ -726,7 +742,7 @@ export default class ProducerService extends cds.ApplicationService {
         const thresholdScaled = Math.round(Number(threshold ?? 0) * 1000);
         const pred = predicate === 'greaterOrEqual' ? 'greaterOrEqual' : 'lessOrEqual';
         const useUnit = unit || 'milli-kg CO2 / kWh';
-        const session = await this.effectiveSession(sessionId);
+        const session = await this.effectiveSession(sessionId, walletId);
         const contractAddress = this.contractAddress() ?? row.contractAddress;
 
         if (!session || !contractAddress) {

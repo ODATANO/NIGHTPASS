@@ -1,0 +1,63 @@
+<mvc:View
+  controllerName="producer.controller.Login"
+  xmlns:mvc="sap.ui.core.mvc"
+  xmlns="sap.m"
+  xmlns:f="sap.f"
+  xmlns:core="sap.ui.core">
+
+  <Page id="loginPage" showHeader="false" class="sapUiContentPadding">
+    <VBox alignItems="Center" justifyContent="Center" class="sapUiLargeMargin">
+
+      <core:Icon src="sap-icon://key-user-settings" size="2.5rem" color="#4f6ef7"/>
+      <Title text="Sign in to the producer cockpit" level="H2" class="sapUiSmallMarginTop"/>
+      <Text text="Choose how this producer signs its on-chain transactions. Passports are scoped to the signing identity, so each wallet sees only its own."
+            textAlign="Center" width="34rem" class="sapUiSmallMarginTop sapUiMediumMarginBottom"/>
+
+      <!-- Mode choice -->
+      <HBox id="modeBox" justifyContent="Center" wrap="Wrap" visible="{= !${login>/mode} }">
+
+        <!-- Browser wallet (Lace): the user signs every transaction themselves -->
+        <VBox class="sapUiMediumMargin" width="20rem" alignItems="Center">
+          <core:Icon src="sap-icon://wallet" size="2rem"/>
+          <Title text="Browser wallet (Lace)" level="H3" class="sapUiSmallMarginTop"/>
+          <Text text="You hold the keys. Every attest, grant and proof is signed in the Lace extension and submitted from your browser."
+                textAlign="Center" class="sapUiSmallMarginTop sapUiSmallMarginBottom"/>
+          <Button id="laceBtn" text="Connect Lace" type="Emphasized" icon="sap-icon://wallet"
+                  press="onChooseLace" width="12rem"/>
+        </VBox>
+
+        <!-- Server wallet: NIGHTGATE signs on the server -->
+        <VBox class="sapUiMediumMargin" width="20rem" alignItems="Center">
+          <core:Icon src="sap-icon://it-host" size="2rem"/>
+          <Title text="Server wallet" level="H3" class="sapUiSmallMarginTop"/>
+          <Text text="The server holds the key and signs for you. Pick one of the configured producer wallets, each an independent Midnight account."
+                textAlign="Center" class="sapUiSmallMarginTop sapUiSmallMarginBottom"/>
+          <Button id="serverBtn" text="Use a server wallet" icon="sap-icon://it-host"
+                  press="onChooseServer" width="12rem"/>
+        </VBox>
+      </HBox>
+
+      <!-- Server wallet picker (second step of the server mode) -->
+      <VBox id="serverPicker" width="42rem" visible="{= ${login>/mode} === 'server' }">
+        <HBox alignItems="Center" class="sapUiSmallMarginBottom">
+          <Button icon="sap-icon://nav-back" type="Transparent" press="onBack" tooltip="Back"/>
+          <Title text="Choose a server wallet" level="H3" class="sapUiTinyMarginBegin"/>
+        </HBox>
+        <List id="walletList" items="{login>/wallets}" noDataText="No server wallets configured (set PRODUCER_WALLETS)."
+              mode="SingleSelectMaster" selectionChange="onWalletSelect">
+          <ObjectListItem
+            title="{login>label}"
+            number="{= ${login>signingReady} ? 'ready' : 'no key' }"
+            numberState="{= ${login>signingReady} ? 'Success' : 'Error' }"
+            type="Active">
+            <attributes>
+              <ObjectAttribute text="{= 'id: ' + ${login>id} }"/>
+              <ObjectAttribute text="{login>ownerShort}"/>
+            </attributes>
+          </ObjectListItem>
+        </List>
+      </VBox>
+
+    </VBox>
+  </Page>
+</mvc:View>

@@ -41,13 +41,28 @@ sap.ui.define([
   return BaseController.extend("producer.controller.Producer", {
 
     onInit: function () {
+      this._router().getRoute("main").attachPatternMatched(this._onMatched, this);
+      this._applyOwnerFilter();
+    },
+
+    // Deep-linking to the list without a signing identity (e.g. a bookmarked
+    // #/passports, or a reload) has nothing to scope the list to: back to login.
+    _onMatched: function () {
+      if (!this._session().getProperty("/connected")) {
+        this._router().navTo("login", {}, true);
+        return;
+      }
       this._applyOwnerFilter();
     },
 
     // Runs before the list's first data load, so it never shows other producers'
-    // passports (owner scope applied up front; empty until the wallet connects).
+    // passports (owner scope applied up front; empty until a signer is chosen).
     onBeforeRendering: function () {
       this._applyOwnerFilter();
+    },
+
+    onSwitchWallet: function () {
+      this._router().navTo("login");
     },
 
     // Filter the passport list by the connected wallet owner; before connect,
@@ -75,32 +90,6 @@ sap.ui.define([
         n = (v == null) ? 0 : v;
       } catch (e) { n = 0; }
       this._session().setProperty("/passportCount", n);
-    },
-
-    // ---- wallet login (producer identity = shielded address) ----
-
-    onConnectWallet: async function () {
-      var oSession = this._session();
-      var that = this;
-      try {
-        this.setBusy(true);
-        var mod = await import("/connector/lib/nightpass-connector.js");
-        var aWallets = mod.listWallets();
-        if (!aWallets.length) { this.setBusy(false); return this.error("No Midnight wallet found — install & unlock Lace on Preview."); }
-        var api = await mod.connect(aWallets[0].key);
-        var addrs = await api.getShieldedAddresses();
-        var sOwner = (addrs && (addrs.shieldedAddress || addrs.shieldedCoinPublicKey)) || "";
-        if (!sOwner) { this.setBusy(false); return this.error("wallet returned no address"); }
-        oSession.setProperty("/owner", sOwner);
-        oSession.setProperty("/ownerShort", sOwner.slice(0, 16) + "…" + sOwner.slice(-6));
-        this._applyOwnerFilter();
-        oSession.setProperty("/connected", true); // reveals the (now-filtered) table
-        this.toast("wallet connected: " + oSession.getProperty("/ownerShort"));
-      } catch (e) {
-        this.error(e);
-      } finally {
-        this.setBusy(false);
-      }
     },
 
     onOpen: function (oEvent) {

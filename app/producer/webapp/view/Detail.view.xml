@@ -6,10 +6,15 @@
   xmlns:core="sap.ui.core">
   <Page title="Passport {passportId}" showNavButton="true" navButtonPress="onNavBack">
     <headerContent>
-      <Button text="Attest" icon="sap-icon://wallet" press="onAttest"/>
-      <Button text="Grant" enabled="{ui>/anchored}" icon="sap-icon://wallet" press="onGrantAction"/>
+      <!-- Who signs (chosen at login): drives both the icon and the handler. -->
+      <ObjectStatus
+        text="{session>/signerLabel}"
+        icon="{= ${session>/mode} === 'server' ? 'sap-icon://it-host' : 'sap-icon://wallet' }"
+        state="Information" class="sapUiTinyMarginEnd"/>
+      <Button text="Attest" icon="{= ${session>/mode} === 'server' ? 'sap-icon://it-host' : 'sap-icon://wallet' }" press="onAttest"/>
+      <Button text="Grant" enabled="{ui>/anchored}" icon="{= ${session>/mode} === 'server' ? 'sap-icon://it-host' : 'sap-icon://wallet' }" press="onGrantAction"/>
       <Button text="Revoke" enabled="{ui>/anchored}" icon="sap-icon://delete" press="onRevokeAction"/>
-      <Button text="Prove" enabled="{ui>/anchored}" icon="sap-icon://wallet" press="onProveAction"/>
+      <Button text="Prove" enabled="{ui>/anchored}" icon="{= ${session>/mode} === 'server' ? 'sap-icon://it-host' : 'sap-icon://wallet' }" press="onProveAction"/>
       <Button text="Share" enabled="{ui>/anchored}" icon="sap-icon://share-2" press="onShare"/>
       <Button icon="sap-icon://refresh" tooltip="Refresh transactions" press="onRefresh"/>
     </headerContent>

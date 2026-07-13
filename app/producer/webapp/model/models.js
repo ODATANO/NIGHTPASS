@@ -11,8 +11,11 @@ sap.ui.define([
         user: "producer",
         authenticated: false,
         busy: false,
-        connected: false,   // wallet connected (producer identity)
-        owner: "",          // shielded address = producer identity / owner
+        connected: false,   // a signing identity was chosen on the login screen
+        mode: "",           // 'wallet' (Lace, browser-signed) | 'server' (server wallet)
+        walletId: "",       // server mode: which configured wallet signs
+        signerLabel: "",    // display name of the chosen signer
+        owner: "",          // shielded address = producer identity / owner scope
         ownerShort: ""
       });
     }

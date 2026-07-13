@@ -20,14 +20,20 @@ sap.ui.define([
       this.getView().setModel(new JSONModel({ aspect: "", pac: "" }), "cx");
     },
 
-    // The top action buttons run the wallet (Lace) flow. The server on-chain
-    // handlers (onSubmit/onGrant/onRevoke/onProve) stay below but are not wired
-    // to the UI. The per-tab forms (partner/level, field/threshold) supply the
-    // inputs; the buttons live in the page header.
-    onAttest:       function () { return this.onSignWithLace(); },
-    onGrantAction:  function () { return this.onGrantWithLace(); },
-    onRevokeAction: function () { return this.onRevokeWithLace(); },
-    onProveAction:  function () { return this.onProveWithLace(); },
+    // The header buttons dispatch on the signing mode chosen at login:
+    //   'wallet' → the in-browser Lace flow (the user signs each tx),
+    //   'server' → the server actions, signed by the selected server wallet
+    //              (its id travels as `walletId`).
+    // The per-tab forms (partner/level, field/threshold) supply the inputs.
+    onAttest:       function () { return this._isServer() ? this.onSubmit() : this.onSignWithLace(); },
+    onGrantAction:  function () { return this._isServer() ? this.onGrant()  : this.onGrantWithLace(); },
+    onRevokeAction: function () { return this._isServer() ? this.onRevoke() : this.onRevokeWithLace(); },
+    onProveAction:  function () { return this._isServer() ? this.onProve()  : this.onProveWithLace(); },
+
+    _isServer: function () { return this._session().getProperty("/mode") === "server"; },
+
+    /** Which server wallet signs (server mode); empty in wallet mode. */
+    _walletId: function () { return this._session().getProperty("/walletId") || ""; },
 
     _onMatched: function (oEvent) {
       var sKey = decodeURIComponent(oEvent.getParameter("arguments").key);
@@ -133,7 +139,7 @@ sap.ui.define([
         return this.toast("passport is already anchored on-chain");
       }
       var that = this;
-      this.callAction("/submitPassport", { passportId: this._pid() })
+      this.callAction("/submitPassport", { passportId: this._pid(), walletId: this._walletId() })
         .then(function (res) { that.toast("submit: " + res.mode + (res.txHash ? " · tx " + res.txHash.slice(0, 16) + "…" : "")); that._refreshAll(); })
         .catch(function (e) { that.error(e); });
     },
@@ -143,7 +149,9 @@ sap.ui.define([
       var sGrantee = this.byId("granteePartner").getSelectedKey();
       if (!sGrantee) { return this.toast("select a partner"); }
       this.callAction("/grantPassportDisclosure", {
-        passportId: this._pid(), grantee: sGrantee, level: parseInt(this.byId("grantLevel").getSelectedKey(), 10)
+        passportId: this._pid(), grantee: sGrantee,
+        level: parseInt(this.byId("grantLevel").getSelectedKey(), 10),
+        walletId: this._walletId()
       }).then(function (res) { that.toast("grant: " + res.mode); that._refreshAll(); })
         .catch(function (e) { that.error(e); });
     },
@@ -152,7 +160,7 @@ sap.ui.define([
       var that = this;
       var sGrantee = this.byId("granteePartner").getSelectedKey();
       if (!sGrantee) { return this.toast("select a partner"); }
-      this.callAction("/revokePassportDisclosure", { passportId: this._pid(), grantee: sGrantee })
+      this.callAction("/revokePassportDisclosure", { passportId: this._pid(), grantee: sGrantee, walletId: this._walletId() })
         .then(function (res) { that.toast("revoke: " + res.mode); that._refreshAll(); })
         .catch(function (e) { that.error(e); });
     },
@@ -164,7 +172,8 @@ sap.ui.define([
         sourceField: this.byId("proofField").getSelectedKey(),
         predicate: this.byId("proofPredicate").getSelectedKey(),
         threshold: Number(this.byId("proofThreshold").getValue()),
-        unit: this.byId("proofUnit").getValue()
+        unit: this.byId("proofUnit").getValue(),
+        walletId: this._walletId()
       }).then(function (res) {
         that.toast("prove: " + res.mode + (res.result === true ? " · ✓ proven" : res.result === false ? " · false" : ""));
         that._refreshAll();

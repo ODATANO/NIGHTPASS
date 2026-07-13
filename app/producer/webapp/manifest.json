@@ -48,10 +48,12 @@
         "async": true
       },
       "routes": [
-        { "name": "main",   "pattern": "",                    "target": "main" },
+        { "name": "login",  "pattern": "",             "target": "login" },
+        { "name": "main",   "pattern": "passports",    "target": "main" },
         { "name": "detail", "pattern": "passport/{key}", "target": "detail" }
       ],
       "targets": {
+        "login":  { "viewName": "Login" },
         "main":   { "viewName": "Producer" },
         "detail": { "viewName": "Detail" }
       }

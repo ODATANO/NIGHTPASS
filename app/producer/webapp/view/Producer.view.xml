@@ -4,8 +4,11 @@
   xmlns="sap.m">
   <Page title="Battery Passports" showNavButton="false">
     <headerContent>
-      <ObjectStatus text="{= 'wallet: ' + ${session>/ownerShort} }" state="Success" visible="{session>/connected}"/>
-      <Button text="Connect wallet" type="Emphasized" icon="sap-icon://wallet" press="onConnectWallet" visible="{= !${session>/connected} }"/>
+      <ObjectStatus
+        text="{= (${session>/mode} === 'server' ? 'server wallet: ' : 'Lace: ') + ${session>/signerLabel} + ' · ' + ${session>/ownerShort} }"
+        state="Success" visible="{session>/connected}"
+        icon="{= ${session>/mode} === 'server' ? 'sap-icon://it-host' : 'sap-icon://wallet' }"/>
+      <Button text="Switch wallet" icon="sap-icon://journey-change" press="onSwitchWallet" visible="{session>/connected}"/>
       <Button text="Create passport" type="Emphasized" icon="sap-icon://add" press="onCreate" enabled="{session>/connected}"/>
       <Button text="Register partner" icon="sap-icon://add-employee" press="onRegisterPartner"/>
       <Button icon="sap-icon://refresh" tooltip="Refresh" press="onRefresh"/>
