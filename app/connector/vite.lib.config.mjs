@@ -8,6 +8,7 @@
 // plugin's rollup peer dependency breaks fresh installs under rolldown-vite 8.
 // Output → app/connector/lib, served by CAP at /connector/lib/.
 // Run via `npm run build:connector-lib`.
+import { fileURLToPath } from 'node:url';
 import { defineConfig } from 'vite';
 import wasm from 'vite-plugin-wasm';
 
@@ -26,7 +27,13 @@ export default defineConfig({
         }
     },
     resolve: {
-        dedupe: ['@midnight-ntwrk/ledger-v8']
+        dedupe: ['@midnight-ntwrk/ledger-v8'],
+        alias: {
+            // @subsquid/* (via the Midnight wallet SDK address-format package)
+            // imports the Node "assert" builtin. Point it at a local browser
+            // shim so Vite stops warning and real assert calls keep working.
+            assert: fileURLToPath(new URL('./shims/assert.mjs', import.meta.url))
+        }
     },
     plugins: [wasm()]
 });
