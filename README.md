@@ -9,6 +9,7 @@
 [![@odatano/nightgate](https://img.shields.io/npm/v/@odatano/nightgate?logo=npm&label=%40odatano%2Fnightgate)](https://www.npmjs.com/package/@odatano/nightgate)
 [![SAP CAP](https://img.shields.io/badge/SAP%20CAP-%40sap%2Fcds%20%5E9-0faaff?logo=sap)](https://cap.cloud.sap/)
 [![Midnight](https://img.shields.io/badge/Midnight-preview-2b2b6f)](https://midnight.network/)
+[![Midnight](https://img.shields.io/badge/Midnight-preprod-2b2b6f)](https://midnight.network/)
 [![Catena-X](https://img.shields.io/badge/Catena--X-CX--0143-009f4d)](https://catena-x.net/)
 
 NIGHTPASS implements the EU Battery Passport. One dataset is exposed with a different view per audience (consumer, recycler, authority), and sensitive numbers (for example "recycled cobalt share is at least the legal minimum") can be **proven without revealing the value**. Only a payload hash and public metadata are anchored on-chain; everything else stays encrypted off-chain, and the disclosure tier is enforced in the API layer.
@@ -33,7 +34,7 @@ One ERP goods-receipt ingested end-to-end (signed webhook -> `createPassport` ->
 | bindPassport | [`97c36cb5...bb5991bb`](https://preview.midnightexplorer.com/transactions/0x97c36cb573ed7ce9ed2d64f45986efa4023859b478ae9a283a0484a6bb5991bb) |
 | anchorContentRoot | [`6cce29ba...93020e16`](https://preview.midnightexplorer.com/transactions/0x6cce29baa9be9237782386ffda00eaebbfd1a18bf68abaf3b0ce9dab93020e16) |
 
-Vault contract: `dcd297ba6a335a5d64916a6f2e36151c7490baa119fd022c846944918d9cde69`. Reproduce with `node --env-file=.env test/integration/erp-ingest-e2e.mjs` against a running server (see [docs/producer-flow.md](docs/producer-flow.md) for how to read the transactions).
+Vault contract: `dcd297ba6a335a5d64916a6f2e36151c7490baa119fd022c846944918d9cde69`.
 
 ## Documentation
 
@@ -98,28 +99,6 @@ tiles, anchor table, detail pages that verify live on open); the same overview
 also exists inside the viewer at `#/explorer`. Both are backed by the anonymous
 `anchorExplorer()` function. See `docs/public-demo.md` for the Docker image,
 environment, and the security checklist.
-
-## Repository layout
-
-```
-db/passport-schema.cds            Passports / Batteries / RecycledMaterials / DiligenceDoc + tracking tables
-db/mock-sap-schema.cds            mock SAP goods-receipt feed (GoodsReceipts)
-db/data/passport-*.csv            CSV seeds (partners, batteries, recycled materials, grantee identities)
-srv/passport-service.{cds,ts}     consumer read side: tier gating, QR resolve, credential export
-srv/producer-service.{cds,ts}     producer cockpit write side: create, submit, disclose, prove
-srv/mock-sap-service.{cds,ts}     mock SAP goods-receipt source (triggerGoodsReceipt feeds generatePassport)
-srv/lib/goods-receipt.ts          deterministic goods-receipt generator + row/batch mapping
-srv/lib/passport-anchor.ts        canonical hashing, encryption, anchor sequence, content-root Merkle builder
-srv/lib/chain-verify.ts           structural on-chain verification of wallet-reported tx hashes
-srv/auth.js                       custom CAP auth (demo users + BPN partners)
-app/producer/webapp/              producer cockpit (SAPUI5), in-app Lace wallet flow
-app/passport/webapp/              consumer viewer, one app / three tiers
-app/explorer/                     public Passport Explorer (plain HTML/CSS/JS, no build step)
-app/connector/                    in-app Lace connector library (connector.mjs, Vite lib bundle)
-tractusx/pac/                     Predicate Attestation Credential glue + verify demo
-docs/                             producer-flow.md, producer-walkthrough.md, architecture.md/svg/png, public-demo.md
-Dockerfile                        public demo image (docs/public-demo.md)
-```
 
 ## Scripts
 
