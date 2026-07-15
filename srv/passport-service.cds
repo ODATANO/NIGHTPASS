@@ -1,18 +1,18 @@
-using { passport } from '../db/passport-schema';
+using {passport} from '../db/passport-schema';
 
 /**
  * PassportService is the NIGHTPASS consumer surface.
  *
- * T17: read-side projections of the passport-domain entities, co-served with the
- * NIGHTGATE plugin services on one port.
- * T19: `generatePassport` is the write path that builds a passport from a batch,
- * anchors it on Midnight via the NIGHTGATE plugin (attest + bindPassport on the
- * `passport-attestation` contract), and returns the QR URL.
+ * Read-side projections of the passport-domain entities, co-served with the
+ * NIGHTGATE plugin services on one port. `generatePassport` is the write path
+ * that builds a passport from a goods-receipt batch, anchors it on Midnight
+ * via the NIGHTGATE plugin (attest + bindPassport on the attestation vault)
+ * and returns the QR URL.
  *
- * Disclosure-tier gating (consumer / recycler / authority projections over Annex
- * XIII fields) lands in T20. Until then these flat projections expose everything;
- * do NOT treat this as the disclosure boundary yet. `payloadCipher` is excluded
- * from the read projection so the encrypted blob isn't served.
+ * These projections ARE the Annex XIII disclosure boundary: after-READ
+ * handlers in passport-service.ts redact every row to the caller's tier
+ * (consumer / recycler / authority; on-chain grants elevate per passport).
+ * `payloadCipher` is excluded so the encrypted blob is never served.
  */
 // requires 'any': the viewer surface is deliberately PUBLIC (anonymous = the
 // consumer tier a cold QR scan gets). Without this, NODE_ENV=production makes
@@ -21,13 +21,29 @@ using { passport } from '../db/passport-schema';
 @(requires: 'any')
 @path: '/api/v1/passport'
 service PassportService {
-    @readonly entity Passports as projection on passport.Passports excluding { payloadCipher };
-    @readonly entity Batteries         as projection on passport.Batteries;
-    @readonly entity RecycledMaterials as projection on passport.RecycledMaterials;
-    @readonly entity DiligenceDoc      as projection on passport.DiligenceDoc;
+    @readonly
+    entity Passports         as
+        projection on passport.Passports
+        excluding {
+            payloadCipher
+        };
+
+    @readonly
+    entity Batteries         as projection on passport.Batteries;
+
+    @readonly
+    entity RecycledMaterials as projection on passport.RecycledMaterials;
+
+    @readonly
+    entity DiligenceDoc      as projection on passport.DiligenceDoc;
 
     // Registered dataspace partners (secret never served).
-    @readonly entity Partners as projection on passport.Partners excluding { secret };
+    @readonly
+    entity Partners          as
+        projection on passport.Partners
+        excluding {
+            secret
+        };
 
     /**
      * Partner registration (Catena-X-style): register a dataspace partner's
@@ -41,16 +57,14 @@ service PassportService {
      * (409); the secret is never rotated through this action.
      */
     @(requires: 'producer')
-    action registerPartner(
-        did:    String,
-        name:   String,
-        role:   String,   // 'recycler' | 'authority'
-        secret: String
-    ) returns {
-        did:       String;
-        name:      String;
-        role:      String;
-        granteeId: String;
+    action   registerPartner(did: String,
+                             name: String,
+                             role: String, // 'recycler' | 'authority'
+                             secret: String)         returns {
+        did       : String;
+        name      : String;
+        role      : String;
+        granteeId : String;
     };
 
     /**
@@ -64,14 +78,12 @@ service PassportService {
      * demo host an anonymous visitor must not be able to insert rows.
      */
     @(requires: 'producer')
-    action generatePassport(
-        batchId:   String,
-        sessionId: UUID
-    ) returns {
-        passportId:        String;
-        attestationTxHash: String;
-        qrCodeUrl:         String;
-        qrCodePng:         LargeString;  // T23: data-URL PNG of qrCodeUrl
+    action   generatePassport(batchId: String,
+                              sessionId: UUID)       returns {
+        passportId        : String;
+        attestationTxHash : String;
+        qrCodeUrl         : String;
+        qrCodePng         : LargeString; // data-URL PNG of qrCodeUrl
     };
 
     /**
@@ -79,17 +91,17 @@ service PassportService {
      * producer shares), return the public identity + on-chain verification + the
      * tier-gated viewer URL, so a supplier can resolve the exact battery.
      */
-    function resolveByHash(payloadHash: String) returns {
-        passportId:        String;
-        payloadHash:       String;
-        manufacturerId:    String;
-        model:             String;
-        batteryCategory:   String;
-        contractAddress:   String;
-        attestationTxHash: String;
-        status:            String;
-        locallyAnchored:   Boolean;   // DB state: anchored + attest tx present (NOT a live chain re-check)
-        viewerUrl:         String;    // /resolve/<hash>, the tier-gated landing
+    function resolveByHash(payloadHash: String)      returns {
+        passportId        : String;
+        payloadHash       : String;
+        manufacturerId    : String;
+        model             : String;
+        batteryCategory   : String;
+        contractAddress   : String;
+        attestationTxHash : String;
+        status            : String;
+        locallyAnchored   : Boolean;
+        viewerUrl         : String;
     };
 
     /**
@@ -107,18 +119,18 @@ service PassportService {
      * account. Unlike `resolveByHash.locallyAnchored` this is NOT a DB-state
      * assertion; `verified` reflects the live ledger read.
      */
-    function verifyOnChain(passportId: String) returns {
-        passportId:        String;
-        status:            String;    // producer lifecycle from the row
-        verified:          Boolean;   // live ledger read: payloadHash present in the vault
-        payloadHash:       String;
-        contractAddress:   String;
-        anchorNetwork:     String;    // network the row was anchored on (null on legacy rows)
-        serverNetwork:     String;    // network this host verifies against
-        checkedNetwork:    String;    // network the live read actually ran on (null = read skipped)
-        attestationTxHash: String;
-        explorerUrl:       String;    // attestation tx on the anchor network's explorer
-        checkedAt:         String;    // ISO timestamp of this live check
+    function verifyOnChain(passportId: String)       returns {
+        passportId        : String;
+        status            : String; // producer lifecycle from the row
+        verified          : Boolean; // live ledger read: payloadHash present in the vault
+        payloadHash       : String;
+        contractAddress   : String;
+        anchorNetwork     : String; // network the row was anchored on (null on legacy rows)
+        serverNetwork     : String; // network this host verifies against
+        checkedNetwork    : String; // network the live read actually ran on (null = read skipped)
+        attestationTxHash : String;
+        explorerUrl       : String; // attestation tx on the anchor network's explorer
+        checkedAt         : String; // ISO timestamp of this live check
     };
 
     /**
@@ -129,21 +141,21 @@ service PassportService {
      * the viewer's Explorer route; per-row live verification goes through
      * `verifyOnChain`.
      */
-    function anchorExplorer() returns array of {
-        passportId:        String;
-        model:             String;
-        manufacturerId:    String;
-        batteryCategory:   String;
-        manufactureDate:   String;         // Annex XIII Point 1 (public)
-        weightKg:          Decimal(10, 3); // Point 1
-        performanceClass:  String;         // Point 1
-        qrCodeUrl:         String;         // Point 1, public landing URL
-        status:            String;
-        payloadHash:       String;
-        contractAddress:   String;
-        anchorNetwork:     String;    // network the row was anchored on (null on legacy rows)
-        attestationTxHash: String;
-        explorerUrl:       String;
-        createdAt:         String;    // row creation (ISO)
+    function anchorExplorer()                        returns array of {
+        passportId        : String;
+        model             : String;
+        manufacturerId    : String;
+        batteryCategory   : String;
+        manufactureDate   : String;
+        weightKg          : Decimal(10, 3);
+        performanceClass  : String;
+        qrCodeUrl         : String;
+        status            : String;
+        payloadHash       : String;
+        contractAddress   : String;
+        anchorNetwork     : String;
+        attestationTxHash : String;
+        explorerUrl       : String;
+        createdAt         : String;
     };
 }

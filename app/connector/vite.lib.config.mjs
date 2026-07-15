@@ -1,6 +1,6 @@
 // Vite LIBRARY build of the connector building blocks (attest / grant / revoke /
 // deploy / predicate + wallet helpers), so a non-bundled host (the SAPUI5
-// producer cockpit) can dynamic-import them and run the Lace flow IN-APP —
+// producer cockpit) can dynamic-import them and run the Lace flow IN-APP,
 // instead of redirecting to the standalone connector page.
 //
 // WASM via vite-plugin-wasm + ledger-v8 dedupe. No top-level-await plugin:

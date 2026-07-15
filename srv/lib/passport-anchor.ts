@@ -49,8 +49,8 @@ function parseNetMap(envName: string): Record<string, string> {
  * `PASSPORT_VERIFY_PEERS=preprod=http://localhost:4005,mainnet=https://...`.
  * Each peer is a second instance of this very app configured for that network
  * (shared or synced DB); verifyOnChain delegates cross-network rows to it
- * server-side over its public API. Bridges the gap until NIGHTGATE ships the
- * `network` override (FR verify-state-network-override), which then wins.
+ * server-side over its public API. Fallback only: NIGHTGATE's native `network`
+ * override on the verify surface wins whenever the loaded plugin has it.
  */
 export function verifyPeers(): Record<string, string> {
     return parseNetMap('PASSPORT_VERIFY_PEERS');
@@ -279,10 +279,10 @@ export function encryptPayload(plaintext: string, passportId: string): Buffer {
  * to cds.spawn, and that work needs a free pooled connection plus (on SQLite)
  * the single write lock. A caller that keeps its own request tx open while
  * waiting inline starves exactly the job it is waiting on: the job can only
- * start once the caller times out and releases the connection. Live-diagnosed
- * on preprod 2026-07-10: the "10-15 minutes per anchor step" were precisely
- * the caller's own waitForJob timeout; the attest itself completes in seconds
- * once the job is allowed to start.
+ * start once the caller times out and releases the connection. Diagnosed
+ * live: "10-15 minutes per anchor step" was precisely the caller's own
+ * waitForJob timeout; the attest itself completes in seconds once the job
+ * is allowed to start.
  */
 export function detachedFromRequest<T>(fn: () => Promise<T>): Promise<T> {
     return (cds as any)._with(undefined, fn);
@@ -294,7 +294,7 @@ export function detachedFromRequest<T>(fn: () => Promise<T>): Promise<T> {
  *
  * Why not `srv.tx({user}, ...)`: that wrapper holds a root tx (and, after the
  * handler's first INSERT, the sqlite write lock) for the whole action call.
- * NIGHTGATE >=0.6.3 commits its BackgroundJobs row DETACHED inside startJob,
+ * NIGHTGATE commits its BackgroundJobs row DETACHED inside startJob,
  * on a second connection, synchronously within the same handler: with a
  * write-holding wrapper both sides wait on each other until the busy timeout
  * fires as "database is locked". So the context is cleared (every db.run in

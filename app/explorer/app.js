@@ -2,7 +2,7 @@
  *
  * A public, account-free single-page explorer over the anonymous
  * PassportService surface, in the spirit of a block explorer:
- *   list    #/            all passports with anchoring state (anchorExplorer)
+ *   list    #/            this network's anchored passports (anchorExplorer)
  *   detail  #/p/<id>      full anchor record + LIVE ledger verification
  *
  * Data endpoints (all anonymous):

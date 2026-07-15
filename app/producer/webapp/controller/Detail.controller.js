@@ -110,7 +110,7 @@ sap.ui.define([
           that._cx().setProperty("/pac", pac);
           try {
             var subj = JSON.parse(pac).credentialSubject || {};
-            if (!(subj.predicateProofs || []).length) { that.toast("PAC built, but no proven predicates yet — run a Prove first."); }
+            if (!(subj.predicateProofs || []).length) { that.toast("PAC built, but no proven predicates yet. Run a Prove first."); }
           } catch (e) { /* ignore */ }
         })
         .catch(function (e) { that.error(e); });
@@ -323,7 +323,7 @@ sap.ui.define([
       var thresholdScaled = Math.round(thr * 1000);
       var that = this;
       // Resolve the value + field-bound inclusion proof server-side (the producer
-      // owns it) — can't read the to-many `batteries` nav via getProperty in v4.
+      // owns it); the to-many `batteries` nav is not readable via getProperty in v4.
       // The field-bound circuit binds the proven value to THIS passport's field
       // via the content root anchored at attest time (no free-witness value).
       this.callAction("/passportFieldValue", { passportId: this._pid(), sourceField: field }).then(function (res) {
@@ -334,7 +334,7 @@ sap.ui.define([
         try { siblings = JSON.parse(res.siblingsJson); dirs = JSON.parse(res.dirsJson); }
         catch (e) { return that.toast("invalid inclusion proof"); }
         that._lace("Prove field predicate with Lace", async function (mod, api, append) {
-          append("proving the passport's own " + field + " (" + rawVal + ") " + (op === 0 ? "≤ " : "≥ ") + thr + " — bound to the anchored content root, value hidden…");
+          append("proving the passport's own " + field + " (" + rawVal + ") " + (op === 0 ? "≤ " : "≥ ") + thr + ", bound to the anchored content root, value hidden…");
           try {
             await mod.proveFieldPredicate(api, {
               contractAddress: that._VAULT, payloadHash: ph, fieldKey: res.fieldKey,
@@ -343,12 +343,12 @@ sap.ui.define([
           } catch (e) {
             var msg = (e && (e.message || String(e))) || "";
             // The circuit rejects a predicate that does not hold ("failed assert:
-            // predicate false") — no tx lands. Record it as a failed proof so the
+            // predicate false"), so no tx lands. Record it as a failed proof so the
             // cockpit shows the negative result, not just a log line.
             if (/predicate false/i.test(msg)) {
-              append("predicate does NOT hold for the passport's value — the circuit rejected it (no tx). Recording a failed proof.");
+              append("predicate does NOT hold for the passport's value; the circuit rejected it (no tx). Recording a failed proof.");
               await that.callAction("/recordWalletPredicate", { passportId: that._pid(), sourceField: field, predicate: predicate, threshold: thresholdScaled, unit: unit, txHash: "", result: false });
-              that._refreshAll(); append("done."); that.toast("predicate false — recorded");
+              that._refreshAll(); append("done."); that.toast("predicate false, recorded");
               return;
             }
             throw e; // a real error: let the outer handler surface it
@@ -387,8 +387,8 @@ sap.ui.define([
         append("loading connector library (first run downloads ~10MB WASM)…");
         var mod = await import("/connector/lib/nightpass-connector.js");
         var w = mod.listWallets();
-        if (!w.length) { append("No Midnight wallet found — install & unlock Lace on Preview."); return; }
-        append("connecting " + w[0].name + " — approve the Lace popup…");
+        if (!w.length) { append("No Midnight wallet found. Install and unlock Lace on Preview."); return; }
+        append("connecting " + w[0].name + ", approve the Lace popup…");
         var api = await mod.connect(w[0].key);
         await fnRun(mod, api, append);
       } catch (e) { append("ERROR: " + ((e && (e.stack || e.message)) || e)); }
@@ -406,10 +406,10 @@ sap.ui.define([
       var oCtx = this.getView().getBindingContext();
       if (!oCtx) { return; }
       var ph = oCtx.getProperty("payloadHash") || "";
-      if (!ph) { return this.toast("passport has no payloadHash yet — save it first"); }
+      if (!ph) { return this.toast("passport has no payloadHash yet, save it first"); }
       var that = this;
       // Fetch the content root (Merkle over the passport's provable fields) so
-      // attest also anchors it — this is what later field-bound proofs bind to.
+      // attest also anchors it; later field-bound proofs bind to this root.
       this.callAction("/passportFieldValue", { passportId: this._pid(), sourceField: "carbonFootprintKgCO2" }).then(function (res) {
         var contentRoot = (res && res.contentRoot) || "";
         that._lace("Attest with Lace", async function (mod, api, append) {

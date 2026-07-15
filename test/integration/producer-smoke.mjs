@@ -59,7 +59,7 @@ async function main() {
   const gl = await get(`DisclosureGrantLog?$filter=passport_ID eq ${ID}&$select=op,level,status`);
   ok(gl.value.some((r) => r.op === 'grant' && r.level === 2 && r.status === 'offline'), `disclosure grant logged`);
 
-  // 4. prove (offline) — value pulled from carbonFootprintKgCO2, threshold scaled ×1000
+  // 4. prove (offline); value pulled from carbonFootprintKgCO2, threshold scaled x1000
   const p = await post('provePassportValue', { passportId, sourceField: 'carbonFootprintKgCO2', predicate: 'lessOrEqual', threshold: 4000, unit: 'milli-kg CO2/kWh' });
   ok(p.mode === 'offline', `prove mode offline`);
   const pl = await get(`PredicateProofLog?$filter=passport_ID eq ${ID}&$select=sourceField,threshold,status`);

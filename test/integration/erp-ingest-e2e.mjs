@@ -1,4 +1,4 @@
-// ERP ingest e2e against a RUNNING NIGHTPASS server (T26 demo chain, beat 4):
+// ERP ingest e2e against a RUNNING NIGHTPASS server:
 //
 //   mock-SAP goods-receipt -> CloudEvent -> HMAC-signed webhook
 //   POST /api/v1/passport/erp-events -> createPassport (auto-anchor when

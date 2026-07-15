@@ -1,5 +1,5 @@
 /**
- * Mock SAP goods-receipt source (T21).
+ * Mock SAP goods-receipt source.
  *
  * A goods-receipt is the inbound event an ERP emits when a battery batch is
  * booked in: the public Point-1 header plus the shielded Annex XIII payload

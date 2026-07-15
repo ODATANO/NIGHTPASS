@@ -17,7 +17,7 @@ sap.ui.define([
         oRouter.getRoute(sTier).attachPatternMatched(this._onRouteMatched.bind(this, sTier));
       }.bind(this));
 
-      // T23: the QR resolver lands here as /...index.html?p=<passportId>#/<tier>.
+      // The QR resolver lands here as /...index.html?p=<passportId>#/<tier>.
       // Stash the passportId so each tier view preselects that battery once its
       // list has loaded (consumed once; see BaseController.onListUpdateFinished).
       var oParams = new URLSearchParams(window.location.search);

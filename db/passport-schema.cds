@@ -4,7 +4,7 @@ using { midnight } from '@odatano/nightgate/db/schema';
 namespace passport;
 
 /*
- * NIGHTPASS domain schema (T17) for the EU Battery Regulation 2023/1542
+ * NIGHTPASS domain schema for the EU Battery Regulation 2023/1542
  * Digital Product Passport.
  *
  * Annex XIII disclosure tiers:
@@ -79,14 +79,14 @@ entity Passports : cuid, managed {
     manufactureDate  : Date;                 // Point 1
     weightKg         : Decimal(10, 3);       // Point 1
     performanceClass : String(1);            // Point 1. A..G per regulation.
-    qrCodeUrl        : String(500);          // Point 1. Public landing URL (T23).
+    qrCodeUrl        : String(500);          // Point 1. Public landing URL.
 
-    // Off-chain encrypted payload (T19 step 3). Holds the AES-encrypted
+    // Off-chain encrypted payload. Holds the AES-encrypted
     // canonical payload whose blake2b-256 is the on-chain `payloadHash`. The
     // bytes never go on-chain; only the hash is attested.
     payloadCipher    : LargeBinary;
 
-    // On-chain anchor result (written by generatePassport after submission).
+    // On-chain anchor result (written by the anchor flow after submission).
     // `payloadHash` is the blake2b-256 committed via the AttestationVault
     // `attest` circuit and bound to `passportId` via `bindPassport`.
     payloadHash       : String(64);          // hex, the on-chain attestationId
@@ -151,7 +151,7 @@ entity RecycledMaterials : cuid {
 entity DiligenceDoc : cuid {
     passport    : Association to Passports;
     docType     : String(100);               // e.g. "supply-chain-due-diligence-report"
-    documentRef : Association to midnight.Documents;  // plugin-owned anchor (T12)
+    documentRef : Association to midnight.Documents;  // plugin-owned anchor
 }
 
 /**

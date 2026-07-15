@@ -5,7 +5,7 @@ import { generateGoodsReceipt, goodsReceiptToRow, PREVIEW_RECEIPT, type GoodsRec
 const { INSERT, SELECT } = cds.ql;
 
 /**
- * MockSapService (T21). A stand-in ERP goods-receipt feed. See mock-sap-service.cds.
+ * MockSapService: a stand-in ERP goods-receipt feed. See mock-sap-service.cds.
  *
  * The feed is generated, not a static fixture: `triggerGoodsReceipt` emits fresh
  * batches through the deterministic generator (srv/lib/goods-receipt.ts), and a

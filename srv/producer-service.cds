@@ -1,56 +1,71 @@
-using { passport } from '../db/passport-schema';
+using {passport} from '../db/passport-schema';
 
 /**
- * ProducerService — the manufacturer / ERP cockpit surface.
+ * ProducerService: the manufacturer / ERP cockpit surface.
  *
  * Where PassportService is the read-side consumer surface (tier-gated views),
  * this is the WRITE side: a producer creates a battery passport from its Annex
  * XIII fields, saves it (draft, off-chain), runs the submit flow (attest +
  * bindPassport), manages disclosure grants, and proves the carbon-footprint
- * predicate in zero-knowledge — with a per-passport transaction overview.
+ * predicate in zero-knowledge, with a per-passport transaction overview.
  *
  * On-chain is offered BOTH ways: server-side automatic (the actions below, via
  * the NIGHTGATE plugin + a server signing session) and wallet-driven (the Fiori
  * app hands off to the Lace connector). Everything is offline-first: without a
  * session/contract the rows land with tx status `offline`.
  */
-@path: '/api/v1/producer'
+@path    : '/api/v1/producer'
 @requires: 'producer'
 service ProducerService {
 
     // Read/write the passport aggregate for the create form + list. payloadCipher
     // (the encrypted blob) is never served.
-    entity Passports         as projection on passport.Passports excluding { payloadCipher };
-    entity Batteries         as projection on passport.Batteries;
-    entity RecycledMaterials as projection on passport.RecycledMaterials;
-    entity DiligenceDoc      as projection on passport.DiligenceDoc;
+    entity Passports            as
+        projection on passport.Passports
+        excluding {
+            payloadCipher
+        };
+
+    entity Batteries            as projection on passport.Batteries;
+    entity RecycledMaterials    as projection on passport.RecycledMaterials;
+    entity DiligenceDoc         as projection on passport.DiligenceDoc;
 
     // Registered dataspace partners (recyclers / authorities) for the grant picker.
-    @readonly entity Partners as projection on passport.Partners excluding { secret };
+    @readonly
+    entity Partners             as
+        projection on passport.Partners
+        excluding {
+            secret
+        };
 
     // Tracking tables (read-only projections drive the cockpit's overview tabs).
-    @readonly entity PassportTransactions as projection on passport.PassportTransactions;
-    @readonly entity DisclosureGrantLog   as projection on passport.DisclosureGrantLog;
-    @readonly entity PredicateProofLog    as projection on passport.PredicateProofLog;
+    @readonly
+    entity PassportTransactions as projection on passport.PassportTransactions;
+
+    @readonly
+    entity DisclosureGrantLog   as projection on passport.DisclosureGrantLog;
+
+    @readonly
+    entity PredicateProofLog    as projection on passport.PredicateProofLog;
 
     /**
      * Create a passport from the passport-example fields (`passportJson` is the
      * full Annex XIII object: public Point-1 fields + batteries / recycledMaterials
      * / diligenceDocs). Always writes the row + payloadHash + encrypted payload
-     * (draft). If `submit` and a signing session + contract are available, also
-     * anchors it on-chain (attest + bindPassport). `mode` = 'onchain' | 'offline'.
+     * (draft). If `submit` and a signing session + contract are available, it
+     * also anchors on-chain, detached like submitPassport.
+     * `mode` = 'anchoring' | 'offline'.
      */
-    action createPassport(
-        passportJson: LargeString,
-        submit:       Boolean,
-        sessionId:    UUID,
-        owner:        String,  // producer wallet identity (shielded address)
-        walletId:     String   // optional: which SERVER wallet signs (see listServerWallets)
-    ) returns {
-        passportId:  String;
-        payloadHash: String;
-        mode:        String;
-        txHash:      String;
+    action   createPassport(passportJson: LargeString,
+                            submit: Boolean,
+                            sessionId: UUID,
+                            owner: String, // producer wallet identity (shielded address)
+                            walletId: String // optional: which SERVER wallet signs (see listServerWallets)
+    )                                                                    returns {
+        passportId  : String;
+        payloadHash : String;
+        mode        : String;
+        txHash      : String;
     };
 
     /**
@@ -59,11 +74,11 @@ service ProducerService {
      * independent Midnight account; secrets never leave the server. Configured
      * via `PRODUCER_WALLETS` + `PRODUCER_<ID>_*` env (srv/lib/producer-wallets.ts).
      */
-    function listServerWallets() returns array of {
-        id:           String;   // pass as `walletId` to the on-chain actions
-        label:        String;   // display name
-        owner:        String;   // shielded address = the passports' owner scope
-        signingReady: Boolean;  // signing secrets present (can anchor)
+    function listServerWallets()                                         returns array of {
+        id           : String; // pass as `walletId` to the on-chain actions
+        label        : String; // display name
+        owner        : String; // shielded address = the passports' owner scope
+        signingReady : Boolean; // signing secrets present (can anchor)
     };
 
     /**
@@ -72,10 +87,10 @@ service ProducerService {
      * wallet-sync wait. Called by the cockpit when a server wallet is picked at
      * login. Returns immediately; poll `serverWalletStatus` for readiness.
      */
-    action prewarmServerWallet(walletId: String) returns {
-        walletId: String;
-        state:    String;  // 'warming' | 'ready' | 'error'
-        error:    String;
+    action   prewarmServerWallet(walletId: String)                       returns {
+        walletId : String;
+        state    : String; // 'warming' | 'ready' | 'error'
+        error    : String;
     };
 
     /**
@@ -83,11 +98,11 @@ service ProducerService {
      * status surface. 'ready' means the prewarm finished, i.e. the wallet is
      * synced to the chain tip and the next attest signs without a sync wait.
      */
-    function serverWalletStatus(walletId: String) returns {
-        walletId:     String;
-        state:        String;   // 'cold' | 'warming' | 'ready' | 'error'
-        sinceSeconds: Integer;  // seconds since the session/prewarm was opened
-        error:        String;
+    function serverWalletStatus(walletId: String)                        returns {
+        walletId     : String;
+        state        : String; // 'cold' | 'warming' | 'ready' | 'error'
+        sinceSeconds : Integer; // seconds since the session/prewarm was opened
+        error        : String;
     };
 
     /**
@@ -96,15 +111,13 @@ service ProducerService {
      * Fiori app after the browser wallet flow submits, so the transaction
      * overview reflects it (the wallet path bypasses the server actions).
      */
-    action recordWalletAttest(
-        passportId:      String,
-        txHash:          String,
-        identifier:      String,
-        contractAddress: String
-    ) returns {
-        ok:     Boolean;
-        txHash: String;
-        status: String;   // pending until the tx is verified on-chain (then succeeded/failed)
+    action   recordWalletAttest(passportId: String,
+                                txHash: String,
+                                identifier: String,
+                                contractAddress: String)                 returns {
+        ok     : Boolean;
+        txHash : String;
+        status : String; // pending until the tx is verified on-chain (then succeeded/failed)
     };
 
     /**
@@ -115,13 +128,13 @@ service ProducerService {
      * path. The value stays client-side (not a circuit arg).
      */
     function passportFieldValue(passportId: String, sourceField: String) returns {
-        value:        String;
-        scaledValue:  String;
-        found:        Boolean;
-        fieldKey:     String;
-        contentRoot:  String;
-        siblingsJson: String;
-        dirsJson:     String;
+        value        : String;
+        scaledValue  : String;
+        found        : Boolean;
+        fieldKey     : String;
+        contentRoot  : String;
+        siblingsJson : String;
+        dirsJson     : String;
     };
 
     /**
@@ -130,7 +143,7 @@ service ProducerService {
      * integrity). Producer-owned data, so no redaction here (the tier gating and
      * the value-hiding live on the consumer read side / in the PAC).
      */
-    function passportAspectJson(passportId: String) returns LargeString;
+    function passportAspectJson(passportId: String)                      returns LargeString;
 
     /**
      * Build the Predicate Attestation Credential (PAC) from the passport's
@@ -138,17 +151,20 @@ service ProducerService {
      * carrying the attestation + each proven claim, with `valueDisclosed: false`.
      * The proven values are never included, only the claim, threshold and proof tx.
      */
-    function passportCredential(passportId: String) returns LargeString;
+    function passportCredential(passportId: String)                      returns LargeString;
 
-    /** Anchor an existing draft passport on-chain (attest + bindPassport). */
-    action submitPassport(
-        passportId: String,
-        sessionId:  UUID,
-        walletId:   String   // optional: which SERVER wallet signs
-    ) returns {
-        passportId: String;
-        mode:       String;
-        txHash:     String;
+    /**
+     * Anchor an existing draft passport on-chain (attest + bindPassport +
+     * content root). Runs DETACHED: returns `mode: 'anchoring'` immediately;
+     * poll the Passports row until 'anchored' or 'failed'.
+     */
+    action   submitPassport(passportId: String,
+                            sessionId: UUID,
+                            walletId: String // optional: which SERVER wallet signs
+    )                                                                    returns {
+        passportId : String;
+        mode       : String;
+        txHash     : String;
     };
 
     /**
@@ -156,16 +172,14 @@ service ProducerService {
      * DisclosureGrantLog row (status succeeded) + a PassportTransactions row, so
      * the read gate honors it immediately (the wallet path bypasses the server).
      */
-    action recordWalletDisclosure(
-        passportId: String,
-        grantee:    String,
-        level:      Integer,
-        op:         String,   // 'grant' | 'revoke'
-        txHash:     String
-    ) returns {
-        ok:     Boolean;
-        txHash: String;
-        status: String;   // pending until the tx is verified on-chain (then succeeded/failed)
+    action   recordWalletDisclosure(passportId: String,
+                                    grantee: String,
+                                    level: Integer,
+                                    op: String, // 'grant' | 'revoke'
+                                    txHash: String)                      returns {
+        ok     : Boolean;
+        txHash : String;
+        status : String; // pending until the tx is verified on-chain (then succeeded/failed)
     };
 
     /**
@@ -173,18 +187,16 @@ service ProducerService {
      * PredicateProofLog row (status succeeded) + PassportTransactions row. The
      * value stays hidden (never sent); only the claim + proof reference.
      */
-    action recordWalletPredicate(
-        passportId:  String,
-        sourceField: String,
-        predicate:   String,   // 'lessOrEqual' | 'greaterOrEqual'
-        threshold:   Integer64,
-        unit:        String,
-        txHash:      String,
-        result:      Boolean
-    ) returns {
-        ok:     Boolean;
-        txHash: String;
-        status: String;   // pending until the tx is verified on-chain (then succeeded/failed)
+    action   recordWalletPredicate(passportId: String,
+                                   sourceField: String,
+                                   predicate: String, // 'lessOrEqual' | 'greaterOrEqual'
+                                   threshold: Integer64,
+                                   unit: String,
+                                   txHash: String,
+                                   result: Boolean)                      returns {
+        ok     : Boolean;
+        txHash : String;
+        status : String; // pending until the tx is verified on-chain (then succeeded/failed)
     };
 
     /**
@@ -193,53 +205,50 @@ service ProducerService {
      * `mode: 'granting'` immediately with the pending DisclosureGrantLog row id;
      * poll that row until it leaves 'pending'.
      */
-    action grantPassportDisclosure(
-        passportId: String,
-        grantee:    String,
-        level:      Integer,
-        sessionId:  UUID,
-        walletId:   String   // optional: which SERVER wallet signs
-    ) returns {
-        mode:       String;  // 'granting' | 'offline'
-        txHash:     String;
-        grantLogId: String;  // DisclosureGrantLog row to poll (mode 'granting')
+    action   grantPassportDisclosure(passportId: String,
+                                     grantee: String,
+                                     level: Integer,
+                                     sessionId: UUID,
+                                     walletId: String // optional: which SERVER wallet signs
+    )                                                                    returns {
+        mode       : String; // 'granting' | 'offline'
+        txHash     : String;
+        grantLogId : String; // DisclosureGrantLog row to poll (mode 'granting')
     };
 
     /** Revoke a previously granted disclosure. Detached like grant (`mode: 'revoking'`). */
-    action revokePassportDisclosure(
-        passportId: String,
-        grantee:    String,
-        sessionId:  UUID,
-        walletId:   String   // optional: which SERVER wallet signs
-    ) returns {
-        mode:       String;  // 'revoking' | 'offline'
-        txHash:     String;
-        grantLogId: String;  // DisclosureGrantLog row to poll (mode 'revoking')
+    action   revokePassportDisclosure(passportId: String,
+                                      grantee: String,
+                                      sessionId: UUID,
+                                      walletId: String // optional: which SERVER wallet signs
+    )                                                                    returns {
+        mode       : String; // 'revoking' | 'offline'
+        txHash     : String;
+        grantLogId : String; // DisclosureGrantLog row to poll (mode 'revoking')
     };
 
     /**
      * Prove that a passport value satisfies a predicate against a public
      * threshold, in zero-knowledge, without revealing the value. Defaults the
      * value to the passport's battery `carbonFootprintKgCO2` when `sourceField`
-     * is that field. The value is a witness — never stored.
+     * is that field. The value is a witness and is never stored.
      *
      * With a signing session the proof runs DETACHED (like submitPassport):
      * the action returns `mode: 'proving'` immediately with the pending
      * PredicateProofLog row id; poll that row until it leaves 'pending'.
      */
-    action provePassportValue(
-        passportId:  String,
-        sourceField: String,
-        predicate:   String,   // 'lessOrEqual' | 'greaterOrEqual'
-        threshold:   Integer64,
-        unit:        String,
-        sessionId:   UUID,
-        walletId:    String    // optional: which SERVER wallet signs
-    ) returns {
-        mode:                   String;  // 'proving' | 'offline'
-        txHash:                 String;
-        predicateAttestationId: String;
-        result:                 Boolean;
-        proofLogId:             String;  // PredicateProofLog row to poll (mode 'proving')
+    action   provePassportValue(passportId: String,
+                                sourceField: String,
+                                predicate: String, // 'lessOrEqual' | 'greaterOrEqual'
+                                threshold: Integer64,
+                                unit: String,
+                                sessionId: UUID,
+                                walletId: String // optional: which SERVER wallet signs
+    )                                                                    returns {
+        mode                   : String; // 'proving' | 'offline'
+        txHash                 : String;
+        predicateAttestationId : String;
+        result                 : Boolean;
+        proofLogId             : String; // PredicateProofLog row to poll (mode 'proving')
     };
 }

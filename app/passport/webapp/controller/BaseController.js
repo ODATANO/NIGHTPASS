@@ -84,7 +84,7 @@ sap.ui.define([
         });
     },
 
-    // T23: when arriving via the QR resolver (?p=<passportId>), preselect that
+    // When arriving via the QR resolver (?p=<passportId>), preselect that
     // battery as soon as the list has rendered. Consumed once.
     onListUpdateFinished: function () {
       var oSession = this.getOwnerComponent().getModel("session");

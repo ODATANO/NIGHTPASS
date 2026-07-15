@@ -7,7 +7,7 @@ import { rowToBatch, type Batch, type GoodsReceiptRow } from './lib/goods-receip
 
 const { INSERT, SELECT, UPDATE } = cds.ql;
 
-// --- Disclosure tiers (T20) --------------------------------------------------
+// --- Disclosure tiers --------------------------------------------------
 //
 // The Annex XIII disclosure boundary is enforced HERE, in the API layer, not on
 // the chain (see db/passport-schema.cds). `after READ` handlers strip every
@@ -35,7 +35,7 @@ function localTierOf(req: cds.Request): Tier {
     return 'consumer';
 }
 
-// On-chain disclosure ACL (NIGHTGATE 0.3.4) ----------------------------------
+// On-chain disclosure ACL ----------------------------------
 //
 // The AttestationVault `disclosures` Map is the tamper-evident, attester-
 // controlled tier ACL; NIGHTGATE indexes it into `midnight.DisclosureGrants`
@@ -158,27 +158,20 @@ function asRows(data: unknown): Record<string, unknown>[] {
 }
 
 /**
- * PassportService implementation (T19).
+ * PassportService implementation
  *
  * `generatePassport(batchId, sessionId)` builds a battery passport from a
  * goods-receipt batch, commits its payload hash on Midnight via the NIGHTGATE
  * plugin, and returns the resolvable QR URL.
  *
  * Flow:
- *   1. Fetch batch data (T21 mock SAP, inlined seam until that lands).
+ *   1. Fetch batch data
  *   2. payload_hash = blake2b-256(canonical JSON of the private payload).
  *   3. Encrypt the payload with a per-passport key → Passports.payloadCipher.
- *   4. Anchor diligence docs + the passport payload on-chain via the plugin.
- *   5. Poll getJobStatus until the attestation tx is included.
- *   6. INSERT the Passports row with the resulting txHash + payloadHash.
- *   7. QR URL = https://<demoHost>/p/<passportId>.
- *
- * On-chain step uses `anchorDocument` (which hex-decodes + calls the
- * AttestationVault `attest` circuit internally). The passportId→payload_hash
- * `bindPassport` call is DEFERRED. `submitContractCall` cannot pass Bytes<32>
- * args yet (NIGHTGATE FR: docs/feature-requests/submitcontractcall-bytes-args.md).
- * Until then the mapping lives in the Passports row (passportId + payloadHash),
- * which T23's resolver reads off-chain.
+ *   4. Anchor on-chain via the shared sequence in srv/lib/passport-anchor
+ *      (attest + bindPassport + content root), polling each job to inclusion.
+ *   5. INSERT the Passports row with the resulting txHash + payloadHash.
+ *   6. QR URL = https://<demoHost>/p/<passportId>.
  *
  * If `sessionId` is omitted the deterministic off-chain steps still run and the
  * tx fields stay null. An offline/dev path that needs no wallet.
@@ -192,10 +185,10 @@ export default class PassportService extends cds.ApplicationService {
         this.on('verifyOnChain', this.verifyOnChain);
         this.on('anchorExplorer', this.anchorExplorer);
 
-        // Disclosure-tier gating (T20): redact restricted fields per requester
+        // Disclosure-tier gating: redact restricted fields per requester
         // tier on every read (the Annex XIII boundary). Base tier is the
-        // requester's CAP role; an active on-chain DisclosureGrant (NIGHTGATE
-        // 0.3.4) can elevate it per passport. Handlers target the SERVICE
+        // requester's CAP role; an active on-chain DisclosureGrant can
+        // elevate it per passport. Handlers target the SERVICE
         // projections (unqualified names, relative to PassportService), not the
         // db-level `passport.*` entities the cds-typer classes resolve to, which
         // a service READ never matches.
@@ -252,7 +245,7 @@ export default class PassportService extends cds.ApplicationService {
         const { batchId, sessionId } = req.data as { batchId?: string; sessionId?: string };
         if (!batchId) return req.reject(400, 'batchId is required');
 
-        // 1. Fetch batch data from the mock SAP goods-receipt feed (T21). The row
+        // 1. Fetch batch data from the mock SAP goods-receipt feed. The row
         //    carries the public header + the shielded payload; rowToBatch parses it.
         const batch = await resolveBatch(batchId);
         if (!batch) return req.reject(404, `batch '${batchId}' not found`);
@@ -277,14 +270,13 @@ export default class PassportService extends cds.ApplicationService {
         const qrCodeUrl = `${demoHost}/p/${passportId}`;
         const contractAddress = process.env.PASSPORT_CONTRACT_ADDRESS ?? null;
 
-        // 4 + 5. On-chain anchor (only when a signing session is supplied):
-        // anchorDocument (AttestationVault.attest) + bindPassport, shared with the
-        // producer cockpit via srv/lib/passport-anchor.
+        // 4. On-chain anchor (only when a signing session is supplied); the
+        // sequence is shared with the producer cockpit via srv/lib/passport-anchor.
         let attestationTxHash: string | null = null;
         if (sessionId) {
             if (!contractAddress) {
                 return req.reject(400,
-                    'PASSPORT_CONTRACT_ADDRESS env is required for on-chain anchoring (a deployed passport-attestation address)');
+                    'PASSPORT_CONTRACT_ADDRESS env is required for on-chain anchoring (a deployed attestation-vault address)');
             }
             const nightgate = await cds.connect.to('NightgateService');
             ({ attestationTxHash } = await anchorPassport(nightgate, {
@@ -292,24 +284,24 @@ export default class PassportService extends cds.ApplicationService {
             }));
         }
 
-        // 6. Persist the passport row (payloadCipher excluded from the read
+        // 5. Persist the passport row (payloadCipher excluded from the read
         //    projection; stored here on the base entity). Cast on entries: the
         //    LargeBinary column is typed `Readable | null` by cds-types, but the
         //    runtime accepts a Buffer for binary inserts.
         await INSERT.into(Passports).entries({
             passportId,
-            manufacturerId:   batch.public.manufacturerId,
-            batteryCategory:  batch.public.batteryCategory as Passport['batteryCategory'],
-            model:            batch.public.model,
-            manufactureDate:  batch.public.manufactureDate as Passport['manufactureDate'],
-            weightKg:         batch.public.weightKg,
+            manufacturerId: batch.public.manufacturerId,
+            batteryCategory: batch.public.batteryCategory as Passport['batteryCategory'],
+            model: batch.public.model,
+            manufactureDate: batch.public.manufactureDate as Passport['manufactureDate'],
+            weightKg: batch.public.weightKg,
             performanceClass: batch.public.performanceClass,
             qrCodeUrl,
-            payloadCipher:    payloadCipher as unknown as Passport['payloadCipher'],
+            payloadCipher: payloadCipher as unknown as Passport['payloadCipher'],
             payloadHash,
             passportIdHash,
             contractAddress,
-            anchorNetwork:    contractAddress ? effectiveNetwork() : null,
+            anchorNetwork: contractAddress ? effectiveNetwork() : null,
             attestationTxHash
         });
 
@@ -317,7 +309,7 @@ export default class PassportService extends cds.ApplicationService {
         // was turned into a passport (best-effort; the passport row is the SoT).
         await UPDATE.entity('mocksap.GoodsReceipts').set({ status: 'consumed' }).where({ batchId });
 
-        // 7. Return the action result, incl. the QR as a data-URL PNG (T23).
+        // 6. Return the action result, incl. the QR as a data-URL PNG.
         const qrCodePng = await QRCode.toDataURL(qrCodeUrl, { width: 320, margin: 1 });
         return { passportId, attestationTxHash, qrCodeUrl, qrCodePng };
     };
@@ -332,18 +324,18 @@ export default class PassportService extends cds.ApplicationService {
         if (!row) return req.reject(404, 'no battery for that payloadHash');
         const demoHost = process.env.PASSPORT_DEMO_HOST ?? 'https://passport.example';
         return {
-            passportId:        row.passportId,
-            payloadHash:       raw,
-            manufacturerId:    row.manufacturerId,
-            model:             row.model,
-            batteryCategory:   row.batteryCategory,
-            contractAddress:   row.contractAddress,
+            passportId: row.passportId,
+            payloadHash: raw,
+            manufacturerId: row.manufacturerId,
+            model: row.model,
+            batteryCategory: row.batteryCategory,
+            contractAddress: row.contractAddress,
             attestationTxHash: row.attestationTxHash,
-            status:            row.status,
+            status: row.status,
             // DB-state assertion only (anchored + tx present); NOT a live on-chain
             // re-verification. A verifier resolves attestationTxHash to confirm.
-            locallyAnchored:   row.status === 'anchored' && !!row.attestationTxHash,
-            viewerUrl:         `${demoHost}/resolve/${raw}`
+            locallyAnchored: row.status === 'anchored' && !!row.attestationTxHash,
+            viewerUrl: `${demoHost}/resolve/${raw}`
         };
     };
 
@@ -370,11 +362,9 @@ export default class PassportService extends cds.ApplicationService {
         const contractAddress = norm(row.contractAddress);
 
         // A row anchored on a DIFFERENT Midnight network than this server queries
-        // needs the `network` override on NIGHTGATE's verifyAttestationState
-        // (FR verify-state-network-override). Feature-detect it on the loaded
-        // model: dormant on plugin versions without it (the doomed read is
-        // skipped and the caller shows the honest reason), active right after
-        // an upgrade with no NIGHTPASS change.
+        // needs the `network` override on NIGHTGATE's verifyAttestationState.
+        // Feature-detect it on the loaded model: on plugin versions without it
+        // the doomed read is skipped and the caller shows the honest reason.
         const serverNetwork = effectiveNetwork();
         const anchorNetwork = (row as Record<string, unknown>).anchorNetwork as string | null ?? null;
         const crossNetwork = !!anchorNetwork && anchorNetwork !== serverNetwork;
@@ -405,8 +395,7 @@ export default class PassportService extends cds.ApplicationService {
             // the UI shows the honest "cannot check here" instead of a false
             // negative.
             try {
-                const url = `${peerBase}/api/v1/passport/verifyOnChain(passportId=${
-                    encodeURIComponent(`'${passportId.replace(/'/g, "''")}'`)})`;
+                const url = `${peerBase}/api/v1/passport/verifyOnChain(passportId=${encodeURIComponent(`'${passportId.replace(/'/g, "''")}'`)})`;
                 // Generous timeout: the peer's FIRST state read builds its
                 // provider bundle (ESM import + indexer handshake) and can take
                 // north of 30s cold; warm reads answer in a few seconds.
@@ -422,17 +411,17 @@ export default class PassportService extends cds.ApplicationService {
             }
         }
         return {
-            passportId:        row.passportId,
-            status:            row.status,
+            passportId: row.passportId,
+            status: row.status,
             verified,
-            payloadHash:       payloadHash || null,
-            contractAddress:   contractAddress || null,
+            payloadHash: payloadHash || null,
+            contractAddress: contractAddress || null,
             anchorNetwork,
             serverNetwork,
             checkedNetwork,
             attestationTxHash: row.attestationTxHash ?? null,
-            explorerUrl:       explorerTxUrl(row.attestationTxHash, anchorNetwork),
-            checkedAt:         new Date().toISOString()
+            explorerUrl: explorerTxUrl(row.attestationTxHash, anchorNetwork),
+            checkedAt: new Date().toISOString()
         };
     };
 
@@ -452,21 +441,21 @@ export default class PassportService extends cds.ApplicationService {
         return (rows as Record<string, unknown>[])
             .sort((a, b) => (rank[String(a.status)] ?? 9) - (rank[String(b.status)] ?? 9))
             .map((r) => ({
-                passportId:        r.passportId,
-                model:             r.model,
-                manufacturerId:    r.manufacturerId,
-                batteryCategory:   r.batteryCategory,
-                manufactureDate:   r.manufactureDate ?? null,
-                weightKg:          r.weightKg ?? null,
-                performanceClass:  r.performanceClass ?? null,
-                qrCodeUrl:         r.qrCodeUrl ?? null,
-                status:            r.status,
-                payloadHash:       r.payloadHash ? norm(r.payloadHash) : null,
-                contractAddress:   r.contractAddress ? norm(r.contractAddress) : null,
-                anchorNetwork:     r.anchorNetwork ?? null,
+                passportId: r.passportId,
+                model: r.model,
+                manufacturerId: r.manufacturerId,
+                batteryCategory: r.batteryCategory,
+                manufactureDate: r.manufactureDate ?? null,
+                weightKg: r.weightKg ?? null,
+                performanceClass: r.performanceClass ?? null,
+                qrCodeUrl: r.qrCodeUrl ?? null,
+                status: r.status,
+                payloadHash: r.payloadHash ? norm(r.payloadHash) : null,
+                contractAddress: r.contractAddress ? norm(r.contractAddress) : null,
+                anchorNetwork: r.anchorNetwork ?? null,
                 attestationTxHash: r.attestationTxHash ?? null,
-                explorerUrl:       explorerTxUrl(r.attestationTxHash as string | null, r.anchorNetwork as string | null),
-                createdAt:         r.createdAt ?? null
+                explorerUrl: explorerTxUrl(r.attestationTxHash as string | null, r.anchorNetwork as string | null),
+                createdAt: r.createdAt ?? null
             }));
     };
 
@@ -559,7 +548,7 @@ export default class PassportService extends cds.ApplicationService {
     };
 }
 
-// --- Batch source (T21 mock SAP goods-receipt feed) --------------------------
+// --- Batch source
 
 /**
  * Resolve a goods-receipt batch by id from the mock SAP feed

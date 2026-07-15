@@ -9,7 +9,7 @@ import type { ChainVerdict } from './chain-verify';
  * crawler populates. With the crawler off (the demo default) that table stays
  * empty, so a wallet action can never self-confirm and its row is stuck PENDING.
  *
- * NIGHTGATE 0.5.0 answers the stronger question instead: not "did this txHash
+ * NIGHTGATE's state readers answer the stronger question instead: not "did this txHash
  * land?" but "does the AttestationVault ledger now reflect the intended effect?".
  * Both surfaces below read live contract state via the indexer
  * (`queryContractState`), so they work with the crawler disabled and verify the
@@ -94,7 +94,7 @@ export async function verifyGrantState(o: {
 }
 
 /**
- * Confirm a field-bound predicate proof's effect crawler-free (NIGHTGATE 0.5.1
+ * Confirm a field-bound predicate proof's effect crawler-free (NIGHTGATE
  * `verifyPredicateState`): the vault recorded a true result for the claim key
  * (payloadHash, fieldKey, predicate, threshold). The wallet flow always proves a
  * field-bound predicate, so `fieldKey` is the canonical field id. `threshold`

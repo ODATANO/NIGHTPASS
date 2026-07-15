@@ -1,4 +1,4 @@
-// Live on-chain e2e against a RUNNING NIGHTPASS server (preprod, real wallet).
+// Live on-chain e2e against a RUNNING NIGHTPASS server (real wallet, any network).
 //
 //   npm start                                      (terminal 1, cds-tsx serve)
 //   node --env-file=.env test/integration/live-anchor-e2e.mjs   (terminal 2)
@@ -21,7 +21,7 @@
 //
 // Env knobs:
 //   NIGHTPASS_BASE            default http://localhost:4004
-//   LACE_VIEWING_KEY          required (preprod viewing key)
+//   LACE_VIEWING_KEY          required (wallet viewing key)
 //   LACE_MNEMONIC             required (BIP39 phrase; server does HD derivation)
 //   LIVE_SKIP_DUST=1          skip dust registration (already registered)
 //   LIVE_DUST_WAIT_SECONDS    default 120, wait after a fresh registration

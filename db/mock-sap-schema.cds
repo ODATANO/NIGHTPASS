@@ -3,7 +3,7 @@ using { managed } from '@sap/cds/common';
 namespace mocksap;
 
 /**
- * Mock SAP goods-receipt source (T21).
+ * Mock SAP goods-receipt source.
  *
  * Stands in for an ERP goods-receipt feed: each row is one inbound batch event
  * (public Point-1 header + the shielded Annex XIII payload as JSON). The

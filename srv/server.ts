@@ -7,7 +7,7 @@ import { verifyPeers, explorerLinks, passportSources } from './lib/passport-anch
 const { SELECT, INSERT, UPDATE } = cds.ql;
 
 /**
- * NIGHTPASS bootstrap extras (T23): the public QR landing resolver and the QR
+ * NIGHTPASS bootstrap extras: the public QR landing resolver and the QR
  * image endpoint. Registered on the Express app before CAP's services so a
  * scanned QR resolves to the right disclosure tier.
  *
@@ -87,17 +87,17 @@ cds.on('bootstrap', (app: any) => {
         const httpOverride = process.env.NIGHTGATE_INDEXER_HTTP_URL?.trim() || cfg.indexerHttpUrl;
         const indexerHttpUrl = httpOverride
             || `https://indexer.${network}.midnight.network/api/v4/graphql`;
-        // Since NIGHTGATE 0.7.1 an HTTP-only override derives the ws endpoint
-        // (same host/path, ws scheme, /ws suffix). Mirror that here so the
-        // browser connector stays on the exact indexer the server worker uses.
+        // NIGHTGATE derives the ws endpoint from an HTTP-only override (same
+        // host/path, ws scheme, /ws suffix). Mirror that here so the browser
+        // connector stays on the exact indexer the server worker uses.
         const indexerWsUrl = process.env.NIGHTGATE_INDEXER_WS_URL?.trim() || cfg.indexerWsUrl
             || (httpOverride
                 ? httpOverride.replace(/^http/, 'ws').replace(/\/+$/, '') + '/ws'
                 : `wss://indexer.${network}.midnight.network/api/v4/graphql/ws`);
         // Capability flags for the explorer UIs: can verifyOnChain live-check
         // rows anchored on ANOTHER network? `crossNetworkVerify` covers ANY
-        // network once the installed NIGHTGATE exposes the `network` override
-        // (FR verify-state-network-override, detected on the loaded model);
+        // network when the installed NIGHTGATE exposes the `network` override
+        // (detected on the loaded model);
         // `peerNetworks` lists networks covered by delegating peer instances
         // (PASSPORT_VERIFY_PEERS) until then.
         const crossNetworkVerify =

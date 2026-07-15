@@ -44,10 +44,11 @@ interface PassportInput {
 /**
  * ProducerService: manufacturer / ERP cockpit write side. See producer-service.cds.
  *
- * Every action is offline-first: it always persists the local row / log, and only
- * touches the chain when a signing session + contract are available (`mode`
- * 'onchain' vs 'offline'). The proven anchor sequence is shared with
- * PassportService via srv/lib/passport-anchor.
+ * Every action is offline-first: it always persists the local row / log, and
+ * only touches the chain when a signing session + contract are available. All
+ * on-chain legs run DETACHED after the request commits (mode 'anchoring' /
+ * 'granting' / 'revoking' / 'proving', else 'offline'); clients poll the row.
+ * The anchor sequence is shared with PassportService via srv/lib/passport-anchor.
  */
 export default class ProducerService extends cds.ApplicationService {
     /** walletId -> NIGHTGATE signing session (one per configured server wallet). */
@@ -283,23 +284,23 @@ export default class ProducerService extends cds.ApplicationService {
         await INSERT.into(Passports).entries({
             ID,
             passportId,
-            owner:            owner || null,
-            manufacturerId:   input.manufacturerId,
-            batteryCategory:  input.batteryCategory as any,
-            model:            input.model,
-            manufactureDate:  input.manufactureDate as any,
-            weightKg:         input.weightKg,
+            owner: owner || null,
+            manufacturerId: input.manufacturerId,
+            batteryCategory: input.batteryCategory as any,
+            model: input.model,
+            manufactureDate: input.manufactureDate as any,
+            weightKg: input.weightKg,
             performanceClass: input.performanceClass,
-            qrCodeUrl:        `${demoHost}/p/${passportId}`,
-            payloadCipher:    payloadCipher as any,
+            qrCodeUrl: `${demoHost}/p/${passportId}`,
+            payloadCipher: payloadCipher as any,
             payloadHash,
             passportIdHash,
             contractAddress,
-            anchorNetwork:    contractAddress ? effectiveNetwork() : null,
-            status:           'draft',
-            batteries:         batteries.map((b) => ({ ...b })),
+            anchorNetwork: contractAddress ? effectiveNetwork() : null,
+            status: 'draft',
+            batteries: batteries.map((b) => ({ ...b })),
             recycledMaterials: recycledMaterials.map((m) => ({ ...m })),
-            diligenceDocs:     diligenceDocs.map((d) => ({ docType: d.docType }))
+            diligenceDocs: diligenceDocs.map((d) => ({ docType: d.docType }))
         } as any);
 
         const session = submit ? await this.effectiveSession(sessionId, walletId) : null;
@@ -433,7 +434,7 @@ export default class ProducerService extends cds.ApplicationService {
 
         // Build the content root + inclusion proof from the passport's provable
         // fields. Degrade gracefully (value still returned for display) if the
-        // plugin's pure circuits aren't available (e.g. pre-0.4.3).
+        // plugin's pure circuits aren't available.
         try {
             const tree = await buildContentRoot(values);
             const proof = tree.proofFor(field);
@@ -588,7 +589,7 @@ export default class ProducerService extends cds.ApplicationService {
 
         const verdict = await this.settleWalletTx({
             txHash: hash, contractAddress: contract,
-            // Crawler-free (NIGHTGATE 0.5.1): confirm the vault recorded a true result
+            // Crawler-free: confirm the vault recorded a true result
             // for this field-bound claim. The cockpit sends the already-scaled
             // threshold that the proof hashed, so it is passed straight through.
             stateCheck: () => verifyPredicateState({
@@ -617,9 +618,9 @@ export default class ProducerService extends cds.ApplicationService {
     /**
      * Verify a wallet-submitted action's on-chain effect, then finalize the row.
      *
-     * Prefers crawler-free STATE verification (NIGHTGATE 0.5.0: `stateCheck` reads
-     * the AttestationVault ledger via `queryContractState`, so it confirms the
-     * outcome with the block crawler off, which is the demo default). It falls back to the
+     * Prefers crawler-free STATE verification (`stateCheck` reads the
+     * AttestationVault ledger via `queryContractState`, so it confirms the
+     * outcome with the block crawler off, the demo default). It falls back to the
      * tx-based indexer check (`verifyContractTx`) only when the state check is
      * absent or inconclusive; that tx path is also the only one that can return a
      * definitive `failed` (an indexed tx whose result is FAILURE or wrong target).

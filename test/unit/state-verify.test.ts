@@ -4,7 +4,7 @@ import cds from '@sap/cds';
 import { verifyAttestState, verifyGrantState, verifyPredicateState } from '../../srv/lib/state-verify';
 
 /**
- * Crawler-free state verification (NIGHTGATE 0.5.0). The module talks to the
+ * Crawler-free state verification. The module talks to the
  * plugin via `cds.connect.to('nightgate').send(...)` and reads back
  * `midnight.DisclosureGrants` via `cds.db.read`. Both are stubbed here so the
  * verdict mapping is asserted in isolation, without a live chain or CAP context.

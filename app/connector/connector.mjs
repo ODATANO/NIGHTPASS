@@ -6,7 +6,7 @@
 // revoke on the AttestationVault. This is the human-attester path. attest+grant+revoke
 // all run with the SAME wallet-derived attester secret, so a full self-contained
 // cycle works (a server-created grant uses a different secret and would fail the
-// on-chain "not attester" assert; a Phase-0 cross-path caveat).
+// on-chain "not attester" assert; a known cross-path caveat).
 //
 // Verified building blocks (NIGHTGATE Phases 1-4): manifest discovery,
 // FetchZkConfigProvider, providers assembly, attester-secret derivation, typed
@@ -170,12 +170,12 @@ async function fetchManifest() {
 //
 // The Midnight DApp Connector (Lace v4) does NOT implement message signing.
 // `api.signData(...)` throws `Method not implemented.` So the attester identity
-// cannot be derived from a wallet signature (the FR open-question-#1 fallback:
-// "else a consumer-owned secret"). We generate a random 32-byte secret once,
+// cannot be derived from a wallet signature; the fallback is a consumer-owned
+// secret. We generate a random 32-byte secret once,
 // persist it in localStorage keyed by the connected wallet's shielded address,
 // and reuse it for attest/grant/revoke so they share one attester identity.
 //
-// Cross-path caveat (Phase 0): this identity differs from the server's
+// Cross-path caveat: this identity differs from the server's
 // seed-HMAC identity, so a server-created grant can't be revoked here and vice
 // versa. Run a full attest to grant to revoke cycle in-browser with the same wallet.
 const STORE_PREFIX = 'nightgate:attester-secret:v1:';
