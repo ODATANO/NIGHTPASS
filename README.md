@@ -14,7 +14,7 @@
 
 NIGHTPASS implements the EU Battery Passport. One dataset is exposed with a different view per audience (consumer, recycler, authority), and sensitive numbers (for example "recycled cobalt share is at least the legal minimum") can be **proven without revealing the value**. Only a payload hash and public metadata are anchored on-chain; everything else stays encrypted off-chain, and the disclosure tier is enforced in the API layer.
 
-It consumes [`@odatano/nightgate`](https://github.com/ODATANO/NIGHTGATE) as a CAP plugin (`cds.requires.nightgate`).
+It consumes [`@odatano/nightgate`](https://github.com/ODATANO/NIGHTGATE) as a CAP plugin, which provides the contract, the ZK proof library, and the Nightgate worker for async on-chain submission.
 
 ## How it works, in short
 
@@ -46,7 +46,7 @@ Vault contract: `dcd297ba6a335a5d64916a6f2e36151c7490baa119fd022c846944918d9cde6
 
 ## Quick start
 
-Requires Node.js >= 22 (see `.nvmrc`).
+Requires Node.js >= 22
 
 ```bash
 npm install            # postinstall generates @cds-models and builds the connector lib

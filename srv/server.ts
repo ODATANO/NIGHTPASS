@@ -84,10 +84,16 @@ cds.on('bootstrap', (app: any) => {
     app.get('/api/v1/passport/runtime-config', (_req: any, res: any) => {
         const cfg: any = (cds.env as any).requires?.nightgate ?? {};
         const network = process.env.NIGHTGATE_NETWORK?.trim() || cfg.network || 'preview';
-        const indexerHttpUrl = process.env.NIGHTGATE_INDEXER_HTTP_URL?.trim() || cfg.indexerHttpUrl
+        const httpOverride = process.env.NIGHTGATE_INDEXER_HTTP_URL?.trim() || cfg.indexerHttpUrl;
+        const indexerHttpUrl = httpOverride
             || `https://indexer.${network}.midnight.network/api/v4/graphql`;
+        // Since NIGHTGATE 0.7.1 an HTTP-only override derives the ws endpoint
+        // (same host/path, ws scheme, /ws suffix). Mirror that here so the
+        // browser connector stays on the exact indexer the server worker uses.
         const indexerWsUrl = process.env.NIGHTGATE_INDEXER_WS_URL?.trim() || cfg.indexerWsUrl
-            || `wss://indexer.${network}.midnight.network/api/v4/graphql/ws`;
+            || (httpOverride
+                ? httpOverride.replace(/^http/, 'ws').replace(/\/+$/, '') + '/ws'
+                : `wss://indexer.${network}.midnight.network/api/v4/graphql/ws`);
         // Capability flags for the explorer UIs: can verifyOnChain live-check
         // rows anchored on ANOTHER network? `crossNetworkVerify` covers ANY
         // network once the installed NIGHTGATE exposes the `network` override
