@@ -1,3 +1,8 @@
+# check=skip=SecretsUsedInArgOrEnv
+# The skipped check is a false positive: cds_requires_db_credentials_url is
+# CAP's env mapping for cds.requires.db.credentials.url and holds a SQLite
+# file path, not a secret. The variable name is fixed by CAP's convention.
+
 # NIGHTPASS public demo image (see docs/public-demo.md).
 #
 # Serves the SAPUI5 passport viewer, the QR resolver (/p/:id, /qr/:id.png) and
@@ -18,7 +23,7 @@ RUN npm ci
 # mounting a volume over /app/db would shadow the CDS model files (db/*.cds)
 # that live next to it. /data holds only the SQLite file.
 ENV NODE_ENV=production \
-    cds_requires_db_credentials_database=/data/passport.db
+    cds_requires_db_credentials_url=/data/passport.db
 RUN mkdir -p /data
 
 EXPOSE 4004
