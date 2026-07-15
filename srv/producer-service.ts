@@ -914,9 +914,17 @@ export default class ProducerService extends cds.ApplicationService {
             ID: proofLogId, passport_ID: row.ID, sourceField: field, predicate: pred,
             threshold: thresholdScaled, unit: useUnit, status: 'pending'
         } as any);
+        // The proof circuit binds against the root in the LEDGER; the worker
+        // only (idempotently) re-anchors when `contentRoot` is supplied. Our
+        // anchor sequence anchors the root at attest and passport content is
+        // immutable after create, so re-sending it would just buy a redundant
+        // anchorContentRoot tx (fee, ~20s, a confusing duplicate row). Supply
+        // it only when no anchored root exists yet for this passport.
+        const rootAnchored = await SELECT.one.from(PassportTransactions).columns('ID')
+            .where({ passport_ID: row.ID, kind: 'anchorContentRoot', status: 'succeeded' });
         const args = {
             payloadHash: row.payloadHash, fieldKey: proof.fieldKey, value: proof.value,
-            contentRoot: tree.contentRoot,
+            ...(rootAnchored ? {} : { contentRoot: tree.contentRoot }),
             siblingsJson: JSON.stringify(proof.siblings), dirsJson: JSON.stringify(proof.dirs),
             predicate: pred, threshold: thresholdScaled, unit: useUnit,
             sessionId: session, contractAddress, compiledArtifactRef: CONTRACT_REF
@@ -958,15 +966,19 @@ export default class ProducerService extends cds.ApplicationService {
             const jobResult: any = await waitForJobResult(nightgate, res.jobId, args.sessionId, user);
             const txHash = String(jobResult?.proof?.proofValue ?? jobResult?.txHash ?? '');
             const paId = String(res.predicateAttestationId ?? jobResult?.predicateAttestationId ?? '');
-            const rootTxHash = await this.contentRootTxOf(args.sessionId, args.contractAddress, startedAt);
+            const rootTx = await this.contentRootTxOf(args.sessionId, args.contractAddress, startedAt);
             await this.runDetached(async () => {
                 await UPDATE.entity(PredicateProofLog).set({
                     status: 'succeeded', result: true, txHash, predicateAttestationId: paId
                 }).where({ ID: proofLogId });
-                if (rootTxHash) {
+                if (rootTx) {
+                    // Stamp the row with the tx's real submit time: both proof
+                    // rows are inserted together here, and identical createdAt
+                    // values make the (root, prove) pair sort randomly.
                     await INSERT.into(PassportTransactions).entries({
                         passport_ID: passportRowId, kind: 'anchorContentRoot', jobId: res.jobId,
-                        txHash: rootTxHash, status: 'succeeded', explorerUrl: txExplorerUrl(rootTxHash)
+                        txHash: rootTx.txHash, status: 'succeeded', explorerUrl: txExplorerUrl(rootTx.txHash),
+                        ...(rootTx.submittedAt ? { createdAt: rootTx.submittedAt } : {})
                     } as any);
                 }
                 await INSERT.into(PassportTransactions).entries({
@@ -994,7 +1006,8 @@ export default class ProducerService extends cds.ApplicationService {
      * started, from the plugin's own submission log. Best-effort (null if the
      * lookup fails); the proof tx itself never depends on it.
      */
-    private async contentRootTxOf(sessionId: string, contractAddress: string, sinceIso: string): Promise<string | null> {
+    private async contentRootTxOf(sessionId: string, contractAddress: string, sinceIso: string):
+        Promise<{ txHash: string; submittedAt?: string } | null> {
         try {
             const rows: any[] = await cds.db.read('midnight.PendingSubmissions')
                 .columns('txHash', 'submittedAt')
@@ -1002,7 +1015,8 @@ export default class ProducerService extends cds.ApplicationService {
                 .and('submittedAt >=', sinceIso)
                 .orderBy('submittedAt desc')
                 .limit(1);
-            return rows?.[0]?.txHash ?? null;
+            const hit = rows?.[0];
+            return hit?.txHash ? { txHash: hit.txHash, submittedAt: hit.submittedAt } : null;
         } catch (e) {
             cds.log('producer').warn('content-root tx lookup skipped:', (e as Error)?.message);
             return null;
