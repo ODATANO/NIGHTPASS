@@ -24,25 +24,20 @@ It consumes [`@odatano/nightgate`](https://github.com/ODATANO/NIGHTGATE) as a CA
 - **Two submit paths** to the same contract: server (NIGHTGATE worker wallet, async jobs) or wallet (the user's own Lace via DApp-Connector). Offline-first: without a session or contract, actions land as local log rows and everything still works.
 - **Catena-X**: the cockpit exports the CX-0143 battery-passport aspect JSON and a **Predicate Attestation Credential (PAC)**, carrying the proven predicates with `valueDisclosed: false`. That predicate capability is what Tractus-X currently lacks.
 
-### Live example (Midnight preview, 2026-07-11)
+### Live example (Midnight preview)
 
-One ERP goods-receipt ingested end-to-end (signed webhook -> `createPassport` -> auto-anchor), passport `BAT-GR-0015`, three transactions on the preview network:
+One passport, end to end: `BAT-PRODA-20260713190211`, created and server-signed by an independent producer wallet, anchored 2026-07-13, three zero-knowledge predicate proofs added 2026-07-15. The proof transactions prove each claim against the passport's anchored content root; the value enters only as a private witness, and the ledger accepts the transaction only if the in-circuit asserts hold, so an included tx IS the verified proof.
 
 | Step | Transaction |
 |---|---|
-| attest | [`67df45db...cc42d8e2`](https://preview.midnightexplorer.com/transactions/0x67df45db9a4c67d1b6af55cf5dbe0d874ecfe0e40ac57e80d5ad7abecc42d8e2) |
-| bindPassport | [`97c36cb5...bb5991bb`](https://preview.midnightexplorer.com/transactions/0x97c36cb573ed7ce9ed2d64f45986efa4023859b478ae9a283a0484a6bb5991bb) |
-| anchorContentRoot | [`6cce29ba...93020e16`](https://preview.midnightexplorer.com/transactions/0x6cce29baa9be9237782386ffda00eaebbfd1a18bf68abaf3b0ce9dab93020e16) |
+| attest (payload hash into the vault) | [`86cd6783...97ae6759`](https://preview.midnightexplorer.com/transactions/0x86cd678313a7d793b9cc12ae056b26a25d31a11a90d041062c98be3997ae6759) |
+| bindPassport (passport id -> payload hash) | [`69b41b10...7c00fcdb`](https://preview.midnightexplorer.com/transactions/0x69b41b10a9c777340faf2418f295c9249fb1bf7244a40e05fd8ea7837c00fcdb) |
+| anchorContentRoot (Merkle root over provable fields) | [`d420ac09...b7970cf8`](https://preview.midnightexplorer.com/transactions/0xd420ac09ec33cb558e59b3c567247af34e02ee747df2422b40472663b7970cf8) |
+| prove: carbon footprint <= 4000 kg CO2 / kWh (value hidden) | [`16c13b72...41623223`](https://preview.midnightexplorer.com/transactions/0x16c13b7231690776e71180a0301d5662b58d2cf1c98c0b975c6b469d41623223) |
+| prove: recycled content >= 16 % (value hidden) | [`a31c0c40...1136cbc4`](https://preview.midnightexplorer.com/transactions/0xa31c0c404a8c7138feecbe05a5c60f93fe626390c3a0e73fe461cafa1136cbc4) |
+| prove: lead content <= 100 ppm (value hidden) | [`64fc655c...bb909dbf`](https://preview.midnightexplorer.com/transactions/0x64fc655c59eb7c5e2e7ad0df4ac9a012c1dec2f8deb1ca53f99e1dfbbb909dbf) |
 
-Vault contract: `dcd297ba6a335a5d64916a6f2e36151c7490baa119fd022c846944918d9cde69`.
-
-Zero-knowledge predicate proofs (2026-07-15) on passport `BAT-PRODA-20260713190211`, anchored 2026-07-13 by an independent server-signed producer wallet ([attest `86cd6783...97ae6759`](https://preview.midnightexplorer.com/transactions/0x86cd678313a7d793b9cc12ae056b26a25d31a11a90d041062c98be3997ae6759), [bindPassport `69b41b10...7c00fcdb`](https://preview.midnightexplorer.com/transactions/0x69b41b10a9c777340faf2418f295c9249fb1bf7244a40e05fd8ea7837c00fcdb), [anchorContentRoot `d420ac09...b7970cf8`](https://preview.midnightexplorer.com/transactions/0xd420ac09ec33cb558e59b3c567247af34e02ee747df2422b40472663b7970cf8)). Each proof run submits two transactions: it re-anchors the content root over the passport's provable fields, then proves the claim against exactly that root, with the value entering only as a private witness. The ledger accepts the proof transaction only if the in-circuit asserts hold, so an included tx IS the verified proof.
-
-| Proven claim (value stays hidden) | anchorContentRoot | proveFieldPredicate |
-|---|---|---|
-| carbon footprint <= 4000 kg CO2 / kWh | [`9f124c9a...0cc56c0a`](https://preview.midnightexplorer.com/transactions/0x9f124c9a2c2c68f7bcea1b75c7013e99fe5f3d2f57954caaf5e12a4a0cc56c0a) | [`16c13b72...41623223`](https://preview.midnightexplorer.com/transactions/0x16c13b7231690776e71180a0301d5662b58d2cf1c98c0b975c6b469d41623223) |
-| recycled content >= 16 % | [`c1f9df0e...35cfa737`](https://preview.midnightexplorer.com/transactions/0xc1f9df0e0207d6916c1ef6e6bb5ae091a313bf9d145fe6285ae1400035cfa737) | [`a31c0c40...1136cbc4`](https://preview.midnightexplorer.com/transactions/0xa31c0c404a8c7138feecbe05a5c60f93fe626390c3a0e73fe461cafa1136cbc4) |
-| lead content <= 100 ppm | [`b29a59dc...70fc63bf`](https://preview.midnightexplorer.com/transactions/0xb29a59dcf8f4cffb61d8084f6e154b043dc4e2fbc75b7d8ba2cab8b470fc63bf) | [`64fc655c...bb909dbf`](https://preview.midnightexplorer.com/transactions/0x64fc655c59eb7c5e2e7ad0df4ac9a012c1dec2f8deb1ca53f99e1dfbbb909dbf) |
+Vault contract: `dcd297ba6a335a5d64916a6f2e36151c7490baa119fd022c846944918d9cde69`. (Each proof run also re-anchors the content root before proving, an idempotent write of the same root value; those bookkeeping transactions are omitted here.)
 
 ## Documentation
 
