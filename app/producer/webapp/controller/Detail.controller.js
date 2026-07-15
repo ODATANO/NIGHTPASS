@@ -140,8 +140,42 @@ sap.ui.define([
       }
       var that = this;
       this.callAction("/submitPassport", { passportId: this._pid(), walletId: this._walletId() })
-        .then(function (res) { that.toast("submit: " + res.mode + (res.txHash ? " · tx " + res.txHash.slice(0, 16) + "…" : "")); that._refreshAll(); })
+        .then(function (res) {
+          if (res.mode === "anchoring") {
+            // The anchor runs detached on the server; the row stays 'anchoring'.
+            // Keep working; the poll below refreshes and notifies on completion.
+            that.toast("anchoring started in the background, status is pending");
+            that._pollAnchor(that._pid());
+          } else {
+            that.toast("submit: " + res.mode + (res.txHash ? " · tx " + res.txHash.slice(0, 16) + "…" : ""));
+          }
+          that._refreshAll();
+        })
         .catch(function (e) { that.error(e); });
+    },
+
+    // Poll the passport row until the detached anchor runner finishes (anchored
+    // or failed), then refresh the views and notify. Bounded to ~10 minutes,
+    // matching the server-side job cap. A new submit supersedes a running poll.
+    _pollAnchor: function (sPid) {
+      var that = this;
+      var nToken = (this._anchorToken = (this._anchorToken || 0) + 1);
+      var iLeft = 120;
+      var tick = function () {
+        if (nToken !== that._anchorToken || iLeft-- <= 0) { return; }
+        fetch("/api/v1/producer/Passports?$select=status&$filter=passportId eq '" + encodeURIComponent(sPid) + "'",
+          { headers: that._authHeaders() })
+          .then(function (r) { return r.ok ? r.json() : Promise.reject(new Error("status " + r.status)); })
+          .then(function (b) {
+            if (nToken !== that._anchorToken) { return; }
+            var sStatus = ((b.value || [])[0] || {}).status;
+            if (sStatus === "anchored") { that._refreshAll(); return that.toast("passport '" + sPid + "' anchored on-chain"); }
+            if (sStatus === "failed") { that._refreshAll(); return that.error("anchoring of '" + sPid + "' failed, see the Transactions tab"); }
+            setTimeout(tick, 5000);
+          })
+          .catch(function () { if (nToken === that._anchorToken) { setTimeout(tick, 8000); } });
+      };
+      setTimeout(tick, 5000);
     },
 
     onGrant: function () {
@@ -152,7 +186,7 @@ sap.ui.define([
         passportId: this._pid(), grantee: sGrantee,
         level: parseInt(this.byId("grantLevel").getSelectedKey(), 10),
         walletId: this._walletId()
-      }).then(function (res) { that.toast("grant: " + res.mode); that._refreshAll(); })
+      }).then(function (res) { that._afterDisclosure("grant", res); })
         .catch(function (e) { that.error(e); });
     },
 
@@ -161,8 +195,47 @@ sap.ui.define([
       var sGrantee = this.byId("granteePartner").getSelectedKey();
       if (!sGrantee) { return this.toast("select a partner"); }
       this.callAction("/revokePassportDisclosure", { passportId: this._pid(), grantee: sGrantee, walletId: this._walletId() })
-        .then(function (res) { that.toast("revoke: " + res.mode); that._refreshAll(); })
+        .then(function (res) { that._afterDisclosure("revoke", res); })
         .catch(function (e) { that.error(e); });
+    },
+
+    // Grant/revoke run detached on the server (mode 'granting'/'revoking'):
+    // notify, then poll the pending DisclosureGrantLog row for the outcome.
+    _afterDisclosure: function (sOp, res) {
+      if (res.mode === "granting" || res.mode === "revoking") {
+        this.toast(sOp + " started in the background, status is pending");
+        this._pollGrant(res.grantLogId, sOp);
+      } else {
+        this.toast(sOp + ": " + res.mode);
+      }
+      this._refreshAll();
+    },
+
+    _pollGrant: function (sLogId, sOp) {
+      var that = this;
+      var nToken = (this._grantToken = (this._grantToken || 0) + 1);
+      var iLeft = 120;
+      var tick = function () {
+        if (nToken !== that._grantToken || iLeft-- <= 0) { return; }
+        fetch("/api/v1/producer/DisclosureGrantLog?$select=status,txHash&$filter=ID eq " + sLogId,
+          { headers: that._authHeaders() })
+          .then(function (r) { return r.ok ? r.json() : Promise.reject(new Error("status " + r.status)); })
+          .then(function (b) {
+            if (nToken !== that._grantToken) { return; }
+            var row = (b.value || [])[0] || {};
+            if (row.status === "succeeded") {
+              that._refreshAll();
+              return that.toast(sOp + " settled on-chain" + (row.txHash ? " · tx " + row.txHash.slice(0, 16) + "…" : ""));
+            }
+            if (row.status === "failed") {
+              that._refreshAll();
+              return that.error(sOp + " failed, see the Transactions tab");
+            }
+            setTimeout(tick, 5000);
+          })
+          .catch(function () { if (nToken === that._grantToken) { setTimeout(tick, 8000); } });
+      };
+      setTimeout(tick, 5000);
     },
 
     onProve: function () {
@@ -175,9 +248,45 @@ sap.ui.define([
         unit: this.byId("proofUnit").getValue(),
         walletId: this._walletId()
       }).then(function (res) {
-        that.toast("prove: " + res.mode + (res.result === true ? " · ✓ proven" : res.result === false ? " · false" : ""));
+        if (res.mode === "proving") {
+          // The ZK proof runs detached on the server; keep working. The log
+          // row is 'pending' and the poll below reports the outcome.
+          that.toast("proof started in the background, status is pending");
+          that._pollProof(res.proofLogId);
+        } else {
+          that.toast("prove: " + res.mode + (res.result === true ? " · ✓ proven" : res.result === false ? " · false" : ""));
+        }
         that._refreshAll();
       }).catch(function (e) { that.error(e); });
+    },
+
+    // Poll the pending PredicateProofLog row until the detached proof runner
+    // resolves it, then refresh and notify. Bounded like the anchor poll.
+    _pollProof: function (sLogId) {
+      var that = this;
+      var nToken = (this._proofToken = (this._proofToken || 0) + 1);
+      var iLeft = 120;
+      var tick = function () {
+        if (nToken !== that._proofToken || iLeft-- <= 0) { return; }
+        fetch("/api/v1/producer/PredicateProofLog?$select=status,result,txHash&$filter=ID eq " + sLogId,
+          { headers: that._authHeaders() })
+          .then(function (r) { return r.ok ? r.json() : Promise.reject(new Error("status " + r.status)); })
+          .then(function (b) {
+            if (nToken !== that._proofToken) { return; }
+            var row = (b.value || [])[0] || {};
+            if (row.status === "succeeded") {
+              that._refreshAll();
+              return that.toast("predicate proven on-chain" + (row.txHash ? " · tx " + row.txHash.slice(0, 16) + "…" : ""));
+            }
+            if (row.status === "failed") {
+              that._refreshAll();
+              return that.error("predicate proof failed (or the predicate does not hold), see the Proofs and Transactions tabs");
+            }
+            setTimeout(tick, 5000);
+          })
+          .catch(function () { if (nToken === that._proofToken) { setTimeout(tick, 8000); } });
+      };
+      setTimeout(tick, 5000);
     },
 
     // Per-field predicate presets (human units; the value is scaled ×1000 in the

@@ -38,7 +38,11 @@ sap.ui.define([
           // override (any network) or a delegating peer instance (listed ones).
           var bCrossVerify = aRes[0].crossNetworkVerify === true;
           var aPeers = aRes[0].peerNetworks || [];
-          var aRows = (aRes[1].value || []).map(function (oRow) {
+          // Failed anchor attempts are producer-internal state, not part of
+          // the public record; the explorer never lists them.
+          var aRows = (aRes[1].value || []).filter(function (oRow) {
+            return oRow.status !== "failed";
+          }).map(function (oRow) {
             oRow.verifying = false;
             var bCross = oRow.anchorNetwork && sNet && oRow.anchorNetwork !== sNet;
             oRow.verifiable = oRow.status === "anchored"

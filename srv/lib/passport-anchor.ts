@@ -307,18 +307,17 @@ export function sendDetached(nightgate: cds.Service, action: string, args: Recor
 }
 
 /**
- * Poll a NIGHTGATE async job to completion and return its tx hash.
- * Throws on job failure. 10 min cap (120 x 5s): the ZK proof takes 1.5-3s and
- * block inclusion a few seconds more, so the cap only covers proof-server
- * queueing. Each poll runs in its own short root tx so it sees the job's
- * committed status updates.
+ * Poll a NIGHTGATE async job to completion and return its parsed result
+ * object. Throws on job failure. 10 min cap (120 x 5s): the ZK proof takes
+ * 1.5-3s and block inclusion a few seconds more, so the cap only covers
+ * proof-server queueing. Each poll runs in its own short root tx so it sees
+ * the job's committed status updates.
  */
-export async function waitForJob(nightgate: cds.Service, jobId: string, sessionId: string, user?: unknown): Promise<string> {
+export async function waitForJobResult(nightgate: cds.Service, jobId: string, sessionId: string, user?: unknown): Promise<any> {
     for (let i = 0; i < 120; i++) {
         const job: any = await sendDetached(nightgate, 'getJobStatus', { jobId, sessionId }, user);
         if (job.status === 'succeeded') {
-            const result = job.result ? JSON.parse(job.result) : {};
-            return String(result.txHash ?? '');
+            return job.result ? JSON.parse(job.result) : {};
         }
         if (job.status === 'failed') {
             throw new Error(`job failed: ${job.errorCode ?? ''} ${job.errorMessage ?? ''}`.trim());
@@ -326,6 +325,16 @@ export async function waitForJob(nightgate: cds.Service, jobId: string, sessionI
         await new Promise(r => setTimeout(r, 5000));
     }
     throw new Error(`job ${jobId} did not complete within timeout`);
+}
+
+/**
+ * waitForJobResult narrowed to the common case: the job result's top-level
+ * tx hash. NOT suitable for `issueFieldPredicateAttestation`, whose result is
+ * a PAC envelope carrying the hash at `proof.proofValue` instead.
+ */
+export async function waitForJob(nightgate: cds.Service, jobId: string, sessionId: string, user?: unknown): Promise<string> {
+    const result = await waitForJobResult(nightgate, jobId, sessionId, user);
+    return String(result.txHash ?? '');
 }
 
 /**

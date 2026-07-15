@@ -6,6 +6,14 @@
   xmlns:core="sap.ui.core">
   <Page title="Passport {passportId}" showNavButton="true" navButtonPress="onNavBack">
     <headerContent>
+      <!-- Signing-facade warmth (server mode): syncing vs. at chain tip. -->
+      <ObjectStatus
+        text="{= ${session>/warmth/state} === 'warming' ? 'wallet syncing (' + (${session>/warmth/sinceSeconds} || 0) + 's)…' : ${session>/warmth/state} === 'ready' ? 'wallet at chain tip' : 'wallet sync error' }"
+        state="{= ${session>/warmth/state} === 'ready' ? 'Success' : ${session>/warmth/state} === 'error' ? 'Error' : 'Warning' }"
+        icon="{= ${session>/warmth/state} === 'ready' ? 'sap-icon://connected' : 'sap-icon://synchronize' }"
+        tooltip="{session>/warmth/error}"
+        visible="{= ${session>/mode} === 'server' &amp;&amp; !!${session>/warmth/state} }"
+        class="sapUiTinyMarginEnd"/>
       <!-- Who signs (chosen at login): drives both the icon and the handler. -->
       <ObjectStatus
         text="{session>/signerLabel}"
@@ -95,7 +103,7 @@
                     <Text text="{op}"/>
                     <Text text="{grantee}"/>
                     <Text text="{level}"/>
-                    <ObjectStatus text="{status}" state="{= ${status} === 'succeeded' ? 'Success' : ${status} === 'failed' ? 'Error' : 'None' }"/>
+                    <ObjectStatus text="{status}" state="{= ${status} === 'succeeded' ? 'Success' : ${status} === 'failed' ? 'Error' : ${status} === 'pending' ? 'Warning' : 'None' }"/>
                     <Link text="{= ${txHash} || '—' }" href="{= ${txHash} ? 'https://preview.midnightexplorer.com/transactions/0x' + ${txHash} : '' }" target="_blank" enabled="{= !!${txHash} }"/>
                   </cells>
                 </ColumnListItem>
@@ -143,9 +151,9 @@
                   <cells>
                     <Text text="{sourceField}"/>
                     <Text text="{= ${predicate} + ' ' + ${threshold} + ' ' + (${unit} || '') }"/>
-                    <ObjectStatus text="{= ${status} === 'succeeded' ? 'proven' : ${status} === 'failed' ? 'false' : ${status} === 'offline' ? 'offline' : '—' }"
-                      state="{= ${status} === 'succeeded' ? 'Success' : ${status} === 'failed' ? 'Error' : 'None' }"/>
-                    <ObjectStatus text="{status}" state="{= ${status} === 'succeeded' ? 'Success' : ${status} === 'failed' ? 'Error' : 'None' }"/>
+                    <ObjectStatus text="{= ${status} === 'succeeded' ? 'proven' : ${status} === 'failed' ? 'false' : ${status} === 'offline' ? 'offline' : ${status} === 'pending' ? 'proving…' : '—' }"
+                      state="{= ${status} === 'succeeded' ? 'Success' : ${status} === 'failed' ? 'Error' : ${status} === 'pending' ? 'Warning' : 'None' }"/>
+                    <ObjectStatus text="{status}" state="{= ${status} === 'succeeded' ? 'Success' : ${status} === 'failed' ? 'Error' : ${status} === 'pending' ? 'Warning' : 'None' }"/>
                     <Link text="{= ${txHash} || '—' }" href="{= ${txHash} ? 'https://preview.midnightexplorer.com/transactions/0x' + ${txHash} : '' }" target="_blank" enabled="{= !!${txHash} }"/>
                   </cells>
                 </ColumnListItem>
@@ -166,7 +174,7 @@
                 <ColumnListItem>
                   <cells>
                     <Text text="{kind}"/>
-                    <ObjectStatus text="{status}"
+                    <ObjectStatus text="{status}" tooltip="{errorMessage}"
                       state="{= ${status} === 'succeeded' ? 'Success' : ${status} === 'failed' ? 'Error' : ${status} === 'pending' ? 'Warning' : 'None' }"/>
                     <Link text="{= ${txHash} || '—' }" href="{explorerUrl}" target="_blank" enabled="{= !!${explorerUrl} }"/>
                     <Text text="{createdAt}"/>

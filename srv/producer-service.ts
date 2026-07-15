@@ -4,7 +4,7 @@ import {
     PassportTransactions, DisclosureGrantLog, PredicateProofLog
 } from '#cds-models/passport';
 import {
-    hashPayload, blake2b256Hex, encryptPayload, anchorPassport, waitForJob,
+    hashPayload, blake2b256Hex, encryptPayload, anchorPassport, waitForJob, waitForJobResult,
     detachedFromRequest, sendDetached,
     buildContentRoot, fieldKeyHex, BATTERY_PROVABLE_FIELDS,
     effectiveNetwork, explorerTxUrl
@@ -15,7 +15,7 @@ import { verifyAttestState, verifyGrantState, verifyPredicateState } from './lib
 
 const CONTRACT_REF = 'attestation-vault';
 
-const { INSERT, SELECT, UPDATE } = cds.ql;
+const { INSERT, SELECT, UPDATE, DELETE } = cds.ql;
 
 const norm = (h?: string | null): string => String(h ?? '').replace(/^0x/, '');
 // Cockpit tx rows happen on the server's CURRENT network, so the explorer link
@@ -56,11 +56,18 @@ export default class ProducerService extends cds.ApplicationService {
      *  detached anchor run on that session (submitting before the facade
      *  exists fails with "No facade for sessionId"). */
     private serverPrewarmJobs = new Map<string, string>();
+    /** walletId -> in-flight session creation; dedupes the login prewarm racing
+     *  a quick first attest (connectWalletForSigning is rate-limited). */
+    private serverSessionInflight = new Map<string, Promise<string | null>>();
+    /** walletId -> prewarm bookkeeping for the cockpit status surface. */
+    private walletWarmth = new Map<string, { state: 'warming' | 'ready' | 'error'; startedAt: number; error?: string }>();
 
     override async init(): Promise<void> {
         this.on('createPassport', this.createPassport);
         this.on('submitPassport', this.submitPassport);
         this.on('listServerWallets', this.listServerWallets);
+        this.on('prewarmServerWallet', this.prewarmServerWallet);
+        this.on('serverWalletStatus', this.serverWalletStatus);
         this.on('recordWalletAttest', this.recordWalletAttest);
         this.on('recordWalletDisclosure', this.recordWalletDisclosure);
         this.on('recordWalletPredicate', this.recordWalletPredicate);
@@ -92,11 +99,22 @@ export default class ProducerService extends cds.ApplicationService {
      * `sendDetached` were tried here and deadlock (SQLITE_BUSY) against the
      * caller's open request tx.
      */
-    private async serverSigningSession(walletId?: string): Promise<string | null> {
+    private serverSigningSession(walletId?: string): Promise<string | null> {
         const secrets = producerWalletSecrets(walletId);
-        if (!secrets) return null;
+        if (!secrets) return Promise.resolve(null);
         const cached = this.serverSessions.get(secrets.id);
-        if (cached) return cached;
+        if (cached) return Promise.resolve(cached);
+        const inflight = this.serverSessionInflight.get(secrets.id);
+        if (inflight) return inflight;
+        const opening = this.openServerSession(secrets)
+            .finally(() => this.serverSessionInflight.delete(secrets.id));
+        this.serverSessionInflight.set(secrets.id, opening);
+        return opening;
+    }
+
+    private async openServerSession(
+        secrets: NonNullable<ReturnType<typeof producerWalletSecrets>>
+    ): Promise<string | null> {
         const { mnemonic, viewingKey } = secrets;
         try {
             const nightgate = await cds.connect.to('NightgateService');
@@ -108,6 +126,10 @@ export default class ProducerService extends cds.ApplicationService {
             // Remember the prewarm job: the detached anchor runner must await it
             // before its first submission (the facade does not exist until then).
             if (signing?.prewarmJobId) this.serverPrewarmJobs.set(sessionId, String(signing.prewarmJobId));
+            this.walletWarmth.set(secrets.id, {
+                state: signing?.prewarmJobId && signing?.prewarmStatus !== 'succeeded' ? 'warming' : 'ready',
+                startedAt: Date.now()
+            });
             this.serverSessions.set(secrets.id, sessionId);
             return sessionId;
         } catch (e: any) {
@@ -118,6 +140,9 @@ export default class ProducerService extends cds.ApplicationService {
                 '| code:', e?.code ?? '-',
                 '| cause:', e?.cause?.message ?? e?.reason ?? '-',
                 '| raw:', (() => { try { return JSON.stringify(e).slice(0, 300); } catch { return String(e); } })());
+            this.walletWarmth.set(secrets.id, {
+                state: 'error', startedAt: Date.now(), error: String(e?.message ?? e ?? 'session unavailable')
+            });
             return null;
         }
     }
@@ -134,6 +159,68 @@ export default class ProducerService extends cds.ApplicationService {
     /** The configured server wallets the cockpit can sign with (no secrets). */
     private listServerWallets = async () => {
         return listProducerWallets();
+    };
+
+    /**
+     * Kick off the signing-facade prewarm for a server wallet (cockpit login).
+     * Opening the session already starts the prewarm inside NIGHTGATE; the call
+     * returns as soon as the session exists, NOT when the wallet is synced.
+     */
+    private prewarmServerWallet = async (req: cds.Request) => {
+        const { walletId } = req.data as { walletId?: string };
+        const secrets = producerWalletSecrets(walletId);
+        if (!secrets) return req.reject(404, `unknown server wallet '${walletId ?? ''}'`);
+        const sessionId = await this.serverSigningSession(secrets.id);
+        if (!sessionId) {
+            const w = this.walletWarmth.get(secrets.id);
+            return { walletId: secrets.id, state: 'error', error: w?.error || 'signing session unavailable (see server log)' };
+        }
+        const w = this.walletWarmth.get(secrets.id);
+        return { walletId: secrets.id, state: w?.state ?? 'ready', error: w?.error ?? '' };
+    };
+
+    /**
+     * Warmth of a server wallet's facade for the cockpit header status. While
+     * 'warming', each call polls the prewarm job once; 'ready' means the wallet
+     * is synced to the chain tip. Never rejects on job-read hiccups; it just
+     * reports the last known state.
+     */
+    private serverWalletStatus = async (req: cds.Request) => {
+        const { walletId } = req.data as { walletId?: string };
+        const secrets = producerWalletSecrets(walletId);
+        if (!secrets) return req.reject(404, `unknown server wallet '${walletId ?? ''}'`);
+        const sessionId = this.serverSessions.get(secrets.id);
+        const warmth = this.walletWarmth.get(secrets.id);
+        if (!sessionId) {
+            // No session yet: either never prewarmed ('cold') or opening failed.
+            const state = warmth?.state === 'error' ? 'error' : 'cold';
+            return { walletId: secrets.id, state, sinceSeconds: 0, error: warmth?.error ?? '' };
+        }
+        let state: string = warmth?.state ?? 'ready';
+        let error = warmth?.error ?? '';
+        if (state === 'warming') {
+            const jobId = this.serverPrewarmJobs.get(sessionId);
+            if (!jobId) {
+                state = 'ready';
+            } else {
+                try {
+                    const nightgate = await cds.connect.to('NightgateService');
+                    const job: any = await sendDetached(nightgate, 'getJobStatus', { jobId, sessionId }, req.user);
+                    if (job?.status === 'succeeded') state = 'ready';
+                    else if (job?.status === 'failed') {
+                        state = 'error';
+                        error = `${job.errorCode ?? ''} ${job.errorMessage ?? ''}`.trim() || 'prewarm failed';
+                    }
+                } catch { /* job read hiccup: keep reporting 'warming' */ }
+            }
+            if (warmth && state !== 'warming') {
+                this.walletWarmth.set(secrets.id, { ...warmth, state: state as 'ready' | 'error', error });
+            }
+            // The prewarm job entry stays in serverPrewarmJobs on purpose: the
+            // first anchor run still awaits it (a completed job resolves instantly).
+        }
+        const sinceSeconds = warmth ? Math.round((Date.now() - warmth.startedAt) / 1000) : 0;
+        return { walletId: secrets.id, state, sinceSeconds, error };
     };
 
     private async passportRef(passportId: string) {
@@ -254,6 +341,9 @@ export default class ProducerService extends cds.ApplicationService {
         const hash = norm(txHash);
         const contract = contractAddress || row.contractAddress || this.contractAddress();
         const txRowId = cds.utils.uuid();
+        // Drop the draft placeholder ('attest'/'offline'); the real wallet attest
+        // row replaces it.
+        await DELETE.from(PassportTransactions).where({ passport_ID: row.ID, kind: 'attest', status: 'offline' });
         await INSERT.into(PassportTransactions).entries({
             ID: txRowId, passport_ID: row.ID, kind: 'attest', txHash: hash || null, identifier: identifier || null,
             status: 'pending', explorerUrl: hash ? txExplorerUrl(hash) : null
@@ -599,7 +689,23 @@ export default class ProducerService extends cds.ApplicationService {
         req: cds.Request, ID: string, passportId: string, payloadHash: string,
         passportIdHash: string, contractAddress: string, sessionId: string, includePayloadHash: boolean
     ) {
+        // The vault's attest circuit asserts the payload hash is not attested
+        // yet, so byte-identical confidential content can never anchor twice.
+        // Fail fast with a pointer instead of a detached job failure. Note the
+        // trap: Point-1 fields (model, weight, ...) are NOT part of the hash;
+        // only batteries / recycledMaterials / diligenceDocs are.
+        const dupe: any = await SELECT.one.from(Passports).columns('passportId')
+            .where({ payloadHash, status: { in: ['anchored', 'anchoring'] }, ID: { '!=': ID } } as any);
+        if (dupe) {
+            return req.reject(409,
+                `content is identical to passport '${dupe.passportId}' (same payloadHash; the vault rejects a second attest of the same hash). ` +
+                `Change a confidential field, e.g. a cell serial number. Point-1 fields like model or weight do not enter the hash.`);
+        }
         await UPDATE.entity(Passports).set({ status: 'anchoring' }).where({ ID });
+        // The draft placeholder ('attest'/'offline' from createPassport) is now
+        // superseded by the real anchor steps; without this it stays in the tx
+        // list next to the succeeded attest forever.
+        await DELETE.from(PassportTransactions).where({ passport_ID: ID, kind: 'attest', status: 'offline' });
         // Content-root inputs must be read HERE: the row's children may still be
         // uncommitted in this request's tx and invisible to a detached reader.
         let contentRoot: string | undefined;
@@ -700,25 +806,64 @@ export default class ProducerService extends cds.ApplicationService {
             await INSERT.into(DisclosureGrantLog).entries({ passport_ID: row.ID, grantee, level, op, status: 'offline' } as any);
             return { mode: 'offline', txHash: '' };
         }
-        const nightgate = await cds.connect.to('NightgateService');
+        // Detached like anchorRow/prove: record a pending log row, run the
+        // chain call after commit, let the client poll the row. The read gate
+        // ignores 'pending' rows (it only counts succeeded/offline), so a
+        // pending grant never elevates a tier early.
+        const grantLogId = cds.utils.uuid();
+        await INSERT.into(DisclosureGrantLog).entries({
+            ID: grantLogId, passport_ID: row.ID, grantee, level, op, status: 'pending'
+        } as any);
         const action = op === 'grant' ? 'grantDisclosure' : 'revokeDisclosure';
         const args: Record<string, unknown> = {
             payloadHash: row.payloadHash, grantee, sessionId: session,
             contractAddress, compiledArtifactRef: CONTRACT_REF
         };
         if (op === 'grant') args.level = level;
-        // Detached send + detached polling: this request only READS before the
-        // wait, so it never holds the write lock, but the NIGHTGATE job still
-        // needs its own pooled connection and committed job row to make
-        // progress (see detachedFromRequest in passport-anchor).
-        const res: any = await sendDetached(nightgate, action, args, req.user);
-        const txHash = await waitForJob(nightgate, res.jobId, session, req.user);
-        await INSERT.into(DisclosureGrantLog).entries({ passport_ID: row.ID, grantee, level, op, txHash, status: 'succeeded' } as any);
-        await INSERT.into(PassportTransactions).entries({
-            passport_ID: row.ID, kind: op === 'grant' ? 'grantDisclosure' : 'revokeDisclosure',
-            jobId: res.jobId, txHash, status: 'succeeded', explorerUrl: txExplorerUrl(txHash)
-        } as any);
-        return { mode: 'onchain', txHash };
+        const user = req.user;
+        (req as any).on('succeeded', () => {
+            void detachedFromRequest(() =>
+                this.runDisclosureDetached(grantLogId, row.ID, op, action, args, String(session), user)
+            ).catch((e: unknown) =>
+                cds.log('producer').error(`detached ${op} runner crashed for ${passportId}:`, e));
+        });
+        return { mode: op === 'grant' ? 'granting' : 'revoking', txHash: '', grantLogId };
+    }
+
+    /** The long-running on-chain leg of disclosure(); same pattern as the anchor/prove runners. */
+    private async runDisclosureDetached(
+        grantLogId: string, passportRowId: string, op: 'grant' | 'revoke',
+        action: string, args: Record<string, unknown>, sessionId: string, user: unknown
+    ): Promise<void> {
+        const log = cds.log('producer');
+        try {
+            const nightgate = await cds.connect.to('NightgateService');
+            const prewarmJob = this.serverPrewarmJobs.get(sessionId);
+            if (prewarmJob) {
+                this.serverPrewarmJobs.delete(sessionId);
+                await waitForJob(nightgate, prewarmJob, sessionId, user);
+            }
+            const res: any = await sendDetached(nightgate, action, args, user);
+            const txHash = await waitForJob(nightgate, res.jobId, sessionId, user);
+            await this.runDetached(async () => {
+                await UPDATE.entity(DisclosureGrantLog).set({ status: 'succeeded', txHash }).where({ ID: grantLogId });
+                await INSERT.into(PassportTransactions).entries({
+                    passport_ID: passportRowId, kind: op === 'grant' ? 'grantDisclosure' : 'revokeDisclosure',
+                    jobId: res.jobId, txHash, status: 'succeeded', explorerUrl: txExplorerUrl(txHash)
+                } as any);
+            });
+            log.info(`${op} settled for log ${grantLogId}: ${txHash}`);
+        } catch (e) {
+            const msg = String((e as Error)?.message ?? e).slice(0, 500);
+            log.warn(`${op} failed for log ${grantLogId}:`, e);
+            await this.runDetached(async () => {
+                await UPDATE.entity(DisclosureGrantLog).set({ status: 'failed' }).where({ ID: grantLogId });
+                await INSERT.into(PassportTransactions).entries({
+                    passport_ID: passportRowId, kind: op === 'grant' ? 'grantDisclosure' : 'revokeDisclosure',
+                    status: 'failed', errorMessage: msg
+                } as any);
+            });
+        }
     }
 
     // --- predicate proof -----------------------------------------------------
@@ -760,34 +905,107 @@ export default class ProducerService extends cds.ApplicationService {
         const proof = tree.proofFor(field);
         if (!proof) return req.reject(400, `field '${field}' is not a provable field`);
 
-        const nightgate = await cds.connect.to('NightgateService');
-        try {
-            // Detached for the same reason as in disclosure(): the job must be
-            // able to run while this request is still open.
-            const res: any = await sendDetached(nightgate, 'issueFieldPredicateAttestation', {
-                payloadHash: row.payloadHash, fieldKey: proof.fieldKey, value: proof.value,
-                contentRoot: tree.contentRoot,
-                siblingsJson: JSON.stringify(proof.siblings), dirsJson: JSON.stringify(proof.dirs),
-                predicate: pred, threshold: thresholdScaled, unit: useUnit,
-                sessionId: session, contractAddress, compiledArtifactRef: CONTRACT_REF
-            }, req.user);
-            const txHash = await waitForJob(nightgate, res.jobId, session, req.user);
-            await INSERT.into(PredicateProofLog).entries({
-                passport_ID: row.ID, sourceField: field, predicate: pred, threshold: thresholdScaled,
-                unit: useUnit, predicateAttestationId: res.predicateAttestationId, txHash, status: 'succeeded', result: true
-            } as any);
-            await INSERT.into(PassportTransactions).entries({
-                passport_ID: row.ID, kind: 'provePredicate', jobId: res.jobId, txHash,
-                status: 'succeeded', explorerUrl: txExplorerUrl(txHash)
-            } as any);
-            return { mode: 'onchain', txHash, predicateAttestationId: String(res.predicateAttestationId ?? ''), result: true };
-        } catch (e) {
-            // A rejected predicate (value fails the bound) surfaces as a failed tx.
-            await INSERT.into(PredicateProofLog).entries({
-                passport_ID: row.ID, sourceField: field, predicate: pred, threshold: thresholdScaled,
-                unit: useUnit, status: 'failed', result: false
-            } as any);
-            return { mode: 'onchain', txHash: '', predicateAttestationId: '', result: false, error: String((e as Error)?.message ?? e) };
-        }
+        // Detached like anchorRow: the ZK proof takes tens of seconds; holding
+        // the request (and the UI) open for it is pointless and its request tx
+        // would go snapshot-stale. Record a pending log row now, run the proof
+        // after commit, and let the client poll the row.
+        const proofLogId = cds.utils.uuid();
+        await INSERT.into(PredicateProofLog).entries({
+            ID: proofLogId, passport_ID: row.ID, sourceField: field, predicate: pred,
+            threshold: thresholdScaled, unit: useUnit, status: 'pending'
+        } as any);
+        const args = {
+            payloadHash: row.payloadHash, fieldKey: proof.fieldKey, value: proof.value,
+            contentRoot: tree.contentRoot,
+            siblingsJson: JSON.stringify(proof.siblings), dirsJson: JSON.stringify(proof.dirs),
+            predicate: pred, threshold: thresholdScaled, unit: useUnit,
+            sessionId: session, contractAddress, compiledArtifactRef: CONTRACT_REF
+        };
+        const user = req.user;
+        (req as any).on('succeeded', () => {
+            void detachedFromRequest(() =>
+                this.runProveDetached(proofLogId, row.ID, args, user)
+            ).catch((e: unknown) =>
+                cds.log('producer').error(`detached prove runner crashed for ${row.passportId}:`, e));
+        });
+        return { mode: 'proving', txHash: '', predicateAttestationId: '', result: null, proofLogId };
     };
+
+    /**
+     * The long-running leg of provePassportValue. The field-bound proof job
+     * submits TWO txs (anchorContentRoot, then proveFieldPredicate); the job
+     * result is a PAC envelope whose tx hash sits at `proof.proofValue`. The
+     * content-root tx hash is not in the result at all, so it is read back
+     * from the plugin's `midnight.PendingSubmissions` log.
+     */
+    private async runProveDetached(
+        proofLogId: string, passportRowId: string,
+        args: Record<string, unknown> & { sessionId: string; contractAddress: string },
+        user: unknown
+    ): Promise<void> {
+        const log = cds.log('producer');
+        const startedAt = new Date().toISOString();
+        try {
+            const nightgate = await cds.connect.to('NightgateService');
+            // First action on a fresh server session: await the facade prewarm
+            // once, same as the anchor runner.
+            const prewarmJob = this.serverPrewarmJobs.get(args.sessionId);
+            if (prewarmJob) {
+                this.serverPrewarmJobs.delete(args.sessionId);
+                await waitForJob(nightgate, prewarmJob, args.sessionId, user);
+            }
+            const res: any = await sendDetached(nightgate, 'issueFieldPredicateAttestation', args, user);
+            const jobResult: any = await waitForJobResult(nightgate, res.jobId, args.sessionId, user);
+            const txHash = String(jobResult?.proof?.proofValue ?? jobResult?.txHash ?? '');
+            const paId = String(res.predicateAttestationId ?? jobResult?.predicateAttestationId ?? '');
+            const rootTxHash = await this.contentRootTxOf(args.sessionId, args.contractAddress, startedAt);
+            await this.runDetached(async () => {
+                await UPDATE.entity(PredicateProofLog).set({
+                    status: 'succeeded', result: true, txHash, predicateAttestationId: paId
+                }).where({ ID: proofLogId });
+                if (rootTxHash) {
+                    await INSERT.into(PassportTransactions).entries({
+                        passport_ID: passportRowId, kind: 'anchorContentRoot', jobId: res.jobId,
+                        txHash: rootTxHash, status: 'succeeded', explorerUrl: txExplorerUrl(rootTxHash)
+                    } as any);
+                }
+                await INSERT.into(PassportTransactions).entries({
+                    passport_ID: passportRowId, kind: 'provePredicate', jobId: res.jobId, txHash,
+                    status: 'succeeded', explorerUrl: txExplorerUrl(txHash)
+                } as any);
+            });
+            log.info(`predicate proven for log ${proofLogId}: ${txHash}`);
+        } catch (e) {
+            // A rejected predicate (value fails the bound) also lands here.
+            const msg = String((e as Error)?.message ?? e).slice(0, 500);
+            log.warn(`predicate proof failed for log ${proofLogId}:`, e);
+            await this.runDetached(async () => {
+                await UPDATE.entity(PredicateProofLog).set({ status: 'failed', result: false }).where({ ID: proofLogId });
+                await INSERT.into(PassportTransactions).entries({
+                    passport_ID: passportRowId, kind: 'provePredicate', status: 'failed', errorMessage: msg
+                } as any);
+            });
+        }
+    }
+
+    /**
+     * The content-root anchor tx of the proof job just completed: the newest
+     * `anchorContentRoot` submission of this session/contract since the job
+     * started, from the plugin's own submission log. Best-effort (null if the
+     * lookup fails); the proof tx itself never depends on it.
+     */
+    private async contentRootTxOf(sessionId: string, contractAddress: string, sinceIso: string): Promise<string | null> {
+        try {
+            const rows: any[] = await cds.db.read('midnight.PendingSubmissions')
+                .columns('txHash', 'submittedAt')
+                .where({ sessionId, contractAddress, circuitName: 'anchorContentRoot' })
+                .and('submittedAt >=', sinceIso)
+                .orderBy('submittedAt desc')
+                .limit(1);
+            return rows?.[0]?.txHash ?? null;
+        } catch (e) {
+            cds.log('producer').warn('content-root tx lookup skipped:', (e as Error)?.message);
+            return null;
+        }
+    }
 }

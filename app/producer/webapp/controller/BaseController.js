@@ -31,6 +31,12 @@ sap.ui.define([
         .finally(function () { that.setBusy(false); });
     },
 
+    // The cockpit's single-role auth header (same principal App.controller puts
+    // on the OData model) for direct fetch calls: collection functions, polling.
+    _authHeaders: function () {
+      return { Authorization: "Basic " + window.btoa("producer:producer") };
+    },
+
     explorerTx: function (sHash) {
       return sHash ? "https://preview.midnightexplorer.com/transactions/0x" + String(sHash).replace(/^0x/, "") : "";
     },

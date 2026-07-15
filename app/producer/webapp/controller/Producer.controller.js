@@ -9,9 +9,14 @@ sap.ui.define([
 
   // Prefilled battery-passport example (EU 2023/1542 Annex XIII), editable in the
   // create dialog. Public Point-1 fields + the private (restricted) content.
+  // The passportId AND the cell serial are stamped unique per dialog open: the
+  // on-chain payloadHash covers ONLY the confidential content (batteries /
+  // recycled / diligence), and the vault rejects a second attest of the same
+  // hash. A static example serial made every unedited draft byte-identical.
   function defaultDraft() {
+    var sStamp = new Date().toISOString().replace(/[-:T]/g, "").slice(2, 14);
     return {
-      passportId: "BAT-PROD-0001",
+      passportId: "BAT-PROD-" + sStamp,
       manufacturerId: "DE-CELLCO-001",
       batteryCategory: "EV",
       model: "PowerCell EV-75",
@@ -19,7 +24,7 @@ sap.ui.define([
       weightKg: 432.5,
       performanceClass: "B",
       battery: {
-        serialNumber: "SN-AX-0001",
+        serialNumber: "SN-AX-" + sStamp,
         cellChemistry: "NMC-811",
         capacityKwh: 75.0,
         carbonFootprintKgCO2: 3412.75,

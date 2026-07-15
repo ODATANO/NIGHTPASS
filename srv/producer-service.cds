@@ -67,6 +67,30 @@ service ProducerService {
     };
 
     /**
+     * Open (or reuse) the signing session for a server wallet and kick off the
+     * NIGHTGATE facade prewarm right away, so the first attest does not pay the
+     * wallet-sync wait. Called by the cockpit when a server wallet is picked at
+     * login. Returns immediately; poll `serverWalletStatus` for readiness.
+     */
+    action prewarmServerWallet(walletId: String) returns {
+        walletId: String;
+        state:    String;  // 'warming' | 'ready' | 'error'
+        error:    String;
+    };
+
+    /**
+     * Warmth of a server wallet's signing facade, for the cockpit's header
+     * status surface. 'ready' means the prewarm finished, i.e. the wallet is
+     * synced to the chain tip and the next attest signs without a sync wait.
+     */
+    function serverWalletStatus(walletId: String) returns {
+        walletId:     String;
+        state:        String;   // 'cold' | 'warming' | 'ready' | 'error'
+        sinceSeconds: Integer;  // seconds since the session/prewarm was opened
+        error:        String;
+    };
+
+    /**
      * Record a wallet-driven (in-app Lace) attest tx in the cockpit: logs a
      * PassportTransactions row and marks the passport anchored. Called by the
      * Fiori app after the browser wallet flow submits, so the transaction
@@ -163,7 +187,12 @@ service ProducerService {
         status: String;   // pending until the tx is verified on-chain (then succeeded/failed)
     };
 
-    /** Grant a disclosure level (0=public, 1=recycler, 2=authority) to a grantee. */
+    /**
+     * Grant a disclosure level (0=public, 1=recycler, 2=authority) to a grantee.
+     * With a signing session the chain call runs DETACHED: the action returns
+     * `mode: 'granting'` immediately with the pending DisclosureGrantLog row id;
+     * poll that row until it leaves 'pending'.
+     */
     action grantPassportDisclosure(
         passportId: String,
         grantee:    String,
@@ -171,19 +200,21 @@ service ProducerService {
         sessionId:  UUID,
         walletId:   String   // optional: which SERVER wallet signs
     ) returns {
-        mode:   String;
-        txHash: String;
+        mode:       String;  // 'granting' | 'offline'
+        txHash:     String;
+        grantLogId: String;  // DisclosureGrantLog row to poll (mode 'granting')
     };
 
-    /** Revoke a previously granted disclosure. */
+    /** Revoke a previously granted disclosure. Detached like grant (`mode: 'revoking'`). */
     action revokePassportDisclosure(
         passportId: String,
         grantee:    String,
         sessionId:  UUID,
         walletId:   String   // optional: which SERVER wallet signs
     ) returns {
-        mode:   String;
-        txHash: String;
+        mode:       String;  // 'revoking' | 'offline'
+        txHash:     String;
+        grantLogId: String;  // DisclosureGrantLog row to poll (mode 'revoking')
     };
 
     /**
@@ -191,6 +222,10 @@ service ProducerService {
      * threshold, in zero-knowledge, without revealing the value. Defaults the
      * value to the passport's battery `carbonFootprintKgCO2` when `sourceField`
      * is that field. The value is a witness — never stored.
+     *
+     * With a signing session the proof runs DETACHED (like submitPassport):
+     * the action returns `mode: 'proving'` immediately with the pending
+     * PredicateProofLog row id; poll that row until it leaves 'pending'.
      */
     action provePassportValue(
         passportId:  String,
@@ -201,9 +236,10 @@ service ProducerService {
         sessionId:   UUID,
         walletId:    String    // optional: which SERVER wallet signs
     ) returns {
-        mode:                   String;
+        mode:                   String;  // 'proving' | 'offline'
         txHash:                 String;
         predicateAttestationId: String;
         result:                 Boolean;
+        proofLogId:             String;  // PredicateProofLog row to poll (mode 'proving')
     };
 }

@@ -4,6 +4,14 @@
   xmlns="sap.m">
   <Page title="Battery Passports" showNavButton="false">
     <headerContent>
+      <!-- Signing-facade warmth (server mode): syncing vs. at chain tip. -->
+      <ObjectStatus
+        text="{= ${session>/warmth/state} === 'warming' ? 'wallet syncing (' + (${session>/warmth/sinceSeconds} || 0) + 's)…' : ${session>/warmth/state} === 'ready' ? 'wallet at chain tip' : 'wallet sync error' }"
+        state="{= ${session>/warmth/state} === 'ready' ? 'Success' : ${session>/warmth/state} === 'error' ? 'Error' : 'Warning' }"
+        icon="{= ${session>/warmth/state} === 'ready' ? 'sap-icon://connected' : 'sap-icon://synchronize' }"
+        tooltip="{session>/warmth/error}"
+        visible="{= ${session>/mode} === 'server' &amp;&amp; !!${session>/warmth/state} }"
+        class="sapUiTinyMarginEnd"/>
       <ObjectStatus
         text="{= (${session>/mode} === 'server' ? 'server wallet: ' : 'Lace: ') + ${session>/signerLabel} + ' · ' + ${session>/ownerShort} }"
         state="Success" visible="{session>/connected}"

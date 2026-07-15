@@ -195,10 +195,12 @@ var API = "/api/v1/passport";
     });
   }
 
-  /** The rows THIS instance explores: anchored work on its own network only. */
+  /** The rows THIS instance explores: anchored work on its own network only.
+   * Drafts and failed anchor attempts are producer-internal state, not part
+   * of the public record. */
   function ownRows() {
     return state.rows.filter(function (r) {
-      return r.anchorNetwork === state.network && r.status !== "draft";
+      return r.anchorNetwork === state.network && r.status !== "draft" && r.status !== "failed";
     });
   }
 
