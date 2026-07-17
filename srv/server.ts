@@ -32,11 +32,24 @@ cds.on('bootstrap', (app: any) => {
                 p.startsWith('/qr/') ||
                 p.startsWith('/p/') ||
                 p.startsWith('/resolve/') ||
-                (p.startsWith('/api/v1/passport') && req.method === 'GET');
+                (p.startsWith('/api/v1/passport') && req.method === 'GET') ||
+                // Conformance surface stays reachable when explicitly enabled
+                // (throwaway tunnel instances for the BatteryPass-Ready executor).
+                (p.startsWith('/dpp-api') && process.env.DPP_API_ENABLED === 'true');
             if (!allowed) return res.status(404).json({ error: 'not on this surface' });
             next();
         });
         app.get('/', (_req: any, res: any) => res.redirect(302, '/explorer/'));
+    }
+
+    // --- BatteryPass-Ready conformance surface (DPP_API_ENABLED=true) --------
+    // DPP Life Cycle API v1.1 + TestAdapter for the official test executor.
+    // Off by default: it is a write-capable, in-memory test surface meant for
+    // throwaway instances behind a tunnel, never for the work instance.
+    if (process.env.DPP_API_ENABLED === 'true') {
+        const { createDppApiRouter } = require('./lib/dpp-api');
+        app.use('/dpp-api', createDppApiRouter());
+        console.log('[dpp-api] BatteryPass-Ready conformance surface mounted at /dpp-api (v1 + adapter)');
     }
 
     // --- Tier resolver: GET /p/:passportId -----------------------------------

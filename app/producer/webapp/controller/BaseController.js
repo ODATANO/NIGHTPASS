@@ -7,6 +7,29 @@ sap.ui.define([
 
   return Controller.extend("producer.controller.BaseController", {
 
+    // Render a guide-attribute valueJson fragment as readable text: scalars
+    // as-is, {value, unit} pairs as "200 Ah", nested objects as key: value.
+    formatAttrValue: function (sJson) {
+      var v;
+      try { v = JSON.parse(sJson); } catch (e) { return sJson || ""; }
+      if (v === null || v === undefined) { return ""; }
+      if (typeof v !== "object") { return String(v); }
+      var aKeys = Object.keys(v);
+      if (aKeys.length === 1) {
+        var vOnly = v[aKeys[0]];
+        return typeof vOnly === "object" ? JSON.stringify(vOnly) : String(vOnly);
+      }
+      var aNum = aKeys.filter(function (k) { return typeof v[k] === "number"; });
+      var sUnit = aKeys.find(function (k) {
+        return typeof v[k] === "string" && String(v[k]).length <= 14 && aNum.indexOf(k) < 0;
+      });
+      if (aNum.length === 1 && sUnit) { return v[aNum[0]] + " " + v[sUnit]; }
+      return aKeys.map(function (k) {
+        var val = v[k];
+        return k + ": " + (typeof val === "object" ? JSON.stringify(val) : val);
+      }).join(", ");
+    },
+
     _model: function () { return this.getOwnerComponent().getModel(); },
     _session: function () { return this.getOwnerComponent().getModel("session"); },
     _router: function () { return this.getOwnerComponent().getRouter(); },

@@ -80,3 +80,7 @@ zz-*.mjs
 
 docs/one-pager.md
 docs/demo-script.md
+# BatteryPass-Ready conformance evidence (local working docs; contains
+# third-party material from the GEFEG test environment, not for publishing)
+docs/batterypass-gap-analysis.md
+docs/batterypass-ready/

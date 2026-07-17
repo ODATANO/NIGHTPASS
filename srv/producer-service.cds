@@ -29,6 +29,7 @@ service ProducerService {
     entity Batteries            as projection on passport.Batteries;
     entity RecycledMaterials    as projection on passport.RecycledMaterials;
     entity DiligenceDoc         as projection on passport.DiligenceDoc;
+    entity PassportAttributes   as projection on passport.PassportAttributes;
 
     // Registered dataspace partners (recyclers / authorities) for the grant picker.
     @readonly

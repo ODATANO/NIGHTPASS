@@ -58,6 +58,8 @@
           <Link text="{qrCodeUrl}" href="{qrCodeUrl}" target="_blank" class="npMono"/>
         </form:SimpleForm>
 
+        <core:Fragment fragmentName="passport.view.AttributesPanel" type="XML"/>
+
         <!-- Live on-chain verification: anonymous check against the Midnight
              ledger that this passport's payload hash is anchored (verifyOnChain). -->
         <VBox class="sapUiSmallMarginTop npVerifyBox">

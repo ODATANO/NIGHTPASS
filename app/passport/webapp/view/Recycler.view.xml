@@ -66,6 +66,8 @@
           </Table>
         </Panel>
 
+        <core:Fragment fragmentName="passport.view.AttributesPanel" type="XML"/>
+
         <!-- Live on-chain verification (anonymous verifyOnChain function). -->
         <VBox class="sapUiSmallMarginTop npVerifyBox">
           <Button text="Verify on Midnight" icon="sap-icon://chain-link"

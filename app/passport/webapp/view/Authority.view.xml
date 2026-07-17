@@ -87,6 +87,8 @@
           </Table>
         </Panel>
 
+        <core:Fragment fragmentName="passport.view.AttributesPanel" type="XML"/>
+
         <Panel headerText="On-chain anchor (Midnight)" expandable="true" expanded="true">
           <form:SimpleForm editable="false" layout="ResponsiveGridLayout" labelSpanL="3" labelSpanM="4">
             <Label text="Payload hash"/>

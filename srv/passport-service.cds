@@ -37,6 +37,11 @@ service PassportService {
     @readonly
     entity DiligenceDoc      as projection on passport.DiligenceDoc;
 
+    // Guide-format attributes (BatteryPass-Ready). Rows are filtered per
+    // requester tier by their longlist accessClass in the after-READ handler.
+    @readonly
+    entity PassportAttributes as projection on passport.PassportAttributes;
+
     // Registered dataspace partners (secret never served).
     @readonly
     entity Partners          as

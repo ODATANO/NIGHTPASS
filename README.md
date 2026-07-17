@@ -16,6 +16,8 @@ NIGHTPASS implements the EU Battery Passport. One dataset is exposed with a diff
 
 It consumes [`@odatano/nightgate`](https://github.com/ODATANO/NIGHTGATE) as a CAP plugin, which provides the contract, the ZK proof library, and the Nightgate worker for async on-chain submission.
 
+NIGHTPASS passes the official [BatteryPass-Ready](https://batterypass-ready.gefeg.com/) test environment (GEFEG / Fraunhofer IPK, DIN DKE SPEC 99100): zero-error data validation and all 11 interoperability scenarios of the DPP Life Cycle API, including the access-rights checks, verified 2026-07-17. On top of the standard API, a NIGHTPASS extension (`GET /dpp-api/v1/dpps/{id}/verification`) lets any caller verify a served passport live against its Midnight anchor.
+
 ## How it works, in short
 
 - **Disclosure tiers** (Annex XIII): consumer sees public metadata, recycler additionally chemistry / capacity / recycled shares, authority everything including supplier identities. Enforced server-side by `after READ` handlers; an active on-chain disclosure grant elevates a partner's tier per passport.
@@ -26,18 +28,18 @@ It consumes [`@odatano/nightgate`](https://github.com/ODATANO/NIGHTGATE) as a CA
 
 ### Live example (Midnight preview)
 
-One passport, end to end: `BAT-PRODA-20260713190211`, created and server-signed by an independent producer wallet, anchored 2026-07-13, three zero-knowledge predicate proofs added 2026-07-15. The proof transactions prove each claim against the passport's anchored content root; the value enters only as a private witness, and the ledger accepts the transaction only if the in-circuit asserts hold, so an included tx IS the verified proof.
+One passport, end to end: `BAT-FRESH-20260717125619`, created through the standard producer flow (all 65 guide attributes seeded automatically and included in the anchored payload hash), zero-error validated by the official BatteryPass-Ready test environment, then server-signed, anchored and predicate-proven on Midnight preview on 2026-07-17. `verifyOnChain` confirms the anchor live against the indexer. The proof transactions prove each claim against the passport's anchored content root; the value enters only as a private witness, and the ledger accepts the transaction only if the in-circuit asserts hold, so an included tx IS the verified proof.
 
 | Step | Transaction |
 |---|---|
-| attest (payload hash into the vault) | [`86cd6783...97ae6759`](https://preview.midnightexplorer.com/transactions/0x86cd678313a7d793b9cc12ae056b26a25d31a11a90d041062c98be3997ae6759) |
-| bindPassport (passport id -> payload hash) | [`69b41b10...7c00fcdb`](https://preview.midnightexplorer.com/transactions/0x69b41b10a9c777340faf2418f295c9249fb1bf7244a40e05fd8ea7837c00fcdb) |
-| anchorContentRoot (Merkle root over provable fields) | [`d420ac09...b7970cf8`](https://preview.midnightexplorer.com/transactions/0xd420ac09ec33cb558e59b3c567247af34e02ee747df2422b40472663b7970cf8) |
-| prove: carbon footprint <= 4000 kg CO2 / kWh (value hidden) | [`16c13b72...41623223`](https://preview.midnightexplorer.com/transactions/0x16c13b7231690776e71180a0301d5662b58d2cf1c98c0b975c6b469d41623223) |
-| prove: recycled content >= 16 % (value hidden) | [`a31c0c40...1136cbc4`](https://preview.midnightexplorer.com/transactions/0xa31c0c404a8c7138feecbe05a5c60f93fe626390c3a0e73fe461cafa1136cbc4) |
-| prove: lead content <= 100 ppm (value hidden) | [`64fc655c...bb909dbf`](https://preview.midnightexplorer.com/transactions/0x64fc655c59eb7c5e2e7ad0df4ac9a012c1dec2f8deb1ca53f99e1dfbbb909dbf) |
+| attest (payload hash into the vault) | [`6071a396...248673b8`](https://preview.midnightexplorer.com/transactions/0x6071a39608d172d3a7a3b34593263992e7621f7d9e7250e533d1f1fd248673b8) |
+| bindPassport (passport id -> payload hash) | [`374c61d9...e0df2cb4`](https://preview.midnightexplorer.com/transactions/0x374c61d9777a67f2e1e8d9a05a39ef394989e6671c4cc8a64fc35d23e0df2cb4) |
+| anchorContentRoot (Merkle root over provable fields) | [`f7f10047...6512a0aa`](https://preview.midnightexplorer.com/transactions/0xf7f10047e248b726ec7c22b36efe4086fe7ccece068978fd72f8132a6512a0aa) |
+| prove: carbon footprint <= 4000 kg CO2e (value hidden) | [`771e6b7f...171581e2`](https://preview.midnightexplorer.com/transactions/0x771e6b7fdcacc8638f9aefa27b8d919ed80793a4a4f7156466d353f7171581e2) |
+| prove: recycled cobalt share >= 16 % (value hidden) | [`f632a4fc...9bdda074`](https://preview.midnightexplorer.com/transactions/0xf632a4fc6e336c576924ff618fab00d95aa6d154601d1149dde9af9e9bdda074) |
+| prove: usable capacity >= 70 kWh (value hidden) | [`33cffbeb...41dfa669`](https://preview.midnightexplorer.com/transactions/0x33cffbeb5ebfdc97fcaf4d26e6693db3399a9991e45e26cf216248c441dfa669) |
 
-Vault contract: `dcd297ba6a335a5d64916a6f2e36151c7490baa119fd022c846944918d9cde69`. (Each proof run also re-anchors the content root before proving, an idempotent write of the same root value; those bookkeeping transactions are omitted here.)
+Vault contract: `f7c755235cc9408bc6664f7cae88b445798726ccdf9a6a560e7c873c807aabe1`. (Each proof run also re-anchors the content root before proving, an idempotent write of the same root value; those bookkeeping transactions are omitted here. The Midnight preview testnet was reset on 2026-07-16; this example lives on the current network.)
 
 ## Documentation
 

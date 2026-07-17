@@ -9,6 +9,7 @@ import {
     buildContentRoot, fieldKeyHex, BATTERY_PROVABLE_FIELDS,
     effectiveNetwork, explorerTxUrl
 } from './lib/passport-anchor';
+import { defaultGuideAttributes, hashableAttributes } from './lib/guide-attribute-defaults';
 import { listProducerWallets, producerWalletSecrets } from './lib/producer-wallets';
 import { verifyContractTx, type ChainVerdict } from './lib/chain-verify';
 import { verifyAttestState, verifyGrantState, verifyPredicateState } from './lib/state-verify';
@@ -273,7 +274,14 @@ export default class ProducerService extends cds.ApplicationService {
         const batteries = input.batteries ?? [];
         const recycledMaterials = input.recycledMaterials ?? [];
         const diligenceDocs = input.diligenceDocs ?? [];
-        const { canonicalPayload, payloadHash } = hashPayload({ batteries, recycledMaterials, diligenceDocs });
+        // Guide-format attributes (DIN DKE SPEC 99100 longlist): caller rows or
+        // the default set; part of the anchored payload, canonically sorted.
+        const attributes = (input as any).attributes?.length
+            ? hashableAttributes((input as any).attributes)
+            : hashableAttributes(defaultGuideAttributes({
+                passportId, model: input.model, performanceClass: input.performanceClass,
+            }));
+        const { canonicalPayload, payloadHash } = hashPayload({ batteries, recycledMaterials, diligenceDocs, attributes });
         const passportIdHash = blake2b256Hex(passportId);
         const payloadCipher = encryptPayload(canonicalPayload, passportId);
 
@@ -300,7 +308,8 @@ export default class ProducerService extends cds.ApplicationService {
             status: 'draft',
             batteries: batteries.map((b) => ({ ...b })),
             recycledMaterials: recycledMaterials.map((m) => ({ ...m })),
-            diligenceDocs: diligenceDocs.map((d) => ({ docType: d.docType }))
+            diligenceDocs: diligenceDocs.map((d) => ({ docType: d.docType })),
+            attributes: attributes.map((a) => ({ ...a }))
         } as any);
 
         const session = submit ? await this.effectiveSession(sessionId, walletId) : null;

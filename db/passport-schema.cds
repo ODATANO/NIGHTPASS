@@ -104,6 +104,49 @@ entity Passports : cuid, managed {
     batteries         : Composition of many Batteries        on batteries.passport = $self;
     recycledMaterials : Composition of many RecycledMaterials on recycledMaterials.passport = $self;
     diligenceDocs     : Composition of many DiligenceDoc      on diligenceDocs.passport = $self;
+    attributes        : Composition of many PassportAttributes on attributes.passport = $self;
+}
+
+/** Access class per the official Data Attribute Longlist (DIN DKE SPEC 99100). */
+type AttributeAccessClass : String enum { public; legitimateInterest; authority; }
+
+/**
+ * Guide-format passport attributes beyond the typed fields above. One row per
+ * official BatteryPass-Ready attribute (GEFEG guide names, e.g. "RatedCapacity",
+ * "SeparateCollectionSymbol"); `valueJson` holds the exact JSON fragment the
+ * guide payload expects, so the payload builder merges rows mechanically.
+ * `accessClass` carries the longlist access classification and is the
+ * disclosure gate for these rows (public → consumer, legitimateInterest →
+ * recycler, authority → authority). Typed fields stay the source of truth
+ * where both exist; rows here only fill guide attributes the typed schema
+ * does not model.
+ */
+@assert.unique: { attr: [ passport, attribute ] }
+entity PassportAttributes : cuid {
+    passport    : Association to Passports;
+    section     : String(80);        // Battery_Passport section, e.g. PerformanceAndDurability
+    attribute   : String(200);       // official guide attribute name
+    valueJson   : LargeString;       // JSON fragment as the guide payload expects it
+    accessClass : AttributeAccessClass default #public;
+}
+
+/**
+ * Versioned DPP documents held by the BatteryPass-Ready conformance surface
+ * (DPP Life Cycle API, srv/lib/dpp-api.ts; mounted only with
+ * DPP_API_ENABLED=true). One row per document VERSION; the highest version of
+ * a dppId is the current one. Not a service projection on purpose: the DPP
+ * API is a spec-shaped REST surface, and the executor's TestTeardown wipes
+ * this table. Anchored NIGHTPASS passports are NOT stored here; they are
+ * rendered read-through from Passports + PassportAttributes.
+ */
+@assert.unique: { rev: [ dppId, version ] }
+entity DppDocuments : cuid {
+    dppId     : String(200);
+    productId : String(200);
+    version   : Integer;
+    status    : String(20);          // draft | active | archived | deleted
+    document  : LargeString;         // guide-format JSON (Battery_Passport root)
+    validFrom : Timestamp;
 }
 
 /**

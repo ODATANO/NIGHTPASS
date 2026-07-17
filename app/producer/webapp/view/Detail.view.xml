@@ -71,6 +71,7 @@
                 </ColumnListItem>
               </items>
             </Table>
+            <core:Fragment fragmentName="producer.view.AttributesPanel" type="XML"/>
           </IconTabFilter>
 
           <!-- Disclosure -->

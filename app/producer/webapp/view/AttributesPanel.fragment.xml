@@ -1,0 +1,26 @@
+<core:FragmentDefinition xmlns="sap.m" xmlns:core="sap.ui.core">
+  <!-- Guide-format passport attributes (DIN DKE SPEC 99100 longlist). Created
+       automatically with the passport and part of the anchored payload hash;
+       the producer sees all rows incl. their disclosure class. -->
+  <Panel headerText="Passport attributes (DIN DKE SPEC 99100)" expandable="true" expanded="false"
+         class="sapUiSmallMarginTop">
+    <Table items="{ path: 'attributes', sorter: { path: 'section' }, parameters: { $select: 'accessClass' } }"
+           noDataText="No passport attributes.">
+      <columns>
+        <Column width="20%" demandPopin="true" minScreenWidth="Tablet"><Text text="Section"/></Column>
+        <Column width="34%"><Text text="Attribute"/></Column>
+        <Column><Text text="Value"/></Column>
+        <Column width="12rem"><Text text="Access"/></Column>
+      </columns>
+      <ColumnListItem>
+        <cells>
+          <Text text="{section}"/>
+          <Text text="{attribute}"/>
+          <Text text="{ path: 'valueJson', formatter: '.formatAttrValue' }"/>
+          <ObjectStatus text="{accessClass}"
+                        state="{= ${accessClass} === 'public' ? 'Success' : ${accessClass} === 'authority' ? 'Error' : 'Warning' }"/>
+        </cells>
+      </ColumnListItem>
+    </Table>
+  </Panel>
+</core:FragmentDefinition>

@@ -2,6 +2,7 @@ import cds from '@sap/cds';
 import QRCode from 'qrcode';
 import { Passport, Passports, PredicateProofLog, Partners } from '#cds-models/passport';
 import { hashPayload, blake2b256Hex, encryptPayload, anchorPassport, effectiveNetwork, explorerTxUrl, verifyPeers } from './lib/passport-anchor';
+import { defaultGuideAttributes, hashableAttributes } from './lib/guide-attribute-defaults';
 import { granteeIdForDid } from './lib/grantee';
 import { rowToBatch, type Batch, type GoodsReceiptRow } from './lib/goods-receipt';
 
@@ -131,6 +132,15 @@ function redactPassport(row: Record<string, unknown>, tier: Tier): void {
     if (Array.isArray(row.batteries)) row.batteries.forEach((b) => redactBattery(b, tier));
     if (Array.isArray(row.recycledMaterials)) row.recycledMaterials.forEach((m) => redactRecycled(m, tier));
     if (tier !== 'authority') row.diligenceDocs = [];
+    // Guide-format attributes carry their own longlist access class per row.
+    // Fail closed: a row whose accessClass was not selected ($expand with a
+    // narrow $select) cannot be classified and is only served to authority.
+    if (Array.isArray(row.attributes)) {
+        row.attributes = row.attributes.filter((a) => {
+            const cls = (a as Record<string, unknown>)?.accessClass;
+            return typeof cls === 'string' ? attributeVisible(cls, tier) : tier === 'authority';
+        });
+    }
 }
 
 /**
@@ -149,6 +159,13 @@ function redactBattery(row: Record<string, unknown>, tier: Tier): void {
 function redactRecycled(row: Record<string, unknown>, tier: Tier): void {
     if (tier === 'consumer') { strip(row, Object.keys(row)); return; }
     if (tier !== 'authority') strip(row, ['sourceSupplierName']);
+}
+
+/** Which longlist access classes a tier may read (guide-format attribute rows). */
+function attributeVisible(accessClass: unknown, tier: Tier): boolean {
+    if (accessClass === 'authority') return tier === 'authority';
+    if (accessClass === 'legitimateInterest') return tier !== 'consumer';
+    return true; // public (also rows with no class yet)
 }
 
 function asRows(data: unknown): Record<string, unknown>[] {
@@ -232,6 +249,16 @@ export default class PassportService extends cds.ApplicationService {
             const tier = localTierOf(req);
             asRows(data).forEach((row) => redactRecycled(row, tier));
         });
+        // Direct and nav-property reads on the guide-attribute rows: restrict
+        // BEFORE the database via a tier where-clause. Row-level after-READ
+        // filtering is not enough here: clients control $select, and a row
+        // fetched without its accessClass column cannot be classified anymore.
+        this.before('READ', 'PassportAttributes', (req) => {
+            const tier = localTierOf(req);
+            if (tier === 'authority') return;
+            const allowed = tier === 'recycler' ? ['public', 'legitimateInterest'] : ['public'];
+            (req.query as any).where({ accessClass: { in: allowed } });
+        });
         // DiligenceDoc is authority-only in full; below-tier requests get nothing.
         this.after('READ', 'DiligenceDoc', (data, req) => {
             if (localTierOf(req) === 'authority') return;
@@ -259,8 +286,13 @@ export default class PassportService extends cds.ApplicationService {
         // 2. Canonical payload + blake2b-256 hash. The hash is what goes on-chain;
         //    the payload body stays off-chain (encrypted, step 3). The passportId
         //    is a human string, so derive a stable Bytes<32> id for the on-chain
-        //    binding by hashing it the same way.
-        const { canonicalPayload, payloadHash } = hashPayload(batch.payload);
+        //    binding by hashing it the same way. Guide-format attributes (DIN DKE
+        //    SPEC 99100 longlist) are part of the anchored payload, canonically
+        //    sorted so row order never changes the hash.
+        const attributes = hashableAttributes(defaultGuideAttributes({
+            passportId, model: batch.public.model, performanceClass: batch.public.performanceClass,
+        }));
+        const { canonicalPayload, payloadHash } = hashPayload({ ...batch.payload, attributes });
         const passportIdHash = blake2b256Hex(passportId);
 
         // 3. Encrypt the payload with a per-passport key derived from passportId.
@@ -302,8 +334,9 @@ export default class PassportService extends cds.ApplicationService {
             passportIdHash,
             contractAddress,
             anchorNetwork: contractAddress ? effectiveNetwork() : null,
-            attestationTxHash
-        });
+            attestationTxHash,
+            attributes: attributes.map((a) => ({ ...a }))
+        } as any);
 
         // Mark the goods-receipt consumed so the feed reflects that this batch
         // was turned into a passport (best-effort; the passport row is the SoT).
