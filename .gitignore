@@ -84,3 +84,7 @@ docs/demo-script.md
 # third-party material from the GEFEG test environment, not for publishing)
 docs/batterypass-gap-analysis.md
 docs/batterypass-ready/
+
+# deploy runtime artifacts (baked DB + filled env stay off the repo)
+deploy/.env
+deploy/passport-demo.db

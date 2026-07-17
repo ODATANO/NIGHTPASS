@@ -5,6 +5,22 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <title>NIGHTPASS Passport Explorer</title>
   <meta name="description" content="Public explorer for EU battery passports anchored on Midnight. Live zero-knowledge attestation state, no account needed."/>
+
+  <!-- Link previews (Open Graph + Twitter). og:image must be an absolute URL;
+       the public deployment lives at zkpassport.eu. -->
+  <meta property="og:type" content="website"/>
+  <meta property="og:site_name" content="zkpassport.eu"/>
+  <meta property="og:title" content="EU Battery Passport, verified on-chain"/>
+  <meta property="og:description" content="Public explorer for battery passports anchored on Midnight. Live zero-knowledge verification, no account needed."/>
+  <meta property="og:url" content="https://zkpassport.eu/explorer/"/>
+  <meta property="og:image" content="https://zkpassport.eu/explorer/og-image.png"/>
+  <meta property="og:image:width" content="1200"/>
+  <meta property="og:image:height" content="630"/>
+  <meta name="twitter:card" content="summary_large_image"/>
+  <meta name="twitter:title" content="EU Battery Passport, verified on-chain"/>
+  <meta name="twitter:description" content="Public explorer for battery passports anchored on Midnight. Live zero-knowledge verification, no account needed."/>
+  <meta name="twitter:image" content="https://zkpassport.eu/explorer/og-image.png"/>
+  <meta name="theme-color" content="#0e0f13"/>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='14' fill='%230e0f13'/%3E%3Ccircle cx='16' cy='16' r='7' fill='none' stroke='%237aa2ff' stroke-width='3'/%3E%3C/svg%3E"/>
   <link rel="stylesheet" href="style.css"/>
 </head>
@@ -32,8 +48,6 @@
       <strong>Midnight</strong> testnet. Payload hashes are public; battery data stays
       encrypted off-chain behind tiered disclosure.</span>
     <span class="foot-links">
-      <a href="/passport/webapp/index.html" target="_blank" rel="noopener">Passport Viewer</a>
-      <span aria-hidden="true">&middot;</span>
       <a href="https://github.com/ODATANO/NIGHTPASS" target="_blank" rel="noopener">GitHub</a>
     </span>
   </footer>

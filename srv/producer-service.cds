@@ -139,6 +139,31 @@ service ProducerService {
     };
 
     /**
+     * Check a passport against the official BatteryPass-Ready validation API
+     * (DIN DKE SPEC 99100). The server holds the API key and proxies the call;
+     * `issues` is empty when the passport is conformant. Run before anchoring.
+     */
+    action   validatePassportConformance(passportId: String)             returns {
+        valid      : Boolean;
+        guide      : String;
+        errorCount : Integer;
+        checkedAt  : String;
+        error      : String;   // set only on transport/config failure
+        issues     : array of { path : String; message : String; };
+    };
+
+    /**
+     * Publish an anchored passport to the public explorer instance: POST its
+     * public Point-1 fields to PASSPORT_PUBLISH_URL (secret PASSPORT_PUBLISH_SECRET).
+     * Only anchored passports; verification stays live on the chain at the target.
+     */
+    action   publishPassport(passportId: String)                         returns {
+        published : Boolean;
+        target    : String;
+        status    : String;   // 'created' | 'updated' | error text
+    };
+
+    /**
      * Build the Catena-X battery-passport aspect JSON: the full structured
      * passport (general + cells + recycled content + due diligence + on-chain
      * integrity). Producer-owned data, so no redaction here (the tier gating and

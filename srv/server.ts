@@ -33,6 +33,9 @@ cds.on('bootstrap', (app: any) => {
                 p.startsWith('/p/') ||
                 p.startsWith('/resolve/') ||
                 (p.startsWith('/api/v1/passport') && req.method === 'GET') ||
+                // Publish ingest: producers push anchored passports to the
+                // public explorer (secret-gated in the handler).
+                (p === '/api/v1/passport/ingest' && req.method === 'POST') ||
                 // Conformance surface stays reachable when explicitly enabled
                 // (throwaway tunnel instances for the BatteryPass-Ready executor).
                 (p.startsWith('/dpp-api') && process.env.DPP_API_ENABLED === 'true');
@@ -52,13 +55,48 @@ cds.on('bootstrap', (app: any) => {
         console.log('[dpp-api] BatteryPass-Ready conformance surface mounted at /dpp-api (v1 + adapter)');
     }
 
+    // --- Per-passport OG preview image: GET /p/:passportId/og.png ------------
+    // Declared before the resolver so Express matches the longer path first.
+    app.get('/p/:passportId/og.png', async (req: any, res: any) => {
+        const passportId = String(req.params.passportId || '');
+        try {
+            const row = await SELECT.one.from('passport.Passports')
+                .columns('passportId', 'model', 'batteryCategory', 'anchorNetwork', 'attestationTxHash', 'status')
+                .where({ passportId });
+            if (!row) return res.status(404).end();
+            const { renderOgPng } = require('./lib/og-image');
+            const png = await renderOgPng(row);
+            res.type('image/png');
+            res.setHeader('Cache-Control', 'public, max-age=86400');
+            res.end(png);
+        } catch (e: any) {
+            res.status(500).end(String(e?.message ?? e));
+        }
+    });
+
     // --- Tier resolver: GET /p/:passportId -----------------------------------
-    app.get('/p/:passportId', (req: any, res: any) => {
+    app.get('/p/:passportId', async (req: any, res: any) => {
         const passportId = String(req.params.passportId || '');
         // On the public explorer surface the explorer detail IS the QR landing
-        // (the tiered viewer lives on the internal instance).
+        // (the tiered viewer lives on the internal instance). Served as a meta
+        // page instead of a 302: link crawlers read the per-passport OG tags
+        // (they run no JS), humans are redirected instantly by the inline
+        // script. Work instances keep the plain 302 below (tier resolver).
         if (surface === 'explorer') {
-            return res.redirect(302, `/explorer/#/p/${encodeURIComponent(passportId)}`);
+            const target = `/explorer/#/p/${encodeURIComponent(passportId)}`;
+            try {
+                const row = await SELECT.one.from('passport.Passports')
+                    .columns('passportId', 'model', 'batteryCategory', 'anchorNetwork', 'attestationTxHash', 'status')
+                    .where({ passportId });
+                if (row) {
+                    const { ogMetaPage } = require('./lib/og-image');
+                    const host = process.env.PASSPORT_DEMO_HOST || `${req.protocol}://${req.get('host')}`;
+                    res.type('text/html');
+                    res.setHeader('Cache-Control', 'public, max-age=3600');
+                    return res.end(ogMetaPage(row, host.replace(/\/+$/, ''), target));
+                }
+            } catch { /* fall through to the plain redirect */ }
+            return res.redirect(302, target);
         }
         const tier = tierFromAuth(req.headers.authorization);
         // The consumer route's pattern is "" (the SPA default), so it lives at the
@@ -192,6 +230,44 @@ cds.on('bootstrap', (app: any) => {
                 return res.status(500).json({ error: String(e?.message ?? e) });
             }
         });
+
+    // --- Passport publish ingest: POST /api/v1/passport/ingest ---------------
+    // A work instance PUSHES an anchored passport's public Point-1 fields here
+    // after it is anchored (and validated). Bearer-secret gated (the payload is
+    // already public, so a shared secret is enough — no HMAC needed). Upsert by
+    // passportId. Verification never trusts this: verifyOnChain re-reads the
+    // chain. Runs on the public read surface so producers can publish to it.
+    const INGEST_FIELDS = [
+        'model', 'manufacturerId', 'batteryCategory', 'manufactureDate', 'weightKg',
+        'performanceClass', 'qrCodeUrl', 'payloadHash', 'contractAddress',
+        'anchorNetwork', 'attestationTxHash', 'status',
+    ] as const;
+    app.post('/api/v1/passport/ingest', express.json({ limit: '256kb' }), async (req: any, res: any) => {
+        const secret = process.env.PASSPORT_INGEST_SECRET;
+        if (!secret) return res.status(503).json({ error: 'ingest not configured (PASSPORT_INGEST_SECRET unset)' });
+        const given = String(req.headers.authorization ?? '').replace(/^Bearer\s+/i, '');
+        const a = Buffer.from(given), b = Buffer.from(secret);
+        if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+            return res.status(401).json({ error: 'invalid or missing bearer secret' });
+        }
+        const passportId = String(req.body?.passportId ?? '').trim();
+        if (!passportId) return res.status(400).json({ error: 'passportId is required' });
+        try {
+            const data: Record<string, unknown> = {};
+            for (const f of INGEST_FIELDS) if (req.body[f] !== undefined) data[f] = req.body[f];
+            const existing: any = await SELECT.one.from('passport.Passports').columns('ID').where({ passportId });
+            if (existing) {
+                await UPDATE.entity('passport.Passports').set(data).where({ ID: existing.ID });
+            } else {
+                await INSERT.into('passport.Passports').entries({ ID: cds.utils.uuid(), passportId, ...data });
+            }
+            cds.log('publish-ingest').info(`ingested passport ${passportId} (${data.status ?? '?'})`);
+            return res.status(existing ? 200 : 201).json({ status: existing ? 'updated' : 'created', passportId });
+        } catch (e: any) {
+            cds.log('publish-ingest').error('ingest failed:', e?.message ?? e);
+            return res.status(500).json({ error: String(e?.message ?? e) });
+        }
+    });
 
     // --- Supplier resolve by on-chain hash: GET /resolve/:payloadHash --------
     // A supplier handed only the passport payloadHash resolves the exact battery:

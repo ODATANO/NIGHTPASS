@@ -74,6 +74,8 @@ export default class ProducerService extends cds.ApplicationService {
         this.on('recordWalletDisclosure', this.recordWalletDisclosure);
         this.on('recordWalletPredicate', this.recordWalletPredicate);
         this.on('passportFieldValue', this.passportFieldValue);
+        this.on('validatePassportConformance', this.validatePassportConformance);
+        this.on('publishPassport', this.publishPassport);
         this.on('passportAspectJson', this.passportAspectJson);
         this.on('passportCredential', this.passportCredential);
         this.on('grantPassportDisclosure', this.grantPassportDisclosure);
@@ -457,6 +459,54 @@ export default class ProducerService extends cds.ApplicationService {
             cds.log('producer').warn('content-root/proof build skipped:', (e as Error)?.message);
         }
         return base;
+    };
+
+    /** Official BatteryPass-Ready conformance check (server-proxied, key hidden). */
+    private validatePassportConformance = async (req: cds.Request) => {
+        const { passportId } = req.data as { passportId?: string };
+        const p: any = await SELECT.one.from(Passports)
+            .columns('ID', 'passportId', 'model', 'manufacturerId', 'batteryCategory',
+                'manufactureDate', 'weightKg', 'performanceClass', 'modifiedAt', 'status')
+            .where({ passportId });
+        if (!p) return req.reject(404, `passport '${passportId}' not found`);
+        const batteries: any[] = await SELECT.from(Batteries)
+            .columns('serialNumber', 'cellChemistry', 'capacityKwh', 'carbonFootprintKgCO2',
+                'cycleLife', 'roundTripEfficiencyPct').where({ passport_ID: p.ID });
+        const recycled: any[] = await SELECT.from(RecycledMaterials)
+            .columns('material', 'recycledPercentage').where({ passport_ID: p.ID });
+        const attrs: any[] = await SELECT.from('passport.PassportAttributes')
+            .columns('section', 'attribute', 'valueJson').where({ passport_ID: p.ID });
+        const { validateConformance } = require('./lib/bp-ready-validate');
+        const r = await validateConformance(p, batteries, recycled, attrs);
+        return { ...r, error: r.error ?? '' };
+    };
+
+    /** Push an anchored passport's public fields to the public explorer instance. */
+    private publishPassport = async (req: cds.Request) => {
+        const { passportId } = req.data as { passportId?: string };
+        const url = process.env.PASSPORT_PUBLISH_URL;
+        const secret = process.env.PASSPORT_PUBLISH_SECRET;
+        if (!url || !secret) return req.reject(503, 'publishing not configured (PASSPORT_PUBLISH_URL / PASSPORT_PUBLISH_SECRET)');
+        const p: any = await SELECT.one.from(Passports)
+            .columns('passportId', 'model', 'manufacturerId', 'batteryCategory', 'manufactureDate',
+                'weightKg', 'performanceClass', 'qrCodeUrl', 'payloadHash', 'contractAddress',
+                'anchorNetwork', 'attestationTxHash', 'status')
+            .where({ passportId });
+        if (!p) return req.reject(404, `passport '${passportId}' not found`);
+        if (p.status !== 'anchored') return req.reject(400, `passport '${passportId}' is not anchored (status: ${p.status})`);
+        try {
+            const res = await fetch(`${url.replace(/\/+$/, '')}/api/v1/passport/ingest`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${secret}` },
+                body: JSON.stringify(p),
+                signal: AbortSignal.timeout(30000),
+            });
+            const body: any = await res.json().catch(() => ({}));
+            if (!res.ok) return { published: false, target: url, status: `HTTP ${res.status}: ${body?.error ?? ''}` };
+            return { published: true, target: url, status: String(body?.status ?? 'ok') };
+        } catch (e: any) {
+            return { published: false, target: url, status: `unreachable: ${e?.message ?? e}` };
+        }
     };
 
     /** Catena-X battery-passport aspect JSON (full structured, producer-owned). */

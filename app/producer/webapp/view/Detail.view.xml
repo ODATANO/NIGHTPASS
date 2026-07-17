@@ -24,6 +24,8 @@
       <Button text="Revoke" enabled="{ui>/anchored}" icon="sap-icon://delete" press="onRevokeAction"/>
       <Button text="Prove" enabled="{ui>/anchored}" icon="{= ${session>/mode} === 'server' ? 'sap-icon://it-host' : 'sap-icon://wallet' }" press="onProveAction"/>
       <Button text="Share" enabled="{ui>/anchored}" icon="sap-icon://share-2" press="onShare"/>
+      <Button text="Publish" enabled="{ui>/anchored}" type="Emphasized" icon="sap-icon://upload-to-cloud"
+              tooltip="Publish this anchored passport to the public explorer" press="onPublish"/>
       <Button icon="sap-icon://refresh" tooltip="Refresh transactions" press="onRefresh"/>
     </headerContent>
     <content>
@@ -72,6 +74,33 @@
               </items>
             </Table>
             <core:Fragment fragmentName="producer.view.AttributesPanel" type="XML"/>
+          </IconTabFilter>
+
+          <!-- Conformance: official BatteryPass-Ready validation -->
+          <IconTabFilter text="Conformance" icon="sap-icon://validate" key="conf">
+            <VBox class="sapUiSmallMargin">
+              <MessageStrip
+                text="Validate this passport against the official EU BatteryPass-Ready test environment (DIN DKE SPEC 99100) before anchoring. Runs server-side; no data leaves except the guide payload."
+                type="Information" showIcon="true" class="sapUiSmallMarginBottom"/>
+              <Button text="Validate against BatteryPass-Ready" icon="sap-icon://validate" type="Emphasized"
+                      press="onValidateConformance" busy="{conf>/busy}" busyIndicatorDelay="0"/>
+              <ObjectStatus class="sapUiSmallMarginTop"
+                            visible="{= !!${conf>/text} }"
+                            title="Result" text="{conf>/text}" state="{conf>/state}"/>
+              <Table items="{conf>/issues}" visible="{= (${conf>/issues} || []).length > 0 }"
+                     headerText="Findings" class="sapUiSmallMarginTop">
+                <columns>
+                  <Column width="40%"><Text text="Path"/></Column>
+                  <Column><Text text="Requirement"/></Column>
+                </columns>
+                <ColumnListItem>
+                  <cells>
+                    <Text text="{conf>path}"/>
+                    <Text text="{conf>message}"/>
+                  </cells>
+                </ColumnListItem>
+              </Table>
+            </VBox>
           </IconTabFilter>
 
           <!-- Disclosure -->

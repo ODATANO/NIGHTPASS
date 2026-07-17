@@ -4,6 +4,8 @@
 
 **EU Battery Regulation 2023/1542 Digital Battery Passport with three disclosure tiers, backed by zero-knowledge attestations on Midnight.**
 
+**Live demo: [zkpassport.eu](https://zkpassport.eu)** a public explorer where anyone can inspect the anchored passports and verify them live against Midnight, no account needed.
+
 [![Tests](https://github.com/ODATANO/NIGHTPASS/actions/workflows/test.yaml/badge.svg)](https://github.com/ODATANO/NIGHTPASS/actions/workflows/test.yaml)
 [![codecov](https://codecov.io/gh/ODATANO/NIGHTPASS/branch/main/graph/badge.svg)](https://codecov.io/gh/ODATANO/NIGHTPASS)
 [![@odatano/nightgate](https://img.shields.io/npm/v/@odatano/nightgate?logo=npm&label=%40odatano%2Fnightgate)](https://www.npmjs.com/package/@odatano/nightgate)
@@ -39,7 +41,7 @@ One passport, end to end: `BAT-FRESH-20260717125619`, created through the standa
 | prove: recycled cobalt share >= 16 % (value hidden) | [`f632a4fc...9bdda074`](https://preview.midnightexplorer.com/transactions/0xf632a4fc6e336c576924ff618fab00d95aa6d154601d1149dde9af9e9bdda074) |
 | prove: usable capacity >= 70 kWh (value hidden) | [`33cffbeb...41dfa669`](https://preview.midnightexplorer.com/transactions/0x33cffbeb5ebfdc97fcaf4d26e6693db3399a9991e45e26cf216248c441dfa669) |
 
-Vault contract: `f7c755235cc9408bc6664f7cae88b445798726ccdf9a6a560e7c873c807aabe1`. (Each proof run also re-anchors the content root before proving, an idempotent write of the same root value; those bookkeeping transactions are omitted here. The Midnight preview testnet was reset on 2026-07-16; this example lives on the current network.)
+Vault contract: `f7c755235cc9408bc6664f7cae88b445798726ccdf9a6a560e7c873c807aabe1`.
 
 ## Documentation
 

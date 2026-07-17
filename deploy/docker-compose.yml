@@ -1,0 +1,27 @@
+# NIGHTPASS public demo, single preview instance behind Caddy (auto-TLS).
+# See deploy/README.md for the five manual steps; full background in
+# docs/public-demo.md.
+services:
+  nightpass:
+    build: ..
+    restart: unless-stopped
+    env_file: .env
+    expose: ["4004"]
+    volumes:
+      - passport-db:/data
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports: ["80:80", "443:443"]
+    environment:
+      DEMO_DOMAIN: ${DEMO_DOMAIN}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  passport-db:
+  caddy-data:
+  caddy-config:

@@ -1,0 +1,6 @@
+# Auto-TLS reverse proxy for the NIGHTPASS demo. DEMO_DOMAIN comes from
+# deploy/.env via compose; Caddy provisions the Let's Encrypt cert itself.
+{$DEMO_DOMAIN} {
+	reverse_proxy nightpass:4004
+	encode gzip
+}

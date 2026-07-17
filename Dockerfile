@@ -11,6 +11,11 @@
 # tsx loader, plain cds-serve would silently skip them.
 FROM node:22-slim
 
+# Fonts + fontconfig for sharp's SVG rasterizer (per-passport OG images);
+# node:22-slim ships none, and librsvg renders <text> through fontconfig.
+RUN apt-get update && apt-get install -y --no-install-recommends fontconfig fonts-dejavu-core \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
 # Copy sources BEFORE npm ci: the postinstall step (cds-typer + connector-lib

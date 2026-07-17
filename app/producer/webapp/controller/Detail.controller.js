@@ -18,6 +18,39 @@ sap.ui.define([
       this.getView().setModel(new JSONModel({ anchored: false }), "ui");
       // Catena-X tab: generated aspect JSON + built PAC.
       this.getView().setModel(new JSONModel({ aspect: "", pac: "" }), "cx");
+      // Conformance tab: BatteryPass-Ready validation result.
+      this.getView().setModel(new JSONModel({ busy: false, text: "", state: "None", valid: false, issues: [] }), "conf");
+    },
+
+    // Publish the anchored passport to the public explorer instance.
+    onPublish: function () {
+      var that = this;
+      this.callAction("/publishPassport", { passportId: this._pid() })
+        .then(function (r) {
+          if (r.published) { that.toast("published to " + r.target + " (" + r.status + ")"); }
+          else { that.error("publish failed: " + r.status); }
+        })
+        .catch(function (e) { that.error(e); });
+    },
+
+    // Official BatteryPass-Ready validation (server-proxied; the API session
+    // stays on the server). Feeds the publish gate: publishing wants a green run.
+    onValidateConformance: function () {
+      var that = this;
+      var oConf = this.getView().getModel("conf");
+      oConf.setData({ busy: true, text: "Validating against the official test environment…", state: "Information", valid: false, issues: [] });
+      this.callAction("/validatePassportConformance", { passportId: this._pid() })
+        .then(function (r) {
+          var text, state;
+          if (r.error) { text = r.error; state = "Warning"; }
+          else if (r.valid) { text = "Conformant · 0 findings (" + r.guide + ")"; state = "Success"; }
+          else { text = r.errorCount + " finding(s) against " + r.guide + " — see below"; state = "Error"; }
+          oConf.setData({ busy: false, text: text, state: state, valid: !!r.valid, issues: r.issues || [] });
+          that._session().setProperty("/lastValidated", r.valid ? that._pid() : "");
+        })
+        .catch(function (e) {
+          oConf.setData({ busy: false, text: String((e && e.message) || e), state: "Error", valid: false, issues: [] });
+        });
     },
 
     // The header buttons dispatch on the signing mode chosen at login:
