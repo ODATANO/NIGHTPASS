@@ -392,6 +392,14 @@ export interface AnchorOpts {
      * owning userId, so the calls must carry the same identity.
      */
     user?: unknown;
+    /**
+     * Optional NIGHTGATE session that pays the dust fees for all three anchor
+     * steps (per-tx sponsoring, NIGHTGATE 0.8.0): the acting session builds
+     * and signs, the sponsor balances only the dust and submits. Must belong
+     * to the same user as the acting session (or be operator-listed in
+     * NIGHTGATE_FEE_SPONSOR_SESSION).
+     */
+    sponsorSessionId?: string;
     /** Called after each successful step, so callers can log a tx row. */
     onStep?: (step: AnchorStep) => Promise<void> | void;
 }
@@ -407,7 +415,8 @@ const CONTRACT_REF = 'attestation-vault';
  * fires per step for transaction logging.
  */
 export async function anchorPassport(nightgate: cds.Service, opts: AnchorOpts): Promise<{ attestationTxHash: string }> {
-    const { payloadHash, passportId, passportIdHash, contractAddress, sessionId, contentRoot, user, onStep } = opts;
+    const { payloadHash, passportId, passportIdHash, contractAddress, sessionId, contentRoot, user, sponsorSessionId, onStep } = opts;
+    const sponsored = sponsorSessionId ? { sponsorSessionId } : {};
 
     let attestJobId = '';
     const attestationTxHash = await runStep('attest', async () => {
@@ -417,7 +426,8 @@ export async function anchorPassport(nightgate: cds.Service, opts: AnchorOpts): 
             sessionId,
             contractAddress,
             contentType:         'application/json',
-            compiledArtifactRef: CONTRACT_REF
+            compiledArtifactRef: CONTRACT_REF,
+            ...sponsored
         }, user);
         attestJobId = String(anchor.jobId ?? '');
         return waitForJob(nightgate, anchor.jobId, sessionId, user);
@@ -431,7 +441,8 @@ export async function anchorPassport(nightgate: cds.Service, opts: AnchorOpts): 
             circuit:             'bindPassport',
             compiledArtifactRef: CONTRACT_REF,
             sessionId,
-            args:                JSON.stringify([passportIdHash, payloadHash])
+            args:                JSON.stringify([passportIdHash, payloadHash]),
+            ...sponsored
         }, user);
         bindJobId = String(bind.jobId ?? '');
         return waitForJob(nightgate, bind.jobId, sessionId, user);
@@ -446,7 +457,8 @@ export async function anchorPassport(nightgate: cds.Service, opts: AnchorOpts): 
                 circuit:             'anchorContentRoot',
                 compiledArtifactRef: CONTRACT_REF,
                 sessionId,
-                args:                JSON.stringify([payloadHash, contentRoot])
+                args:                JSON.stringify([payloadHash, contentRoot]),
+                ...sponsored
             }, user);
             rootJobId = String(root.jobId ?? '');
             return waitForJob(nightgate, root.jobId, sessionId, user);

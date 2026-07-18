@@ -1,6 +1,6 @@
 import { test, describe, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { listProducerWallets, producerWalletSecrets } from '../../srv/lib/producer-wallets';
+import { listProducerWallets, producerWalletSecrets, feeSponsorWalletId } from '../../srv/lib/producer-wallets';
 
 /**
  * The server-wallet registry backing the cockpit's "server wallet" login mode.
@@ -11,7 +11,8 @@ const KEYS = [
     'PRODUCER_WALLETS', 'PRODUCER_LABEL', 'PRODUCER_SHIELDED_ADDRESS',
     'PRODUCER_WALLET_MNEMONIC', 'PRODUCER_VIEWING_KEY',
     'PRODUCER_A_WALLET_MNEMONIC', 'PRODUCER_A_VIEWING_KEY', 'PRODUCER_A_SHIELDED_ADDRESS', 'PRODUCER_A_LABEL',
-    'PRODUCER_B_WALLET_MNEMONIC', 'PRODUCER_B_VIEWING_KEY', 'PRODUCER_B_SHIELDED_ADDRESS'
+    'PRODUCER_B_WALLET_MNEMONIC', 'PRODUCER_B_VIEWING_KEY', 'PRODUCER_B_SHIELDED_ADDRESS',
+    'PASSPORT_FEE_SPONSOR_WALLET'
 ];
 let saved: Record<string, string | undefined> = {};
 
@@ -96,5 +97,18 @@ describe('producer wallet registry', () => {
     test('no configuration at all yields no wallets', () => {
         assert.deepEqual(listProducerWallets(), []);
         assert.equal(producerWalletSecrets(), undefined);
+    });
+});
+
+describe('fee sponsor wallet (PASSPORT_FEE_SPONSOR_WALLET)', () => {
+    test('unset or blank means no sponsoring', () => {
+        assert.equal(feeSponsorWalletId(), null);
+        process.env.PASSPORT_FEE_SPONSOR_WALLET = '   ';
+        assert.equal(feeSponsorWalletId(), null);
+    });
+
+    test('returns the configured wallet id, trimmed', () => {
+        process.env.PASSPORT_FEE_SPONSOR_WALLET = ' default ';
+        assert.equal(feeSponsorWalletId(), 'default');
     });
 });

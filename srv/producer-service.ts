@@ -10,7 +10,7 @@ import {
     effectiveNetwork, explorerTxUrl
 } from './lib/passport-anchor';
 import { defaultGuideAttributes, hashableAttributes } from './lib/guide-attribute-defaults';
-import { listProducerWallets, producerWalletSecrets } from './lib/producer-wallets';
+import { listProducerWallets, producerWalletSecrets, feeSponsorWalletId } from './lib/producer-wallets';
 import { verifyContractTx, type ChainVerdict } from './lib/chain-verify';
 import { verifyAttestState, verifyGrantState, verifyPredicateState } from './lib/state-verify';
 
@@ -158,6 +158,32 @@ export default class ProducerService extends cds.ApplicationService {
      */
     private async effectiveSession(argSessionId?: string, walletId?: string): Promise<string | null> {
         return argSessionId || this.serverSigningSession(walletId);
+    }
+
+    /**
+     * NIGHTGATE session of the configured fee-sponsor wallet
+     * (PASSPORT_FEE_SPONSOR_WALLET), for per-tx dust sponsoring of the
+     * on-chain legs. Returns undefined when no sponsor is configured, when the
+     * sponsor IS the acting session (self-sponsoring is a no-op), or when the
+     * sponsor session cannot be opened. The latter degrades to unsponsored
+     * with a warning: a funded acting wallet still succeeds on its own dust,
+     * an unfunded one surfaces a clear insufficient-dust failure downstream.
+     *
+     * Must run inside the original request context (session opening inherits
+     * the request's user, and NIGHTGATE's sponsor guard requires the sponsor
+     * session to belong to the same user as the acting one).
+     */
+    private async sponsorSessionIdFor(actingSessionId: string): Promise<string | undefined> {
+        const sponsorWallet = feeSponsorWalletId();
+        if (!sponsorWallet) return undefined;
+        const sponsorSession = await this.serverSigningSession(sponsorWallet);
+        if (!sponsorSession) {
+            cds.log('producer').warn(
+                `fee sponsor wallet '${sponsorWallet}' has no signing session; proceeding UNSPONSORED`);
+            return undefined;
+        }
+        if (sponsorSession === actingSessionId) return undefined;
+        return sponsorSession;
     }
 
     /** The configured server wallets the cockpit can sign with (no secrets). */
@@ -788,6 +814,10 @@ export default class ProducerService extends cds.ApplicationService {
         } catch (e) {
             cds.log('producer').warn('content-root build skipped:', (e as Error)?.message);
         }
+        // Sponsor session must be resolved HERE (request context: session
+        // opening inherits the request's user); the detached runner just
+        // carries the id.
+        const sponsorSessionId = await this.sponsorSessionIdFor(sessionId);
         // 'succeeded' fires after the request tx committed, so the detached
         // runner never contends with this request for the write lock. The
         // user is captured NOW: the NIGHTGATE calls must carry the caller's
@@ -795,7 +825,7 @@ export default class ProducerService extends cds.ApplicationService {
         const user = req.user;
         (req as any).on('succeeded', () => {
             void detachedFromRequest(() =>
-                this.runAnchorDetached(ID, passportId, payloadHash, passportIdHash, contractAddress, sessionId, user, contentRoot)
+                this.runAnchorDetached(ID, passportId, payloadHash, passportIdHash, contractAddress, sessionId, user, contentRoot, sponsorSessionId)
             ).catch((e: unknown) =>
                 cds.log('producer').error(`detached anchor runner crashed for ${passportId}:`, e));
         });
@@ -810,7 +840,8 @@ export default class ProducerService extends cds.ApplicationService {
      */
     private async runAnchorDetached(
         ID: string, passportId: string, payloadHash: string, passportIdHash: string,
-        contractAddress: string, sessionId: string, user: unknown, contentRoot?: string
+        contractAddress: string, sessionId: string, user: unknown, contentRoot?: string,
+        sponsorSessionId?: string
     ): Promise<void> {
         const log = cds.log('producer');
         try {
@@ -826,8 +857,9 @@ export default class ProducerService extends cds.ApplicationService {
                 await waitForJob(nightgate, prewarmJob, sessionId, user);
                 log.info('server-session prewarm complete');
             }
+            if (sponsorSessionId) log.info(`anchor fees for ${passportId} sponsored by session ${sponsorSessionId.slice(0, 8)}...`);
             const { attestationTxHash } = await anchorPassport(nightgate, {
-                payloadHash, passportId, passportIdHash, contractAddress, sessionId, user, contentRoot,
+                payloadHash, passportId, passportIdHash, contractAddress, sessionId, user, contentRoot, sponsorSessionId,
                 onStep: async (s) => {
                     await this.runDetached(async () => {
                         await INSERT.into(PassportTransactions).entries({
@@ -893,6 +925,8 @@ export default class ProducerService extends cds.ApplicationService {
             contractAddress, compiledArtifactRef: CONTRACT_REF
         };
         if (op === 'grant') args.level = level;
+        const sponsorSessionId = await this.sponsorSessionIdFor(String(session));
+        if (sponsorSessionId) args.sponsorSessionId = sponsorSessionId;
         const user = req.user;
         (req as any).on('succeeded', () => {
             void detachedFromRequest(() =>
@@ -995,12 +1029,14 @@ export default class ProducerService extends cds.ApplicationService {
         // it only when no anchored root exists yet for this passport.
         const rootAnchored = await SELECT.one.from(PassportTransactions).columns('ID')
             .where({ passport_ID: row.ID, kind: 'anchorContentRoot', status: 'succeeded' });
+        const sponsorSessionId = await this.sponsorSessionIdFor(String(session));
         const args = {
             payloadHash: row.payloadHash, fieldKey: proof.fieldKey, value: proof.value,
             ...(rootAnchored ? {} : { contentRoot: tree.contentRoot }),
             siblingsJson: JSON.stringify(proof.siblings), dirsJson: JSON.stringify(proof.dirs),
             predicate: pred, threshold: thresholdScaled, unit: useUnit,
-            sessionId: session, contractAddress, compiledArtifactRef: CONTRACT_REF
+            sessionId: session, contractAddress, compiledArtifactRef: CONTRACT_REF,
+            ...(sponsorSessionId ? { sponsorSessionId } : {})
         };
         const user = req.user;
         (req as any).on('succeeded', () => {

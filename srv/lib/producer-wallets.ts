@@ -82,6 +82,16 @@ export function listProducerWallets(): ProducerWallet[] {
     return registry().map(({ id, label, owner, signingReady }) => ({ id, label, owner, signingReady }));
 }
 
+/**
+ * The server wallet that pays the dust fees for OTHER wallets' on-chain legs
+ * (NIGHTGATE 0.8.0 per-tx sponsoring), from `PASSPORT_FEE_SPONSOR_WALLET`.
+ * Value is a wallet id from this registry (e.g. `default` for the main
+ * wallet). Unset = no sponsoring; every wallet pays its own fees.
+ */
+export function feeSponsorWalletId(): string | null {
+    return process.env.PASSPORT_FEE_SPONSOR_WALLET?.trim() || null;
+}
+
 /** Secrets for one wallet id, or undefined. Never leaves the server. */
 export function producerWalletSecrets(walletId?: string | null):
     { id: string; mnemonic: string; viewingKey: string; owner: string } | undefined {
