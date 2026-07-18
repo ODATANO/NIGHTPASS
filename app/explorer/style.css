@@ -316,6 +316,21 @@ tr.row-glow { animation: rowGlow 900ms ease-out 1; }
 .stat:hover, .qr-card:hover { transform: translateY(-2px); border-color: #333949; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35); }
 .detail-grid { perspective: 1200px; }
 
+/* ---------- Pager (from 11 rows on: 10 per page, newest first) ---------- */
+.pager {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 14px 16px 6px;
+  border-top: 1px solid var(--border);
+  margin-top: 8px;
+}
+.pager .page-btn { min-width: 34px; }
+.pager .page-btn.primary:disabled { opacity: 1; cursor: default; }
+.pager-info { color: var(--ink-3); font-size: 12px; margin-left: 10px; }
+
 /* Search field widens on focus */
 .search { transition: max-width 260ms cubic-bezier(0.2, 0.8, 0.2, 1); }
 .search:focus-within { max-width: 760px; }

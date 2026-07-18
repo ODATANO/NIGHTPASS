@@ -14,11 +14,13 @@
             <Label text="Manufacturer ID"/>
             <Input value="{create>/manufacturerId}"/>
             <Label text="Category"/>
-            <Select selectedKey="{create>/batteryCategory}">
+            <Select selectedKey="{create>/batteryCategory}" change="onCreateCategoryChange">
               <core:Item key="EV" text="EV"/>
               <core:Item key="INDUSTRIAL" text="Industrial"/>
               <core:Item key="LMT" text="LMT"/>
             </Select>
+            <Label text="Validation guide"/>
+            <Text text="{create>/guide}" class="sapUiTinyMarginTop"/>
             <Label text="Model"/>
             <Input value="{create>/model}"/>
             <Label text="Manufacture date"/>

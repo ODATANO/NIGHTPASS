@@ -13,32 +13,68 @@ sap.ui.define([
   // on-chain payloadHash covers ONLY the confidential content (batteries /
   // recycled / diligence), and the vault rejects a second attest of the same
   // hash. A static example serial made every unedited draft byte-identical.
-  function defaultDraft() {
-    var sStamp = new Date().toISOString().replace(/[-:T]/g, "").slice(2, 14);
-    return {
-      passportId: "BAT-PROD-" + sStamp,
-      manufacturerId: "DE-CELLCO-001",
-      batteryCategory: "EV",
-      model: "PowerCell EV-75",
-      manufactureDate: "2026-03-15",
-      weightKg: 432.5,
-      performanceClass: "B",
+  // One example set per battery category: the category picks the official
+  // BatteryPass-Ready validation guide AND the guide-specific default
+  // attribute set on the server, so the prefill matches the chosen type.
+  var CATEGORY_EXAMPLES = {
+    EV: {
+      guide: "EV_Guide",
+      manufacturerId: "DE-CELLCO-001", model: "PowerCell EV-75",
+      weightKg: 432.5, performanceClass: "B",
       battery: {
-        serialNumber: "SN-AX-" + sStamp,
-        cellChemistry: "NMC-811",
-        capacityKwh: 75.0,
-        carbonFootprintKgCO2: 3412.75,
-        supplierName: "CathodeWorks GmbH",
-        recycledContentPct: 16.5,
-        cycleLife: 4200,
-        roundTripEfficiencyPct: 92.5,
-        leadContentPpm: 45.0
+        cellChemistry: "NMC-811", capacityKwh: 75.0, carbonFootprintKgCO2: 3412.75,
+        supplierName: "CathodeWorks GmbH", recycledContentPct: 16.5,
+        cycleLife: 4200, roundTripEfficiencyPct: 92.5, leadContentPpm: 45.0
       },
       recycled: [
         { material: "Co", recycledPercentage: 16.5, sourceSupplierName: "ReCobalt Recyclers SA" },
         { material: "Li", recycledPercentage: 8.25, sourceSupplierName: "LiLoop Recycling BV" },
         { material: "Ni", recycledPercentage: 12.0, sourceSupplierName: "NickelBack Materials Oy" }
-      ],
+      ]
+    },
+    INDUSTRIAL: {
+      guide: "Other_Industrial_2kWh_Guide",
+      manufacturerId: "DE-BETAVOLT-002", model: "BetaVolt IND-120",
+      weightKg: 985.0, performanceClass: "B",
+      battery: {
+        cellChemistry: "LFP", capacityKwh: 120.0, carbonFootprintKgCO2: 5150.25,
+        supplierName: "FerroPhos AG", recycledContentPct: 5.5,
+        cycleLife: 6000, roundTripEfficiencyPct: 88.0, leadContentPpm: 12.0
+      },
+      recycled: [
+        { material: "Li", recycledPercentage: 6.8, sourceSupplierName: "LiLoop Recycling BV" },
+        { material: "Ni", recycledPercentage: 4.1, sourceSupplierName: "NickelBack Materials Oy" }
+      ]
+    },
+    LMT: {
+      guide: "LMT_Guide",
+      manufacturerId: "DE-CITYCHARGE-003", model: "CityCharge LMT-15",
+      weightKg: 9.8, performanceClass: "C",
+      battery: {
+        cellChemistry: "NMC-622", capacityKwh: 1.5, carbonFootprintKgCO2: 78.4,
+        supplierName: "MicroCell GmbH", recycledContentPct: 12.0,
+        cycleLife: 1200, roundTripEfficiencyPct: 94.0, leadContentPpm: 8.0
+      },
+      recycled: [
+        { material: "Co", recycledPercentage: 16.9, sourceSupplierName: "ReCobalt Recyclers SA" }
+      ]
+    }
+  };
+
+  function defaultDraft(sCategory) {
+    var oEx = CATEGORY_EXAMPLES[sCategory] || CATEGORY_EXAMPLES.EV;
+    var sStamp = new Date().toISOString().replace(/[-:T]/g, "").slice(2, 14);
+    return {
+      passportId: "BAT-PROD-" + sStamp,
+      manufacturerId: oEx.manufacturerId,
+      batteryCategory: sCategory || "EV",
+      guide: oEx.guide,
+      model: oEx.model,
+      manufactureDate: "2026-03-15",
+      weightKg: oEx.weightKg,
+      performanceClass: oEx.performanceClass,
+      battery: Object.assign({ serialNumber: "SN-AX-" + sStamp }, oEx.battery),
+      recycled: oEx.recycled.map(function (r) { return Object.assign({}, r); }),
       diligenceDocType: "supply-chain-due-diligence-report"
     };
   }
@@ -129,6 +165,17 @@ sap.ui.define([
 
     onCreateCancel: function () {
       this.byId("createDialog").close();
+    },
+
+    // Switching the category re-seeds the example values for that battery
+    // type (and with them the server-side guide attribute set). The passport
+    // id is kept so an edited id survives the switch.
+    onCreateCategoryChange: function (oEvent) {
+      var oModel = this.getView().getModel("create");
+      var sKeep = oModel.getProperty("/passportId");
+      var oDraft = defaultDraft(oEvent.getParameter("selectedItem").getKey());
+      oDraft.passportId = sKeep;
+      oModel.setData(oDraft);
     },
 
     // ---- register partner (self-service registry) ----

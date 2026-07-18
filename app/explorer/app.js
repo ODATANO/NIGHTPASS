@@ -103,7 +103,7 @@ function scrambleIn(el, delayMs) {
 }
 
 var API = "/api/v1/passport";
-  var state = { rows: [], network: "", query: "", crossVerify: false, peerNets: [], explorerLinks: {}, viewerBase: null, loaded: false };
+  var state = { rows: [], network: "", query: "", page: 1, crossVerify: false, peerNets: [], explorerLinks: {}, viewerBase: null, loaded: false };
   var app = document.getElementById("app");
 
   // ---------- utils ----------
@@ -202,6 +202,29 @@ var API = "/api/v1/passport";
     return state.rows.filter(function (r) {
       return r.anchorNetwork === state.network && r.status !== "draft" && r.status !== "failed";
     });
+  }
+
+  /** ownRows narrowed by the active search filter (list order = newest first). */
+  function filteredRows() {
+    var q = state.query.trim().toLowerCase();
+    var all = ownRows();
+    return !q ? all : all.filter(function (r) {
+      return [r.passportId, r.model, r.payloadHash, r.attestationTxHash, r.status]
+        .some(function (v) { return String(v || "").toLowerCase().indexOf(q) >= 0; });
+    });
+  }
+
+  // The table paginates from 11 rows on: 10 per page, page 1 = the newest.
+  var PAGE_SIZE = 10;
+
+  function pageCount(rows) {
+    return Math.max(1, Math.ceil(rows.length / PAGE_SIZE));
+  }
+
+  function currentPageRows() {
+    var rows = filteredRows();
+    var page = Math.min(Math.max(1, state.page), pageCount(rows));
+    return rows.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
   }
 
   // ---------- list view ----------
@@ -319,14 +342,28 @@ var API = "/api/v1/passport";
   // ONE instance, ONE network: the list shows only this network's anchored
   // passports. Other networks live in their own instances behind the header /
   // stat-tile links (PASSPORT_EXPLORER_LINKS). No drafts here.
+  function pagerHtml(rows) {
+    var pages = pageCount(rows);
+    if (pages <= 1) return "";
+    var btns = "";
+    for (var p = 1; p <= pages; p++) {
+      btns += '<button class="btn page-btn' + (p === state.page ? " primary" : "") + '" data-page="' + p + '"' +
+        (p === state.page ? " disabled" : "") + ">" + p + "</button>";
+    }
+    return '<div class="pager">' +
+      '<button class="btn page-btn" data-page="' + (state.page - 1) + '"' + (state.page <= 1 ? " disabled" : "") + ">&lsaquo; Newer</button>" +
+      btns +
+      '<button class="btn page-btn" data-page="' + (state.page + 1) + '"' + (state.page >= pages ? " disabled" : "") + ">Older &rsaquo;</button>" +
+      '<span class="pager-info">page ' + state.page + " of " + pages + " &middot; " + rows.length + " passports</span>" +
+      "</div>";
+  }
+
   function renderList() {
     var q = state.query.trim().toLowerCase();
     var all = ownRows();
-    var rows = !q ? all : all.filter(function (r) {
-      return [r.passportId, r.model, r.payloadHash, r.attestationTxHash, r.status]
-        .some(function (v) { return String(v || "").toLowerCase().indexOf(q) >= 0; });
-    });
-    var body = rows.map(function (r) { return rowHtml(r, state.rows.indexOf(r)); }).join("");
+    var rows = filteredRows();
+    state.page = Math.min(Math.max(1, state.page), pageCount(rows));
+    var body = currentPageRows().map(function (r) { return rowHtml(r, state.rows.indexOf(r)); }).join("");
     app.innerHTML =
       heroHtml(all) +
       statTiles(all) +
@@ -341,10 +378,17 @@ var API = "/api/v1/passport";
           "<thead><tr><th>Passport</th><th>Status</th><th>Payload hash</th><th>Attestation tx</th><th>Age</th><th>On-chain verification</th></tr></thead>" +
           "<tbody>" + (body || '<tr><td colspan="6"><div class="empty">No passports match.</div></td></tr>') + "</tbody>" +
         "</table></div>" +
+        pagerHtml(rows) +
       "</section>";
 
     document.getElementById("reload").addEventListener("click", function () {
       load().then(render);
+    });
+    Array.prototype.forEach.call(app.querySelectorAll(".page-btn"), function (btn) {
+      btn.addEventListener("click", function () {
+        state.page = Number(btn.dataset.page);
+        renderList();
+      });
     });
     document.getElementById("verifyAll").addEventListener("click", verifyAll);
     Array.prototype.forEach.call(app.querySelectorAll(".verify-row"), function (btn) {
@@ -393,12 +437,12 @@ var API = "/api/v1/passport";
   }
 
   // Sequential on purpose: one indexer read at a time keeps the endpoint
-  // polite. Sweeps this instance's own-network anchored rows.
+  // polite. Sweeps the rows of the CURRENT page (the visible ones).
   function verifyAll() {
     var chain = Promise.resolve();
-    state.rows.forEach(function (row, i) {
-      if (row.anchorNetwork !== state.network) return;
+    currentPageRows().forEach(function (row) {
       if (verifiable(row)) {
+        var i = state.rows.indexOf(row);
         chain = chain.then(function () { return verifyRow(i); });
       }
     });
@@ -570,6 +614,7 @@ var API = "/api/v1/passport";
       return;
     }
     state.query = q;
+    state.page = 1; // a new filter starts on the newest page
     if (location.hash && location.hash !== "#/") location.hash = "#/";
     render();
   });
