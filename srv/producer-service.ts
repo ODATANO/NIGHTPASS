@@ -282,6 +282,7 @@ export default class ProducerService extends cds.ApplicationService {
             ? hashableAttributes((input as any).attributes)
             : hashableAttributes(defaultGuideAttributes({
                 passportId, model: input.model, performanceClass: input.performanceClass,
+                batteryCategory: input.batteryCategory,
             }));
         const { canonicalPayload, payloadHash } = hashPayload({ batteries, recycledMaterials, diligenceDocs, attributes });
         const passportIdHash = blake2b256Hex(passportId);

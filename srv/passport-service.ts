@@ -291,6 +291,7 @@ export default class PassportService extends cds.ApplicationService {
         //    sorted so row order never changes the hash.
         const attributes = hashableAttributes(defaultGuideAttributes({
             passportId, model: batch.public.model, performanceClass: batch.public.performanceClass,
+            batteryCategory: batch.public.batteryCategory,
         }));
         const { canonicalPayload, payloadHash } = hashPayload({ ...batch.payload, attributes });
         const passportIdHash = blake2b256Hex(passportId);

@@ -34,12 +34,20 @@ const kgCO2kWh = (v: number) => ({ 'kgCO2-equivalentPerKilowattHourValue': v, 'k
 const celsius = (v: number) => ({ celsiusValue: v, degreeCelsius: '°C' });
 const volt = (v: number) => ({ voltValue: v, volt: 'V' });
 
+/**
+ * Attributes only the EV guide models; the LMT and industrial guides reject
+ * them ("false schema"), so they are dropped for those categories.
+ */
+const EV_ONLY_ATTRIBUTES = new Set(['StateOfCertifiedEnergySOCE', 'CapacityThresholdForExhaustion']);
+
 export function defaultGuideAttributes(p: {
     passportId: string;
     model?: string | null;
     performanceClass?: string | null;
+    batteryCategory?: string | null; // EV (default) | INDUSTRIAL | LMT; picks the guide-specific set
 }): GuideAttributeRow[] {
     const pid = p.passportId;
+    const category = p.batteryCategory ?? 'EV';
     const urn = (kind: string, rest: string) => `urn:odatano:${kind}:${rest}`;
     const rows: Array<[string, string, unknown, GuideAttributeRow['accessClass']]> = [
         // Identifiers and product data (longlist #3-11)
@@ -132,7 +140,35 @@ export function defaultGuideAttributes(p: {
         [SYM, 'EUDeclarationOfConformity', urn('compliance', `EU-DoC-${pid}`), PUB],
         [SYM, 'ResultsOfTestReportsProvingCompliance', urn('compliance', `test-reports-${pid}`), AUTH],
     ];
-    return rows.map(([section, attribute, value, accessClass]) => ({
+
+    const filtered = category === 'EV' ? rows : rows.filter(([, attribute]) => !EV_ONLY_ATTRIBUTES.has(attribute));
+
+    if (category === 'INDUSTRIAL') {
+        // Required by Other_Industrial_2kWh_Guide beyond the common set.
+        filtered.push([CIRC, 'Post-consumerRecycledCobaltShare', pct(5.2), PUB]);
+    }
+    if (category === 'LMT') {
+        // The LMT guide requires the dynamic battery-state attributes
+        // (longlist #53-93, legitimate interest) plus the in-service date.
+        filtered.push(
+            [ID, 'DateOfPuttingTheBatteryIntoService', '2026-07-10', LI],
+            [PERF, 'RemainingCapacity', { amperehourMiliamperehourValue: 198, ampereHourMiliamperehour: 'Ah' }, LI],
+            [PERF, 'RemainingPowerCapability', { wattValueAt80SoC: 148500, wattValueAt20SoC: 118800, watt: 'W' }, LI],
+            [PERF, 'RemainingRoundTripEnergyEfficiency', pct(95.1), LI],
+            [PERF, 'EvolutionOfSelf-dischargeRates', pct(1.1), LI],
+            [PERF, 'EnergyThroughput', { kilowattHourValue: 120.5, kilowattHour: 'kWh' }, LI],
+            // The guide's unit key here is all-lowercase "amperehour" (unlike
+            // RatedCapacity's "ampereHour..."), and the times are bare minutes.
+            [PERF, 'CapacityThroughput', { amperehourMiliamperehourValue: 3200, amperehourMiliamperehour: 'Ah' }, LI],
+            [PERF, 'TimeSpentInExtremeTemperaturesAboveBoundary', 42, LI],
+            [PERF, 'TimeSpentInExtremeTemperaturesBelowBoundary', 15, LI],
+            [PERF, 'TimeSpentChargingDuringExtremeTemperaturesAboveBoundary', 8, LI],
+            [PERF, 'TimeSpentChargingDuringExtremeTemperaturesBelowBoundary', 3, LI],
+            [PERF, 'NumberOfDeepDischargeEvents', 2, LI],
+        );
+    }
+
+    return filtered.map(([section, attribute, value, accessClass]) => ({
         section, attribute, valueJson: JSON.stringify(value), accessClass,
     }));
 }

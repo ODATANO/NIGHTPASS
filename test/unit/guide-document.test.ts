@@ -64,6 +64,12 @@ describe('buildGuideDocument', () => {
         assert.equal(bare.Battery_Passport.SupplyChainDueDiligence, undefined);
         assert.ok(bare.Battery_Passport.IdentifiersAndProductData);
     });
+    it('maps non-EV categories to their guide enums and drops the EV-only energy field', () => {
+        const ind = buildGuideDocument({ ...PASSPORT, batteryCategory: 'INDUSTRIAL' }, [BATTERY], RECYCLED, []) as any;
+        assert.equal(ind.Battery_Passport.IdentifiersAndProductData.BatteryCategory.batteryCategoryValue, 'industrial/non-stationary battery');
+        assert.equal(ind.Battery_Passport.PerformanceAndDurability, undefined);
+        assert.equal(bp.PerformanceAndDurability.CertifiedUsableBatteryEnergy.kilowattHourValue, 75);
+    });
 });
 
 describe('defaultGuideAttributes', () => {
@@ -77,5 +83,22 @@ describe('defaultGuideAttributes', () => {
     it('hashableAttributes is order-stable (same hash input regardless of row order)', () => {
         const shuffled = [...rows].reverse();
         assert.deepEqual(hashableAttributes(shuffled), hashableAttributes(rows));
+    });
+    it('INDUSTRIAL set drops EV-only attrs and adds the required cobalt share', () => {
+        const ind = defaultGuideAttributes({ passportId: 'BAT-X', batteryCategory: 'INDUSTRIAL' });
+        assert.equal(ind.length, 64);
+        const names = new Set(ind.map((r) => r.attribute));
+        assert.ok(!names.has('StateOfCertifiedEnergySOCE'));
+        assert.ok(!names.has('CapacityThresholdForExhaustion'));
+        assert.ok(names.has('Post-consumerRecycledCobaltShare'));
+    });
+    it('LMT set adds the dynamic battery-state attributes as legitimate interest', () => {
+        const lmt = defaultGuideAttributes({ passportId: 'BAT-X', batteryCategory: 'LMT' });
+        assert.equal(lmt.length, 75);
+        const byName = new Map(lmt.map((r) => [r.attribute, r]));
+        assert.ok(!byName.has('StateOfCertifiedEnergySOCE'));
+        assert.equal(byName.get('RemainingCapacity')?.accessClass, 'legitimateInterest');
+        assert.equal(JSON.parse(byName.get('TimeSpentInExtremeTemperaturesAboveBoundary')!.valueJson), 42);
+        assert.equal(JSON.parse(byName.get('CapacityThroughput')!.valueJson).amperehourMiliamperehour, 'Ah');
     });
 });

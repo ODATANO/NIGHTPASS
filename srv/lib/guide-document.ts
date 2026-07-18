@@ -30,7 +30,9 @@ export interface AttributeRow { section?: string | null; attribute?: string | nu
 
 const CATEGORY_LABEL: Record<string, string> = {
     EV: 'electric vehicle battery',
-    INDUSTRIAL: 'industrial battery',
+    // Enum value of the Other_Industrial_2kWh_Guide (the guide INDUSTRIAL
+    // passports validate against); plain "industrial battery" is rejected.
+    INDUSTRIAL: 'industrial/non-stationary battery',
     LMT: 'LMT battery',
 };
 
@@ -73,7 +75,9 @@ export function buildGuideDocument(
     };
 
     const performance: Record<string, unknown> = {
-        ...(b.capacityKwh != null
+        // Usable-energy is an EV-guide attribute; the LMT and industrial
+        // guides reject it, so it is only emitted for EV passports.
+        ...(b.capacityKwh != null && (p.batteryCategory ?? 'EV') === 'EV'
             ? { CertifiedUsableBatteryEnergy: { kilowattHourValue: Number(b.capacityKwh), kilowattHour: 'kWh' } }
             : {}),
         ...(b.roundTripEfficiencyPct != null ? { InitialRoundTripEnergyEfficiency: pct(b.roundTripEfficiencyPct) } : {}),

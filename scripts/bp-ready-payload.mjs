@@ -25,7 +25,8 @@ const b = batteries[0] ?? {};
 
 const CATEGORY_LABEL = {
   EV: 'electric vehicle battery',
-  INDUSTRIAL: 'industrial battery',
+  // Enum value of the Other_Industrial_2kWh_Guide; plain "industrial battery" is rejected.
+  INDUSTRIAL: 'industrial/non-stationary battery',
   LMT: 'LMT battery',
 };
 
@@ -68,7 +69,8 @@ const identifiers = {
 };
 
 const performance = {
-  ...(b.capacityKwh != null
+  // EV-guide attribute; the LMT and industrial guides reject it.
+  ...(b.capacityKwh != null && (p.batteryCategory ?? 'EV') === 'EV'
     ? { CertifiedUsableBatteryEnergy: { kilowattHourValue: Number(b.capacityKwh), kilowattHour: 'kWh' } }
     : {}),
   ...(b.roundTripEfficiencyPct != null
