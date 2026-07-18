@@ -4,7 +4,7 @@ import crypto from 'node:crypto';
 import express from 'express';
 import { verifyPeers, explorerLinks, passportSources } from './lib/passport-anchor';
 
-const { SELECT, INSERT, UPDATE } = cds.ql;
+const { SELECT, INSERT, UPDATE, DELETE } = cds.ql;
 
 /**
  * NIGHTPASS bootstrap extras: the public QR landing resolver and the QR
@@ -256,12 +256,34 @@ cds.on('bootstrap', (app: any) => {
             const data: Record<string, unknown> = {};
             for (const f of INGEST_FIELDS) if (req.body[f] !== undefined) data[f] = req.body[f];
             const existing: any = await SELECT.one.from('passport.Passports').columns('ID').where({ passportId });
-            if (existing) {
-                await UPDATE.entity('passport.Passports').set(data).where({ ID: existing.ID });
+            let ID = existing?.ID as string | undefined;
+            if (ID) {
+                await UPDATE.entity('passport.Passports').set(data).where({ ID });
             } else {
-                await INSERT.into('passport.Passports').entries({ ID: cds.utils.uuid(), passportId, ...data });
+                ID = cds.utils.uuid();
+                await INSERT.into('passport.Passports').entries({ ID, passportId, ...data });
             }
-            cds.log('publish-ingest').info(`ingested passport ${passportId} (${data.status ?? '?'})`);
+            // Proven ZK claims (claim + threshold + proof tx, no values): replace
+            // this passport's rows so re-publishes stay idempotent. Thresholds
+            // arrive in RAW units and are stored scaled (milli-units), the same
+            // convention the local prove path uses.
+            if (Array.isArray(req.body.claims)) {
+                await DELETE.from('passport.PredicateProofLog').where({ passport_ID: ID });
+                const rows = req.body.claims
+                    .filter((c: any) => c && c.sourceField && (c.predicate === 'lessOrEqual' || c.predicate === 'greaterOrEqual'))
+                    .map((c: any) => ({
+                        ID: cds.utils.uuid(), passport_ID: ID,
+                        sourceField: String(c.sourceField).slice(0, 120),
+                        predicate: c.predicate,
+                        threshold: Math.round(Number(c.threshold ?? 0) * 1000),
+                        unit: String(c.unit ?? '').slice(0, 60),
+                        txHash: String(c.txHash ?? '').slice(0, 120),
+                        status: 'succeeded', result: true,
+                        ...(c.provenAt ? { createdAt: c.provenAt } : {}),
+                    }));
+                if (rows.length) await INSERT.into('passport.PredicateProofLog').entries(rows);
+            }
+            cds.log('publish-ingest').info(`ingested passport ${passportId} (${data.status ?? '?'}, ${req.body.claims?.length ?? 0} claims)`);
             return res.status(existing ? 200 : 201).json({ status: existing ? 'updated' : 'created', passportId });
         } catch (e: any) {
             cds.log('publish-ingest').error('ingest failed:', e?.message ?? e);

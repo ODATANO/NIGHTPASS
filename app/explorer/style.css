@@ -316,6 +316,49 @@ tr.row-glow { animation: rowGlow 900ms ease-out 1; }
 .stat:hover, .qr-card:hover { transform: translateY(-2px); border-color: #333949; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35); }
 .detail-grid { perspective: 1200px; }
 
+/* ---------- Proven ZK claims ---------- */
+.zk-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: 6px;
+  padding: 2px 8px;
+  border: 1px solid var(--accent-2);
+  border-radius: 999px;
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 600;
+  vertical-align: middle;
+  white-space: nowrap;
+}
+.zk-chip .shield { flex: none; }
+.claims-note { color: var(--ink-2); font-size: 13px; padding: 10px 16px 0; margin: 0; }
+.claims { display: flex; flex-direction: column; gap: 8px; padding: 12px 16px 16px; }
+.claim {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 10px 12px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.claim-shield { color: var(--good); display: inline-flex; }
+.claim-shield .shield { width: 16px; height: 16px; }
+.claim-field { font-weight: 600; }
+.claim-bound {
+  font-family: var(--mono);
+  color: var(--accent);
+  background: rgba(122, 162, 255, 0.08);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 2px 8px;
+}
+.claim-proof { color: var(--ink-2); font-size: 12px; margin-left: auto; }
+.claim-verify { display: inline-flex; align-items: center; gap: 8px; }
+.claim-verify .btn { padding: 4px 10px; font-size: 12px; }
+
 /* ---------- Pager (from 11 rows on: 10 per page, newest first) ---------- */
 .pager {
   display: flex;

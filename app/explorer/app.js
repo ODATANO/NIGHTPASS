@@ -156,6 +156,44 @@ var API = "/api/v1/passport";
     return '<button class="copy" data-copy="' + esc(value) + '" title="Copy">&#10697;</button>';
   }
 
+  // ---------- proven ZK claims ----------
+
+  var CLAIM_FIELD_LABELS = {
+    carbonFootprintKgCO2: "CO₂ footprint",
+    capacityKwh: "Capacity",
+    recycledContentPct: "Recycled content",
+    cycleLife: "Cycle life",
+    roundTripEfficiencyPct: "Round-trip efficiency",
+    leadContentPpm: "Lead content",
+    recycledCoPct: "Recycled cobalt share",
+    recycledLiPct: "Recycled lithium share",
+    recycledNiPct: "Recycled nickel share"
+  };
+
+  function claimLabel(field) {
+    return CLAIM_FIELD_LABELS[field] || field;
+  }
+  function claimBound(claim) {
+    var op = claim.predicate === "greaterOrEqual" ? "≥" : "≤";
+    var n = Number(claim.threshold);
+    var num = isFinite(n) ? String(+n.toFixed(3)) : esc(String(claim.threshold));
+    return op + " " + num + (claim.unit ? " " + esc(claim.unit) : "");
+  }
+  function shieldSvg() {
+    return '<svg class="shield" viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">' +
+      '<path d="M8 1.5l5 2v4c0 3.2-2.1 5.5-5 7-2.9-1.5-5-3.8-5-7v-4z" fill="none" ' +
+      'stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/>' +
+      '<path d="M5.6 8l1.7 1.7 3-3.4" fill="none" stroke="currentColor" stroke-width="1.4" ' +
+      'stroke-linecap="round" stroke-linejoin="round"/></svg>';
+  }
+  /** Small list-row badge: how many ZK-proven claims this passport carries. */
+  function claimsBadge(row) {
+    var n = (row.claims || []).length;
+    if (!n) return "";
+    var tip = row.claims.map(function (c) { return claimLabel(c.sourceField) + " " + claimBound(c); }).join("\n");
+    return '<span class="zk-chip" title="' + esc(tip) + '">' + shieldSvg() + n + " ZK</span>";
+  }
+
   // ---------- data ----------
 
   function load() {
@@ -328,7 +366,7 @@ var API = "/api/v1/passport";
     return "<tr data-pid=\"" + pid + "\">" +
       '<td class="mono"><a href="#/p/' + encodeURIComponent(row.passportId) + '">' + pid + "</a>" +
         '<div class="sub">' + esc(row.model || "") + "</div></td>" +
-      "<td>" + chip(row.status) + "</td>" +
+      "<td>" + chip(row.status) + claimsBadge(row) + "</td>" +
       '<td class="mono" title="' + esc(row.payloadHash || "") + '">' + esc(shortHash(row.payloadHash)) + "</td>" +
       '<td class="mono">' + (row.explorerUrl
         ? '<a href="' + esc(row.explorerUrl) + '" target="_blank" rel="noopener" title="' + esc(row.attestationTxHash || "") + '">' + esc(shortHash(row.attestationTxHash)) + "</a>"
@@ -394,11 +432,13 @@ var API = "/api/v1/passport";
     Array.prototype.forEach.call(app.querySelectorAll(".verify-row"), function (btn) {
       btn.addEventListener("click", function () { verifyRow(Number(btn.dataset.i)); });
     });
-    // Double-click anywhere on a row opens the passport's detail page (the ID
-    // link keeps working for single-click / middle-click).
+    // A click anywhere on a row opens the passport's detail page; links and
+    // buttons inside the row keep their own behavior. Selecting text (e.g. a
+    // hash to copy) does not navigate.
     Array.prototype.forEach.call(app.querySelectorAll("tbody tr[data-pid]"), function (tr) {
-      tr.addEventListener("dblclick", function (ev) {
+      tr.addEventListener("click", function (ev) {
         if (ev.target.closest("a, button")) return;
+        if (String(window.getSelection && window.getSelection())) return;
         location.hash = "#/p/" + encodeURIComponent(tr.getAttribute("data-pid"));
       });
     });
@@ -454,6 +494,40 @@ var API = "/api/v1/passport";
     return "<div>" + esc(label) + "</div><div>" + (valueHtml || "&ndash;") + "</div>";
   }
 
+  /** "Proven claims" panel: one badge per ZK-proven predicate. The exact value
+   * never appears; only the claim, its bound and the on-chain proof tx. Each
+   * claim can be LIVE-verified against the vault's ledger state (button). */
+  function claimsPanelHtml(row, canVerify) {
+    var claims = row.claims || [];
+    if (!claims.length) return "";
+    return '<section class="panel">' +
+      '<div class="panel-head"><h2>Proven claims</h2>' +
+        '<span class="net" title="Zero-knowledge predicate proofs on Midnight">zero-knowledge</span></div>' +
+      '<p class="claims-note">The exact values stay confidential. Each claim was proven in zero-knowledge ' +
+        "against this passport's anchored content and carries its own on-chain proof transaction.</p>" +
+      '<div class="claims">' + claims.map(function (c, i) {
+        var tx = !c.txHash ? "" :
+          c.explorerUrl
+            ? '<a href="' + esc(c.explorerUrl) + '" target="_blank" rel="noopener" class="mono" title="' + esc(c.txHash) + '">' + esc(shortHash(c.txHash)) + "</a>"
+            : '<span class="mono" title="' + esc(c.txHash) + '">' + esc(shortHash(c.txHash)) + "</span>";
+        return '<div class="claim">' +
+          '<span class="claim-shield">' + shieldSvg() + "</span>" +
+          '<span class="claim-field">' + esc(claimLabel(c.sourceField)) + "</span>" +
+          '<span class="claim-bound">' + claimBound(c) + "</span>" +
+          '<span class="claim-proof">proven in ZK' + (tx ? " &middot; tx " + tx : "") + "</span>" +
+          '<span class="claim-verify"><button class="btn verify-claim" data-ci="' + i + '"' + (canVerify ? "" : " disabled") + ">Verify</button> " +
+            '<span class="vstate" id="cvs-' + i + '"></span></span>' +
+          "</div>";
+      }).join("") + "</div></section>";
+  }
+
+  function verifyClaimUrl(pid, c) {
+    var q = (s) => encodeURIComponent("'" + String(s).replace(/'/g, "''") + "'");
+    return API + "/verifyClaimOnChain(passportId=" + q(pid) +
+      ",sourceField=" + q(c.sourceField) + ",predicate=" + q(c.predicate) +
+      ",threshold=" + encodeURIComponent(String(c.threshold)) + ")";
+  }
+
   function renderDetail(pid) {
     var row = state.rows.find(function (r) { return r.passportId === pid; });
     if (!row) {
@@ -501,6 +575,7 @@ var API = "/api/v1/passport";
             kv("Created", row.createdAt ? esc(new Date(row.createdAt).toLocaleString()) + ' <span class="sub">(' + esc(relTime(row.createdAt)) + ")</span>" : "") +
           "</div>" +
         "</section>" +
+        claimsPanelHtml(row, canVerify) +
         "</div>" +
         '<section class="panel qr-card">' +
           '<img src="/qr/' + encodeURIComponent(row.passportId) + '.png" alt="QR code for ' + esc(row.passportId) + '"/>' +
@@ -546,6 +621,32 @@ var API = "/api/v1/passport";
 
     var vBtn = document.getElementById("verifyBtn");
     vBtn.addEventListener("click", runVerify);
+
+    // Per-claim live verification: read the vault's ledger state for exactly
+    // this claim key. Same capability rules as the anchor verify.
+    Array.prototype.forEach.call(app.querySelectorAll(".verify-claim"), function (btn) {
+      btn.addEventListener("click", function () {
+        var c = (row.claims || [])[Number(btn.dataset.ci)];
+        var el = document.getElementById("cvs-" + btn.dataset.ci);
+        if (!c || !el) return;
+        el.innerHTML = '<span class="vstate info checking">checking…</span>';
+        fetch(verifyClaimUrl(row.passportId, c))
+          .then(function (r) { return r.json(); })
+          .then(function (b) {
+            if (b.verified === true) {
+              el.innerHTML = '<span class="vstate ok">' + checkSvg() + "proven on " + esc(b.checkedNetwork || "chain") + "</span>";
+              drawCheck(el);
+              flash(btn.closest(".claim"), "row-glow");
+            } else if (!b.checkedNetwork) {
+              el.innerHTML = '<span class="vstate info">cannot check here</span>';
+            } else {
+              el.innerHTML = '<span class="vstate warn">not confirmed</span>';
+              flash(el, "shake");
+            }
+          })
+          .catch(function () { el.innerHTML = '<span class="vstate err">check failed</span>'; });
+      });
+    });
     if (row.status === "anchored") {
       if (!canVerify) {
         showBanner("warn", "Anchored on " + row.anchorNetwork,

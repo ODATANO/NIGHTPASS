@@ -139,6 +139,28 @@ service PassportService {
     };
 
     /**
+     * Anonymous LIVE check of one proven ZK claim (crawler-free ledger read):
+     * does the vault record a true result for the claim key (payloadHash of the
+     * passport, field, predicate, threshold)? `threshold` in RAW units, exactly
+     * as `anchorExplorer().claims[]` serves it. Never the value itself.
+     */
+    function verifyClaimOnChain(passportId: String,
+                                sourceField: String,
+                                predicate: String,        // lessOrEqual | greaterOrEqual
+                                threshold: Decimal(14, 3) // RAW units
+    )                                                returns {
+        passportId     : String;
+        sourceField    : String;
+        predicate      : String;
+        threshold      : Decimal(14, 3);
+        verified       : Boolean; // live ledger read: claim key proven true in the vault
+        anchorNetwork  : String;
+        serverNetwork  : String;
+        checkedNetwork : String;  // network the live read actually ran on (null = read skipped)
+        checkedAt      : String;
+    };
+
+    /**
      * Public anchor explorer (showcase): every passport this demo issued and its
      * Midnight anchoring state, anchored rows first. Only Point-1 identity plus
      * the anchor metadata that is public by design (it lives on-chain and is
@@ -154,7 +176,7 @@ service PassportService {
         manufactureDate   : String;
         weightKg          : Decimal(10, 3);
         performanceClass  : String;
-        qrCodeUrl         : String;
+        qrCodeUrl        : String;
         status            : String;
         payloadHash       : String;
         contractAddress   : String;
@@ -162,5 +184,16 @@ service PassportService {
         attestationTxHash : String;
         explorerUrl       : String;
         createdAt         : String;
+        // Successfully proven ZK predicate claims (public by design: the claim,
+        // threshold and proof tx; the underlying value stays confidential).
+        claims            : array of {
+            sourceField : String;
+            predicate   : String;  // lessOrEqual | greaterOrEqual
+            threshold   : Decimal(14, 3); // RAW units (kg CO2e, kWh, %)
+            unit        : String;
+            txHash      : String;
+            explorerUrl : String;
+            provenAt    : String;
+        };
     };
 }

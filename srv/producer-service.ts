@@ -495,11 +495,23 @@ export default class ProducerService extends cds.ApplicationService {
             .where({ passportId });
         if (!p) return req.reject(404, `passport '${passportId}' not found`);
         if (p.status !== 'anchored') return req.reject(400, `passport '${passportId}' is not anchored (status: ${p.status})`);
+        // Proven ZK claims travel with the public fields (claim + threshold +
+        // proof tx are public by design; the underlying value never leaves).
+        const rowId: any = await SELECT.one.from(Passports).columns('ID').where({ passportId });
+        const proofs: any[] = await SELECT.from(PredicateProofLog)
+            .columns('sourceField', 'predicate', 'threshold', 'unit', 'txHash', 'createdAt')
+            .where({ passport_ID: rowId.ID, status: 'succeeded', result: true })
+            .orderBy('createdAt');
+        const claims = proofs.map((c) => ({
+            sourceField: c.sourceField, predicate: c.predicate,
+            threshold: Number(c.threshold) / 1000, unit: c.unit ?? '',
+            txHash: c.txHash ?? '', provenAt: c.createdAt ?? null,
+        }));
         try {
             const res = await fetch(`${url.replace(/\/+$/, '')}/api/v1/passport/ingest`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${secret}` },
-                body: JSON.stringify(p),
+                body: JSON.stringify({ ...p, claims }),
                 signal: AbortSignal.timeout(30000),
             });
             const body: any = await res.json().catch(() => ({}));

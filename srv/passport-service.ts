@@ -1,7 +1,7 @@
 import cds from '@sap/cds';
 import QRCode from 'qrcode';
 import { Passport, Passports, PredicateProofLog, Partners } from '#cds-models/passport';
-import { hashPayload, blake2b256Hex, encryptPayload, anchorPassport, effectiveNetwork, explorerTxUrl, verifyPeers } from './lib/passport-anchor';
+import { hashPayload, blake2b256Hex, encryptPayload, anchorPassport, effectiveNetwork, explorerTxUrl, verifyPeers, fieldKeyHex } from './lib/passport-anchor';
 import { defaultGuideAttributes, hashableAttributes } from './lib/guide-attribute-defaults';
 import { granteeIdForDid } from './lib/grantee';
 import { rowToBatch, type Batch, type GoodsReceiptRow } from './lib/goods-receipt';
@@ -200,6 +200,7 @@ export default class PassportService extends cds.ApplicationService {
         this.on('passportCredential', this.passportCredential);
         this.on('registerPartner', this.registerPartner);
         this.on('verifyOnChain', this.verifyOnChain);
+        this.on('verifyClaimOnChain', this.verifyClaimOnChain);
         this.on('anchorExplorer', this.anchorExplorer);
 
         // Disclosure-tier gating: redact restricted fields per requester
@@ -464,12 +465,94 @@ export default class PassportService extends cds.ApplicationService {
      * first, newest first within a status. DB-only (no ledger reads here); the
      * UI verifies rows live via verifyOnChain on demand.
      */
+    /**
+     * Anonymous LIVE check of one proven ZK claim: does the vault's on-chain
+     * state record a true result for the claim key (payloadHash, field,
+     * predicate, threshold)? Crawler-free via NIGHTGATE verifyPredicateState;
+     * `threshold` arrives in RAW units and is scaled x1000 to the same integer
+     * the circuit hashed into the claim key. Mirrors verifyOnChain: technical
+     * user for the plugin call, network override for cross-network rows,
+     * failures degrade to verified:false (never 5xx).
+     */
+    private verifyClaimOnChain = async (req: cds.Request) => {
+        const { passportId, sourceField, predicate, threshold } = req.data as {
+            passportId?: string; sourceField?: string; predicate?: string; threshold?: number;
+        };
+        const pid = String(passportId ?? '').trim();
+        if (!pid) return req.reject(400, 'passportId is required');
+        if (!sourceField) return req.reject(400, 'sourceField is required');
+        const pred = predicate === 'greaterOrEqual' ? 'greaterOrEqual' : 'lessOrEqual';
+        const row = await SELECT.one.from(Passports)
+            .columns('passportId', 'payloadHash', 'contractAddress', 'anchorNetwork', 'status')
+            .where({ passportId: pid });
+        if (!row) return req.reject(404, `passport '${pid}' not found`);
+
+        const norm = (h: unknown) => String(h ?? '').replace(/^0x/, '').toLowerCase();
+        const payloadHash = norm(row.payloadHash);
+        const contractAddress = norm(row.contractAddress);
+        const serverNetwork = effectiveNetwork();
+        const anchorNetwork = (row as Record<string, unknown>).anchorNetwork as string | null ?? null;
+        const crossNetwork = !!anchorNetwork && anchorNetwork !== serverNetwork;
+        const canOverride = !!(cds.model?.definitions?.['NightgateService.verifyPredicateState'] as any)?.params?.network;
+
+        let verified = false;
+        let checkedNetwork: string | null = null;
+        if (payloadHash && contractAddress && (!crossNetwork || canOverride)) {
+            checkedNetwork = crossNetwork ? anchorNetwork : serverNetwork;
+            try {
+                const nightgate = await cds.connect.to('NightgateService');
+                const verifier = new (cds.User as any)({ id: 'passport-verifier' });
+                const res: any = await (nightgate as any).tx({ user: verifier }, (tx: any) =>
+                    tx.send('verifyPredicateState', {
+                        contractAddress,
+                        payloadHash,
+                        fieldKey: fieldKeyHex(String(sourceField)),
+                        predicate: pred,
+                        threshold: Math.round(Number(threshold ?? 0) * 1000),
+                        compiledArtifactRef: 'attestation-vault',
+                        ...(crossNetwork ? { network: anchorNetwork } : {})
+                    }));
+                verified = res?.verified === true;
+            } catch { /* indexer unreachable or contract unknown: stay unverified */ }
+        }
+        return {
+            passportId: row.passportId,
+            sourceField,
+            predicate: pred,
+            threshold: Number(threshold ?? 0),
+            verified,
+            anchorNetwork,
+            serverNetwork,
+            checkedNetwork,
+            checkedAt: new Date().toISOString()
+        };
+    };
+
     private anchorExplorer = async () => {
         const rows = await SELECT.from(Passports)
-            .columns('passportId', 'model', 'manufacturerId', 'batteryCategory', 'status',
+            .columns('ID', 'passportId', 'model', 'manufacturerId', 'batteryCategory', 'status',
                 'manufactureDate', 'weightKg', 'performanceClass', 'qrCodeUrl',
                 'payloadHash', 'contractAddress', 'anchorNetwork', 'attestationTxHash', 'createdAt')
             .orderBy('createdAt desc');
+        // Successfully proven ZK claims per passport. Public by design: claim,
+        // threshold (scaled back to raw units) and proof tx; never the value.
+        const proofs: any[] = await SELECT.from(PredicateProofLog)
+            .columns('passport_ID', 'sourceField', 'predicate', 'threshold', 'unit', 'txHash', 'createdAt')
+            .where({ status: 'succeeded', result: true })
+            .orderBy('createdAt');
+        const claimsByPassport = new Map<string, unknown[]>();
+        for (const p of proofs) {
+            const list = claimsByPassport.get(p.passport_ID) ?? [];
+            list.push({
+                sourceField: p.sourceField,
+                predicate: p.predicate,
+                threshold: Number(p.threshold) / 1000,
+                unit: p.unit ?? '',
+                txHash: p.txHash ?? '',
+                provenAt: p.createdAt ?? null,
+            });
+            claimsByPassport.set(p.passport_ID, list);
+        }
         const norm = (h: unknown) => String(h ?? '').replace(/^0x/, '').toLowerCase();
         const rank: Record<string, number> = { anchored: 0, anchoring: 1, failed: 2, draft: 3 };
         return (rows as Record<string, unknown>[])
@@ -489,7 +572,10 @@ export default class PassportService extends cds.ApplicationService {
                 anchorNetwork: r.anchorNetwork ?? null,
                 attestationTxHash: r.attestationTxHash ?? null,
                 explorerUrl: explorerTxUrl(r.attestationTxHash as string | null, r.anchorNetwork as string | null),
-                createdAt: r.createdAt ?? null
+                createdAt: r.createdAt ?? null,
+                claims: (claimsByPassport.get(String(r.ID)) ?? []).map((c: any) => ({
+                    ...c, explorerUrl: explorerTxUrl(c.txHash, r.anchorNetwork as string | null),
+                })),
             }));
     };
 
