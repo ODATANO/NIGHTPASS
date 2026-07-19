@@ -1,0 +1,12 @@
+# Caddyfile WITH the "Try it" demo subdomain. Swap in at demo rollout:
+#   cp Caddyfile.demo Caddyfile && docker compose restart caddy
+# Requires TRY_DOMAIN in deploy/.env (e.g. demo.zkpassport.eu, A record live).
+{$DEMO_DOMAIN} {
+	reverse_proxy nightpass:4004
+	encode gzip
+}
+
+{$TRY_DOMAIN} {
+	reverse_proxy nightpass-demo:4004
+	encode gzip
+}

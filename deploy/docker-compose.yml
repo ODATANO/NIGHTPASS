@@ -10,12 +10,43 @@ services:
     volumes:
       - passport-db:/data
 
+  # ---- "Try it" demo instance (profile: demo, off by default) --------------
+  # Anchors visitor passports on preview with a dedicated sponsor wallet and
+  # publishes them into the main explorer via the ingest endpoint. Start with
+  # `docker compose --profile demo up -d` AFTER filling .env.demo and swapping
+  # in Caddyfile.demo (see README, "Try-it demo instance").
+  nightpass-demo:
+    build: ..
+    restart: unless-stopped
+    profiles: ["demo"]
+    env_file: .env.demo
+    expose: ["4004"]
+    volumes:
+      - passport-demo-db:/data
+    depends_on:
+      - proof-server
+
+  # ZK proof server for the demo instance's anchor/proof transactions.
+  # Internal network only, never published to the host.
+  proof-server:
+    image: midnightntwrk/proof-server:8.1.0
+    restart: unless-stopped
+    profiles: ["demo"]
+    command: ["midnight-proof-server"]
+    expose: ["6300"]
+
   caddy:
     image: caddy:2-alpine
     restart: unless-stopped
     ports: ["80:80", "443:443"]
     environment:
       DEMO_DOMAIN: ${DEMO_DOMAIN}
+      # Subdomain of the "Try it" demo; only read once Caddyfile.demo is
+      # swapped in (README, "Try-it demo instance"). The non-empty fallback is
+      # a guard: an EMPTY value would expand to a Caddy site block with no
+      # address and break config load for BOTH domains; 'demo.invalid' merely
+      # fails its own cert issuance while the main site keeps serving.
+      TRY_DOMAIN: ${TRY_DOMAIN:-demo.invalid}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data
@@ -23,5 +54,6 @@ services:
 
 volumes:
   passport-db:
+  passport-demo-db:
   caddy-data:
   caddy-config:

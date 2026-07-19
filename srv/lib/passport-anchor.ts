@@ -356,9 +356,15 @@ async function runStep(kind: string, fn: () => Promise<string>): Promise<string>
         catch (e) {
             lastErr = e;
             const msg = String((e as Error)?.message ?? e);
-            // Retryable: 1014 (pool rejected the tx outright, wallet dust state
-            // settling) and sqlite write contention (a facade-persist of the
-            // multi-MB dust blob can hold the write lock past the busy timeout).
+            // Retryable: ONLY 1014 (pool rejected the tx outright, wallet dust
+            // state settling) and sqlite write contention (a facade-persist of
+            // the multi-MB dust blob can hold the write lock past the busy
+            // timeout). Both are provably pre-mempool, so a retry can never
+            // double-anchor. Upstream HTTP 4xx is deliberately NOT retried:
+            // the 'Received status code 4xx' string is the GraphQL client's
+            // generic error for EVERY indexer call, including reads that
+            // happen AFTER the node accepted the tx; retrying on it could
+            // rebuild and resubmit a tx that is already in the mempool.
             if (!/\b1014\b|database is locked/i.test(msg)) break;
             cds.log('producer').warn(`anchor step ${kind} hit a retryable error (${msg.slice(0, 60)}), retrying...`);
         }

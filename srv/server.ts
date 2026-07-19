@@ -17,6 +17,14 @@ const { SELECT, INSERT, UPDATE, DELETE } = cds.ql;
  * so the view preselects the battery.
  */
 cds.on('bootstrap', (app: any) => {
+    // Behind a reverse proxy (Caddy on the public hosts) req.ip is the proxy
+    // container's address unless Express is told to trust X-Forwarded-For.
+    // Without this every visitor shares ONE per-IP rate/cap bucket (demo caps,
+    // NIGHTGATE limiters). Opt-in: only the proxied deployments set it, and
+    // trusting XFF without a proxy in front would let clients spoof their IP.
+    if (process.env.PASSPORT_TRUST_PROXY === 'true') {
+        app.set('trust proxy', 1);
+    }
     // --- Public-surface gate (PASSPORT_PUBLIC_SURFACE=explorer) --------------
     // Deployment split: a PUBLIC instance serves ONLY the explorer surface
     // (static app + anonymous GET read API + QR/resolver); cockpit, tiered
@@ -43,6 +51,31 @@ cds.on('bootstrap', (app: any) => {
             next();
         });
         app.get('/', (_req: any, res: any) => res.redirect(302, '/explorer/'));
+    }
+    // The "Try it" demo instance: only the demo app + its service surface.
+    // Anchoring runs server-side through internal service calls, so none of
+    // the cockpit/NIGHTGATE HTTP surfaces need to be public here.
+    if (surface === 'demo') {
+        app.use((req: any, res: any, next: any) => {
+            const p = String(req.path || '');
+            // Only the demo app + its service; the service surface is
+            // additionally method-narrowed (actions/functions only need
+            // GET + POST, so PATCH/DELETE/PUT are cut at the gate).
+            const allowed =
+                p === '/' ||
+                p === '/demo' || p.startsWith('/demo/') ||
+                (p.startsWith('/api/v1/demo') && (req.method === 'GET' || req.method === 'POST'));
+            if (!allowed) return res.status(404).json({ error: 'not on this surface' });
+            next();
+        });
+        app.get('/', (_req: any, res: any) => res.redirect(302, '/demo/'));
+    }
+    // FAIL CLOSED on unknown surface values: a typo'd PASSPORT_PUBLIC_SURFACE
+    // on a public host must never silently expose the full internal surface.
+    if (surface && surface !== 'explorer' && surface !== 'demo') {
+        console.error(`[surface] UNKNOWN PASSPORT_PUBLIC_SURFACE='${surface}': denying ALL requests (use 'explorer' or 'demo')`);
+        app.use((_req: any, res: any) =>
+            res.status(503).json({ error: `unknown public surface '${surface}'` }));
     }
 
     // --- BatteryPass-Ready conformance surface (DPP_API_ENABLED=true) --------

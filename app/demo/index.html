@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Try it - anchor your own ZK battery passport | NIGHTPASS</title>
+  <meta name="description"
+    content="Anchor your own zero-knowledge battery passport on Midnight in five minutes. No wallet, no tokens, no signup." />
+  <!-- Link previews (Open Graph + Twitter). og:image must be an absolute URL. -->
+  <meta property="og:type" content="website" />
+  <meta property="og:site_name" content="zkpassport.eu" />
+  <meta property="og:title" content="Anchor your own battery passport on Midnight" />
+  <meta property="og:description"
+    content="No wallet, no tokens, no signup. Five minutes, zero-knowledge proof included. Live on Midnight preview." />
+  <meta property="og:url" content="https://demo.zkpassport.eu/demo/" />
+  <meta property="og:image" content="https://demo.zkpassport.eu/demo/og-image.png" />
+  <meta property="og:image:width" content="2400" />
+  <meta property="og:image:height" content="1260" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content="Anchor your own battery passport on Midnight" />
+  <meta name="twitter:description"
+    content="No wallet, no tokens, no signup. Five minutes, zero-knowledge proof included. Live on Midnight preview." />
+  <meta name="twitter:image" content="https://demo.zkpassport.eu/demo/og-image.png" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+
+<body>
+  <header class="site-header">
+    <a class="brand" href="./">
+      <span class="brand-mark"></span>
+      <span class="brand-text">NIGHTPASS <em>try it live</em></span>
+    </a>
+    <div class="header-status" id="headerStatus"></div>
+  </header>
+
+  <main class="wrap">
+
+    <!-- ============ view: landing ============ -->
+    <section id="viewLanding" class="view">
+      <h1 class="hero-title">Create your own <em>battery passport</em><br />and anchor it on Midnight.</h1>
+      <p class="hero-sub">
+        In about five minutes you will create a small battery passport, anchor
+        it on the Midnight blockchain and prove a confidential claim about it,
+        without revealing the number. <strong>No wallet extension, no tokens,
+          no signup.</strong>
+      </p>
+      <div class="cta-row">
+        <button id="btnStart" class="btn-primary">Start the demo</button>
+        <span id="landingInfo" class="muted"></span>
+      </div>
+      <div class="fact-row">
+        <div class="fact">
+          <div class="fact-k">5</div>
+          <div class="fact-v">custom fields per Passport</div>
+        </div>
+        <div class="fact">
+          <div class="fact-k">4</div>
+          <div class="fact-v">real transactions on Midnight Preview per Passport</div>
+        </div>
+        <div class="fact">
+          <div class="fact-k">1</div>
+          <div class="fact-v">confidential value, proven not revealed</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ view: form ============ -->
+    <section id="viewForm" class="view" hidden>
+      <h2>Your producer identity</h2>
+      <div class="panel identity-panel">
+        <div class="id-row"><span class="id-label">NIGHT address</span><code id="idNight" class="hash"></code></div>
+        <div class="id-row"><span class="id-label">Shielded address</span><code id="idShielded" class="hash"></code>
+        </div>
+        <p class="muted small">Freshly created for you. Your passport is issued and anchored under this identity.</p>
+      </div>
+
+      <h2>Your battery passport</h2>
+      <form id="passportForm" class="panel form-panel">
+        <div class="grid2">
+          <label>Model name
+            <input id="fModel" required maxlength="40" pattern="[A-Za-z0-9 ._\-]{2,40}"
+              placeholder="e.g. MyCell EV-60" />
+          </label>
+          <label>Manufacturer
+            <input id="fManufacturer" required maxlength="40" pattern="[A-Za-z0-9 ._\-]{2,40}"
+              placeholder="e.g. DemoWorks" />
+          </label>
+          <label>Weight (kg)
+            <input id="fWeight" required type="number" min="1" max="5000" step="1" value="300" />
+          </label>
+          <label>Performance class
+            <select id="fPerf" required>
+              <option value="A">A</option>
+              <option value="B" selected>B</option>
+              <option value="C">C</option>
+              <option value="D">D</option>
+              <option value="E">E</option>
+            </select>
+            <span class="hint">Public, shown on the explorer next to model and weight.</span>
+          </label>
+          <label class="confidential">
+            <span class="lock" aria-hidden="true"></span>Carbon footprint (kg CO2e) <span
+              class="chip-conf">confidential</span>
+            <input id="fCo2" required type="number" min="1" max="100000" step="1" value="3900" />
+            <span class="hint">Never published, never on-chain in clear. Only a proof about it.</span>
+          </label>
+          <label>Prove publicly: CO2 is at most (kg CO2e)
+            <input id="fThreshold" required type="number" min="1" max="200000" step="1" value="4000" />
+            <span class="hint">The claim everyone can verify, without learning the real value.</span>
+          </label>
+        </div>
+        <div class="cta-row">
+          <button type="submit" class="btn-primary" id="btnCreate">Anchor it on Midnight</button>
+          <span id="formError" class="err"></span>
+        </div>
+      </form>
+    </section>
+
+    <!-- ============ view: run ============ -->
+    <section id="viewRun" class="view" hidden>
+      <h2>Anchoring your passport</h2>
+      <div class="panel identity-panel">
+        <div class="id-row">
+          <span class="id-label">Passport ID</span>
+          <code id="runPassportId" class="hash big"></code>
+          <button id="btnCopyId" class="btn-mini" type="button">Copy</button>
+        </div>
+        <p class="muted small">Freshly generated for you. The bind step anchors the blake2b-256 hash of exactly
+          this id on-chain, and the explorer will list your passport under it.</p>
+      </div>
+      <p class="muted" id="runHint">This runs live on Midnight preview. Every step with a tx link is a real on-chain transaction.</p>
+      <ol id="timeline" class="timeline"></ol>
+      <div id="runError" class="panel err-panel" hidden></div>
+      <div class="cta-row">
+        <button id="btnRestartRun" class="btn-secondary" hidden>Start over</button>
+      </div>
+    </section>
+
+    <!-- ============ view: done ============ -->
+    <section id="viewDone" class="view" hidden>
+      <h2>Done. Your passport is on-chain.</h2>
+      <div class="panel done-panel">
+        <p><code id="donePassportId" class="hash big"></code></p>
+        <div id="doneLinks" class="done-links"></div>
+        <p class="muted">Your confidential CO2 value never left the server. What is on-chain is the
+          passport's anchor and a zero-knowledge proof of the claim, verifiable by anyone.</p>
+        <p class="star-line">Liked it? <a href="https://github.com/ODATANO/NIGHTPASS" target="_blank"
+            rel="noopener">Leave a star on the NIGHTPASS repo</a> &#9733;</p>
+        <p class="muted small">Powered by <a href="https://github.com/ODATANO/NIGHTGATE"
+            rel="noopener">@odatano/nightgate</a>
+          on <a href="https://midnight.network" rel="noopener">Midnight</a>.</p>
+      </div>
+      <div class="cta-row">
+        <button id="btnRestart" class="btn-secondary">Start over</button>
+      </div>
+    </section>
+
+  </main>
+
+  <footer class="site-footer">
+    <span>NIGHTPASS Demo</span>
+    <a href="https://zkpassport.eu" rel="noopener">Explorer</a>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+
+</html>

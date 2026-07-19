@@ -87,4 +87,8 @@ docs/batterypass-ready/
 
 # deploy runtime artifacts (baked DB + filled env stay off the repo)
 deploy/.env
+deploy/.env.demo
 deploy/passport-demo.db
+
+# internal planning docs stay local
+docs/try-it-demo-plan.md
