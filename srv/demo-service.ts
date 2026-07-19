@@ -134,6 +134,18 @@ export default class DemoService extends cds.ApplicationService {
         return createHash('sha256').update(ip).digest('hex').slice(0, 32);
     }
 
+    /**
+     * IPs exempt from the per-IP cap (comma list in DEMO_IP_ALLOWLIST, e.g.
+     * the maintainers' own address for live smoke tests). The global daily
+     * cap and the per-tester cap still apply to allowlisted addresses.
+     */
+    private ipExemptFromCap(req: cds.Request): boolean {
+        const list = String(process.env.DEMO_IP_ALLOWLIST || '')
+            .split(',').map(s => s.trim()).filter(Boolean);
+        if (!list.length) return false;
+        return list.includes(String((req as any)?._?.req?.ip ?? ''));
+    }
+
     private todayIso(): string {
         return new Date().toISOString().slice(0, 10);
     }
@@ -172,7 +184,8 @@ export default class DemoService extends cds.ApplicationService {
         // is the cheapest thing to spam, so it is capped hardest. Fast-path
         // reject before the (slow) wallet derivation; the authoritative
         // re-check happens under the cap lock together with the INSERT.
-        if (await this.countToday(Testers, { clientKey }) >= this.maxPerIpPerDay()) {
+        const ipExempt = this.ipExemptFromCap(req);
+        if (!ipExempt && await this.countToday(Testers, { clientKey }) >= this.maxPerIpPerDay()) {
             return req.reject(429, 'daily demo budget for this address is used up, try again tomorrow');
         }
 
@@ -191,7 +204,7 @@ export default class DemoService extends cds.ApplicationService {
         // wallet worker's periodic facade-save commit in between), and writing
         // in a stale snapshot is the documented SQLITE_BUSY_SNAPSHOT trap.
         await this.withCapLock(async () => {
-            if (await this.countToday(Testers, { clientKey }) >= this.maxPerIpPerDay()) {
+            if (!ipExempt && await this.countToday(Testers, { clientKey }) >= this.maxPerIpPerDay()) {
                 return req.reject(429, 'daily demo budget for this address is used up, try again tomorrow');
             }
             await this.detachedWrite(async () => INSERT.into(Testers).entries({
@@ -244,7 +257,7 @@ export default class DemoService extends cds.ApplicationService {
             }
             // Per IP and global per day first (so a rejected request does not
             // consume the tester's quota)...
-            if (await this.runsToday({ clientKey }) >= this.maxPerIpPerDay()) {
+            if (!this.ipExemptFromCap(req) && await this.runsToday({ clientKey }) >= this.maxPerIpPerDay()) {
                 return req.reject(429, 'daily demo budget for this address is used up, try again tomorrow');
             }
             if (await this.runsToday() >= this.maxPerDay()) {
@@ -300,27 +313,46 @@ export default class DemoService extends cds.ApplicationService {
             .columns('ID', 'passportId', 'state', 'stepsJson', 'error')
             .where({ ID: runId });
         if (!run) return req.reject(404, 'unknown runId');
-        const pos = this.queue.indexOf(runId);
         return {
             passportId: run.passportId,
             state: run.state,
             stepsJson: run.stepsJson,
             error: run.error ?? '',
-            // Approximation under parallelism: how many runs are ahead of
-            // this one (queued before it plus currently executing).
-            queuePosition: pos >= 0 ? pos + this.running.size : 0
+            ...this.queueViewFor(runId)
         };
     };
+
+    /**
+     * Honest queue view for the UI. Runs admitted into a free slot still wait
+     * out the start stagger, which used to render as "queue position N" even
+     * though nobody was actually ahead of them. Distinguish the two cases:
+     * startingInSec >= 0 means only the stagger is ticking (estimated start
+     * countdown), -1 means the run really waits for a slot to free up.
+     * queuePosition stays for API compatibility.
+     */
+    private queueViewFor(runId: string) {
+        const pos = this.queue.indexOf(runId);
+        const runningCount = this.running.size;
+        if (pos < 0) return { runningCount, waitingAhead: 0, startingInSec: 0, queuePosition: 0 };
+        let startingInSec = -1;
+        if (pos < this.concurrency() - runningCount || runningCount === 0) {
+            const eta = this.lastStartAt + this.startStaggerMs() * (pos + 1) - Date.now();
+            startingInSec = Math.max(0, Math.ceil(eta / 1000));
+        }
+        return { runningCount, waitingAhead: pos, startingInSec, queuePosition: pos + runningCount };
+    }
 
     private demoInfo = async () => {
         // No DB access when disabled: the demo tables may not exist there.
         if (!this.enabled() || !this.contractAddress()) {
-            return { enabled: false, queueDepth: 0, dailyRemaining: 0 };
+            return { enabled: false, queueDepth: 0, dailyRemaining: 0, runningCount: 0, waitingCount: 0 };
         }
         const used = await this.runsToday();
         return {
             enabled: true,
             queueDepth: this.queueDepth(),
+            runningCount: this.running.size,
+            waitingCount: this.queue.length,
             dailyRemaining: Math.max(0, this.maxPerDay() - used)
         };
     };

@@ -55,7 +55,11 @@
         $('landingInfo').textContent = 'The demo is currently closed. Try again later.';
         return;
       }
-      const busy = info.queueDepth > 0 ? `${info.queueDepth} in the queue. ` : '';
+      const running = info.runningCount ?? info.queueDepth ?? 0;
+      const waiting = info.waitingCount ?? 0;
+      const busy = running || waiting
+        ? `${running} passport${running === 1 ? '' : 's'} being anchored now${waiting ? `, ${waiting} waiting` : ''}. `
+        : '';
       $('landingInfo').textContent = `${busy}${info.dailyRemaining} demo passports left today.`;
       if (info.dailyRemaining <= 0) {
         $('btnStart').disabled = true;
@@ -157,7 +161,23 @@
     publish: 'Puts the passport’s public data on the explorer, together with the proven claim.'
   };
 
-  function renderSteps(steps, queuePosition) {
+  // Honest waiting label: with a leased slot only the start stagger ticks
+  // (countdown), otherwise the run really waits for a free slot. Countdown is
+  // rounded to 5s so the timeline is not rebuilt on every poll tick.
+  function waitingText(st) {
+    if (typeof st.runningCount !== 'number') {
+      return st.queuePosition > 0 ? `waiting (queue position ${st.queuePosition})` : 'pending';
+    }
+    const running = st.runningCount ? `${st.runningCount} running` : '';
+    if (st.startingInSec >= 0) {
+      const sec = Math.max(5, Math.ceil(st.startingInSec / 5) * 5);
+      return running ? `${running}, starting yours in ~${sec}s` : `starting in ~${sec}s`;
+    }
+    const ahead = st.waitingAhead > 0 ? `, ${st.waitingAhead} ahead of you` : '';
+    return `waiting for a free slot (${running || 'busy'}${ahead})`;
+  }
+
+  function renderSteps(steps, st) {
     const ol = $('timeline');
     ol.innerHTML = '';
     for (const s of steps) {
@@ -167,8 +187,8 @@
       const main = document.createElement('span'); main.className = 'step-main';
       const label = document.createElement('span'); label.className = 'step-label'; label.textContent = s.label || s.kind;
       const state = document.createElement('span'); state.className = 'step-state';
-      state.textContent = s.status === 'pending' && queuePosition > 0
-        ? `waiting (queue position ${queuePosition})` : s.status;
+      state.textContent = s.status === 'pending' && st && st.state === 'queued'
+        ? waitingText(st) : s.status;
       main.append(label, state);
       if (STEP_INFO[s.kind]) {
         const info = document.createElement('div');
@@ -200,10 +220,11 @@
       // Skip the DOM rebuild when nothing changed: a queued visitor would
       // otherwise get a full timeline teardown every 4s (GC churn, killed
       // text selections and mid-click links).
-      const fingerprint = st.stepsJson + '|' + st.queuePosition + '|' + st.state;
+      const waitLabel = st.state === 'queued' ? waitingText(st) : '';
+      const fingerprint = st.stepsJson + '|' + waitLabel + '|' + st.state;
       if (fingerprint !== lastRendered) {
         lastRendered = fingerprint;
-        renderSteps(steps, st.queuePosition);
+        renderSteps(steps, st);
       }
       if (st.state === 'done') {
         clearInterval(pollTimer);

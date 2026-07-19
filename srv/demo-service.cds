@@ -36,19 +36,30 @@ service DemoService @(path: '/api/v1/demo', requires: 'any') {
         queuePosition : Integer;
     };
 
-    /** Timeline polling for a run. */
+    /**
+     * Timeline polling for a run. runningCount executes right now,
+     * waitingAhead queued runs are before this one; startingInSec is the
+     * estimated start countdown when only the start stagger is ticking
+     * (-1 while the run waits for a free slot). queuePosition stays for
+     * compatibility (waitingAhead + runningCount).
+     */
     function demoRunStatus(runId: UUID) returns {
         passportId    : String;
         state         : String;
         stepsJson     : LargeString;
         error         : String;
         queuePosition : Integer;
+        runningCount  : Integer;
+        waitingAhead  : Integer;
+        startingInSec : Integer;
     };
 
     /** Landing-page status: is the demo open, how busy is it. */
     function demoInfo() returns {
         enabled        : Boolean;
         queueDepth     : Integer;
+        runningCount   : Integer;
+        waitingCount   : Integer;
         dailyRemaining : Integer;
     };
 }
