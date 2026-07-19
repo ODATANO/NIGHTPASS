@@ -61,7 +61,8 @@ service ProducerService {
                             submit: Boolean,
                             sessionId: UUID,
                             owner: String, // producer wallet identity (shielded address)
-                            walletId: String // optional: which SERVER wallet signs (see listServerWallets)
+                            walletId: String, // optional: which SERVER wallet signs (see listServerWallets)
+                            sponsorWalletId: String // optional: which pool member of PASSPORT_FEE_SPONSOR_WALLET pays the fees
     )                                                                    returns {
         passportId  : String;
         payloadHash : String;
@@ -186,7 +187,8 @@ service ProducerService {
      */
     action   submitPassport(passportId: String,
                             sessionId: UUID,
-                            walletId: String // optional: which SERVER wallet signs
+                            walletId: String, // optional: which SERVER wallet signs
+                            sponsorWalletId: String // optional: pool member of PASSPORT_FEE_SPONSOR_WALLET
     )                                                                    returns {
         passportId : String;
         mode       : String;
@@ -269,7 +271,8 @@ service ProducerService {
                                 threshold: Integer64,
                                 unit: String,
                                 sessionId: UUID,
-                                walletId: String // optional: which SERVER wallet signs
+                                walletId: String, // optional: which SERVER wallet signs
+                                sponsorWalletId: String // optional: pool member of PASSPORT_FEE_SPONSOR_WALLET
     )                                                                    returns {
         mode                   : String; // 'proving' | 'offline'
         txHash                 : String;

@@ -1,6 +1,6 @@
 import { test, describe, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { listProducerWallets, producerWalletSecrets, feeSponsorWalletId } from '../../srv/lib/producer-wallets';
+import { listProducerWallets, producerWalletSecrets, feeSponsorWalletId, feeSponsorWalletIds } from '../../srv/lib/producer-wallets';
 
 /**
  * The server-wallet registry backing the cockpit's "server wallet" login mode.
@@ -110,5 +110,15 @@ describe('fee sponsor wallet (PASSPORT_FEE_SPONSOR_WALLET)', () => {
     test('returns the configured wallet id, trimmed', () => {
         process.env.PASSPORT_FEE_SPONSOR_WALLET = ' default ';
         assert.equal(feeSponsorWalletId(), 'default');
+    });
+
+    test('parses a comma-separated pool; single id stays a one-element pool', () => {
+        process.env.PASSPORT_FEE_SPONSOR_WALLET = ' S1 , S2,S3 ';
+        assert.deepEqual(feeSponsorWalletIds(), ['S1', 'S2', 'S3']);
+        assert.equal(feeSponsorWalletId(), 'S1'); // first member = default sponsor
+        process.env.PASSPORT_FEE_SPONSOR_WALLET = 'default';
+        assert.deepEqual(feeSponsorWalletIds(), ['default']);
+        delete process.env.PASSPORT_FEE_SPONSOR_WALLET;
+        assert.deepEqual(feeSponsorWalletIds(), []);
     });
 });

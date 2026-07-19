@@ -9,7 +9,7 @@
     "url": "https://github.com/ODATANO/NIGHTPASS"
   },
   "dependencies": {
-    "@odatano/nightgate": "^0.8.1",
+    "@odatano/nightgate": "^0.8.2",
     "@sap/cds": "^9",
     "animejs": "^4.5.0",
     "express": "^4",

@@ -83,13 +83,23 @@ export function listProducerWallets(): ProducerWallet[] {
 }
 
 /**
- * The server wallet that pays the dust fees for OTHER wallets' on-chain legs
- * (NIGHTGATE 0.8.0 per-tx sponsoring), from `PASSPORT_FEE_SPONSOR_WALLET`.
- * Value is a wallet id from this registry (e.g. `default` for the main
- * wallet). Unset = no sponsoring; every wallet pays its own fees.
+ * The server wallet POOL that pays the dust fees for OTHER wallets' on-chain
+ * legs (NIGHTGATE 0.8.x per-tx sponsoring), from `PASSPORT_FEE_SPONSOR_WALLET`
+ * as a comma-separated list of registry wallet ids (a single id remains
+ * valid). Unset = no sponsoring; every wallet pays its own fees.
+ *
+ * Why a pool: parallel runs over ONE sponsor race each other for the same
+ * dust notes (1014 rejections); with one sponsor leased per concurrent run
+ * the collisions cannot happen at all.
  */
+export function feeSponsorWalletIds(): string[] {
+    return String(process.env.PASSPORT_FEE_SPONSOR_WALLET ?? '')
+        .split(',').map((s) => s.trim()).filter(Boolean);
+}
+
+/** First pool member; the default sponsor for callers without a preference. */
 export function feeSponsorWalletId(): string | null {
-    return process.env.PASSPORT_FEE_SPONSOR_WALLET?.trim() || null;
+    return feeSponsorWalletIds()[0] ?? null;
 }
 
 /** Secrets for one wallet id, or undefined. Never leaves the server. */

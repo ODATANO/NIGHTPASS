@@ -3,7 +3,7 @@ import { randomBytes, createHash } from 'node:crypto';
 import { Testers, Runs } from '#cds-models/demo';
 import { Passports, PassportTransactions, PredicateProofLog } from '#cds-models/passport';
 import { validateDemoInput, validNickname } from './lib/demo-validation';
-import { feeSponsorWalletId } from './lib/producer-wallets';
+import { feeSponsorWalletIds } from './lib/producer-wallets';
 import { encryptSecret, decryptSecret } from './lib/demo-crypto';
 import { sendDetached, waitForJob, detachedFromRequest, explorerTxUrl } from './lib/passport-anchor';
 
@@ -25,7 +25,12 @@ const { INSERT, SELECT, UPDATE } = cds.ql;
  */
 export default class DemoService extends cds.ApplicationService {
     private queue: string[] = [];
-    private processing = false;
+    /** runIds currently executing (semaphore up to concurrency()). */
+    private running = new Set<string>();
+    /** Sponsor pool lease: walletId -> runId currently pinned to it. One run
+     *  per sponsor at a time, so parallel runs never race each other for the
+     *  same wallet's dust notes (1014). */
+    private sponsorLeases = new Map<string, string>();
 
     override async init(): Promise<void> {
         this.on('startTester', this.startTester);
@@ -41,6 +46,16 @@ export default class DemoService extends cds.ApplicationService {
                     'the demo stays DISABLED (tester wallet secrets must never use the dev fallback key)');
             }
             void this.failStaleRuns().catch(() => { /* best-effort */ });
+            // Under parallel runs, write bursts (facade saves, deep inserts)
+            // exceed the default 5s busy timeout; let writers queue longer
+            // instead of failing with 'database is locked'. Same best-effort
+            // pragma mechanism the plugin's sqlite tuning uses.
+            void (async () => {
+                try {
+                    const db: any = await cds.connect.to('db');
+                    if (typeof db.pragma === 'function') await db.pragma('busy_timeout = 15000');
+                } catch { /* non-sqlite or pragma unsupported */ }
+            })();
             // Warm the sponsor at boot: the sponsor facade must catch up to
             // the chain tip before its first dust balance (117 guard), and
             // without this the FIRST visitor after a restart pays that wait
@@ -70,7 +85,43 @@ export default class DemoService extends cds.ApplicationService {
     private maxPerIpPerDay(): number { return Number(process.env.DEMO_MAX_PER_IP_PER_DAY || 3); }
     private maxPerTester(): number { return Number(process.env.DEMO_MAX_PER_TESTER || 1); }
     private maxQueue(): number { return Number(process.env.DEMO_MAX_QUEUE || 5); }
-    private queueDepth(): number { return this.queue.length + (this.processing ? 1 : 0); }
+    private queueDepth(): number { return this.queue.length + this.running.size; }
+
+    /**
+     * How many runs may execute in parallel, capped by the sponsor pool size
+     * (each run leases its own sponsor, see sponsorLeases).
+     *
+     * DEFAULT IS 1; DEMO_CONCURRENCY > 1 requires @odatano/nightgate >= 0.8.2
+     * (hardened persist sink). Before that hardening, parallel runs made the
+     * facade saves lose the SQLite write lock on every tick; load-tested
+     * green at concurrency 3 with 0.8.2 plus the start stagger below.
+     */
+    private concurrency(): number {
+        const pool = feeSponsorWalletIds().length;
+        const wanted = Number(process.env.DEMO_CONCURRENCY || 1);
+        return Math.max(1, Math.min(pool || 1, wanted));
+    }
+
+    /** Lease a free pool sponsor for a run; null when none configured. */
+    private acquireSponsor(runId: string): string | null {
+        const free = feeSponsorWalletIds().find((w) => !this.sponsorLeases.has(w));
+        if (!free) return null;
+        this.sponsorLeases.set(free, runId);
+        return free;
+    }
+
+    /**
+     * Minimum spacing between run STARTS. A run's opening phase is
+     * write-heavy (createPassport deep-inserts ~65 attribute rows plus the
+     * content root inside one tx); measured under 3 truly simultaneous
+     * starts, those transactions pile up on SQLite's single write lock and
+     * starve the visitor-facing requests. Staggering the starts keeps at
+     * most one heavy phase active while the runs' LONG chain-wait phases
+     * still overlap, which is where the parallel throughput actually lives.
+     */
+    private startStaggerMs(): number { return Number(process.env.DEMO_START_STAGGER_MS || 45_000); }
+    private lastStartAt = 0;
+    private staggerTimer: NodeJS.Timeout | null = null;
     private contractAddress(): string | null { return process.env.PASSPORT_CONTRACT_ADDRESS ?? null; }
 
     /** Fixed technical principal for all downstream service calls (see class doc). */
@@ -233,8 +284,7 @@ export default class DemoService extends cds.ApplicationService {
         (req as any).on('succeeded', () => {
             this.queue.push(runId);
             this.pending.set(runId, payload);
-            void detachedFromRequest(() => this.processQueue()).catch((e: unknown) =>
-                cds.log('demo').error('queue processor crashed:', e));
+            this.processQueue();
         });
 
         return { runId, passportId, queuePosition: this.queueDepth() };
@@ -256,7 +306,9 @@ export default class DemoService extends cds.ApplicationService {
             state: run.state,
             stepsJson: run.stepsJson,
             error: run.error ?? '',
-            queuePosition: pos >= 0 ? pos + (this.processing ? 1 : 0) : 0
+            // Approximation under parallelism: how many runs are ahead of
+            // this one (queued before it plus currently executing).
+            queuePosition: pos >= 0 ? pos + this.running.size : 0
         };
     };
 
@@ -292,30 +344,52 @@ export default class DemoService extends cds.ApplicationService {
         ];
     }
 
-    private async processQueue(): Promise<void> {
-        if (this.processing) return;
-        this.processing = true;
-        try {
-            for (;;) {
-                const runId = this.queue.shift();
-                if (!runId) break;
-                const ctx = this.pending.get(runId);
-                this.pending.delete(runId);
-                if (!ctx) continue;
-                try {
-                    await this.executeRun(ctx);
-                } catch (e) {
+    /**
+     * Launcher: starts queued runs while free slots (and pool sponsors) are
+     * available. Synchronous pop-and-launch; every completed run re-invokes
+     * it, so the queue drains under parallelism without a coordinator loop.
+     */
+    private processQueue(): void {
+        while (this.queue.length && this.running.size < this.concurrency()) {
+            // Stagger starts (see startStaggerMs): the first run of an idle
+            // instance starts immediately, further parallel starts wait out
+            // the spacing via a single rearm timer.
+            const wait = this.lastStartAt + this.startStaggerMs() - Date.now();
+            if (this.running.size > 0 && wait > 0) {
+                if (!this.staggerTimer) {
+                    this.staggerTimer = setTimeout(() => {
+                        this.staggerTimer = null;
+                        this.processQueue();
+                    }, wait + 50);
+                    this.staggerTimer.unref?.();
+                }
+                return;
+            }
+            this.lastStartAt = Date.now();
+            const runId = this.queue.shift()!;
+            const ctx = this.pending.get(runId);
+            this.pending.delete(runId);
+            if (!ctx) continue;
+            const sponsor = this.acquireSponsor(runId);
+            this.running.add(runId);
+            void detachedFromRequest(() => this.executeRun(ctx, sponsor ?? undefined))
+                .catch(async (e: unknown) => {
                     const msg = String((e as Error)?.message ?? e).slice(0, 480);
                     cds.log('demo').warn(`run ${runId} failed:`, e);
                     await this.patchRun(runId, { state: 'failed', error: msg }).catch(() => { /* best-effort */ });
-                }
-            }
-        } finally {
-            this.processing = false;
+                })
+                .finally(() => {
+                    this.running.delete(runId);
+                    if (sponsor) this.sponsorLeases.delete(sponsor);
+                    this.processQueue();
+                });
         }
     }
 
-    private async executeRun(ctx: NonNullable<ReturnType<DemoService['pending']['get']>>): Promise<void> {
+    private async executeRun(
+        ctx: NonNullable<ReturnType<DemoService['pending']['get']>>,
+        sponsorWalletId?: string
+    ): Promise<void> {
         const log = cds.log('demo');
         const { runId, passportId, input } = ctx;
         const user = this.techUser();
@@ -336,18 +410,18 @@ export default class DemoService extends cds.ApplicationService {
             }
         };
 
-        // 0. Make sure the SPONSOR session exists BEFORE the anchor: without
-        //    this, a failed boot prewarm would let ProducerService open the
-        //    sponsor session lazily INSIDE the write-holding createPassport
-        //    tx (the documented write-lock-vs-detached-commit deadlock), and
-        //    the run would silently degrade to unsponsored and die on zero
-        //    dust. Failing here instead gives an honest, early error.
-        const sponsorWallet = feeSponsorWalletId();
-        if (sponsorWallet) {
+        // 0. Make sure the LEASED sponsor's session exists BEFORE the anchor:
+        //    without this, a failed boot prewarm would let ProducerService
+        //    open the sponsor session lazily INSIDE the write-holding
+        //    createPassport tx (the documented write-lock-vs-detached-commit
+        //    deadlock), and the run would silently degrade to unsponsored and
+        //    die on zero dust. Failing here instead gives an honest, early
+        //    error. (sponsorWalletId is this run's exclusive pool lease.)
+        if (sponsorWalletId) {
             const warm: any = await producer.tx({ user }, (tx: any) =>
-                tx.send('prewarmServerWallet', { walletId: sponsorWallet }));
+                tx.send('prewarmServerWallet', { walletId: sponsorWalletId }));
             if (warm?.state === 'error') {
-                throw new Error(`fee sponsor '${sponsorWallet}' unavailable: ${warm?.error || 'no signing session'}`);
+                throw new Error(`fee sponsor '${sponsorWalletId}' unavailable: ${warm?.error || 'no signing session'}`);
             }
         }
 
@@ -402,7 +476,8 @@ export default class DemoService extends cds.ApplicationService {
                 }]
             });
             const created: any = await producer.tx({ user }, (tx: any) => tx.send('createPassport', {
-                passportJson, submit: true, owner: tester.shieldedAddress, sessionId
+                passportJson, submit: true, owner: tester.shieldedAddress, sessionId,
+                ...(sponsorWalletId ? { sponsorWalletId } : {})
             }));
             if (created?.mode !== 'anchoring') {
                 throw new Error(`createPassport returned mode '${created?.mode}' (expected 'anchoring')`);
@@ -423,7 +498,8 @@ export default class DemoService extends cds.ApplicationService {
                 predicate: 'lessOrEqual',
                 threshold: input.proveThreshold,
                 unit: 'kg CO2e',
-                sessionId
+                sessionId,
+                ...(sponsorWalletId ? { sponsorWalletId } : {})
             }));
             if (prove?.mode !== 'proving') throw new Error(`provePassportValue returned mode '${prove?.mode}'`);
             const proof = await this.pollProof(String(prove.proofLogId));
@@ -555,14 +631,16 @@ export default class DemoService extends cds.ApplicationService {
             UPDATE.entity(Runs).set(patch).where({ ID: runId }) as any);
     }
 
-    /** Kick the fee-sponsor wallet's session + sync at boot (non-blocking). */
+    /** Kick every pool sponsor's session + sync at boot (non-blocking). */
     private async prewarmSponsor(): Promise<void> {
-        const sponsorWallet = feeSponsorWalletId();
-        if (!this.enabled() || !sponsorWallet) return;
+        const pool = feeSponsorWalletIds();
+        if (!this.enabled() || !pool.length) return;
         const producer: any = await cds.connect.to('ProducerService');
-        await producer.tx({ user: this.techUser() }, (tx: any) =>
-            tx.send('prewarmServerWallet', { walletId: sponsorWallet }));
-        cds.log('demo').info(`fee sponsor '${sponsorWallet}' prewarm kicked at boot`);
+        for (const walletId of pool) {
+            await producer.tx({ user: this.techUser() }, (tx: any) =>
+                tx.send('prewarmServerWallet', { walletId }));
+            cds.log('demo').info(`fee sponsor '${walletId}' prewarm kicked at boot`);
+        }
     }
 
     private async failStaleRuns(): Promise<void> {

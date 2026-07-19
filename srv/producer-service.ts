@@ -10,7 +10,7 @@ import {
     effectiveNetwork, explorerTxUrl
 } from './lib/passport-anchor';
 import { defaultGuideAttributes, hashableAttributes } from './lib/guide-attribute-defaults';
-import { listProducerWallets, producerWalletSecrets, feeSponsorWalletId } from './lib/producer-wallets';
+import { listProducerWallets, producerWalletSecrets, feeSponsorWalletId, feeSponsorWalletIds } from './lib/producer-wallets';
 import { verifyContractTx, type ChainVerdict } from './lib/chain-verify';
 import { verifyAttestState, verifyGrantState, verifyPredicateState } from './lib/state-verify';
 
@@ -173,9 +173,15 @@ export default class ProducerService extends cds.ApplicationService {
      * the request's user, and NIGHTGATE's sponsor guard requires the sponsor
      * session to belong to the same user as the acting one).
      */
-    private async sponsorSessionIdFor(actingSessionId: string): Promise<string | undefined> {
-        const sponsorWallet = feeSponsorWalletId();
-        if (!sponsorWallet) return undefined;
+    private async sponsorSessionIdFor(actingSessionId: string, preferredWalletId?: string): Promise<string | undefined> {
+        const pool = feeSponsorWalletIds();
+        if (!pool.length) return undefined;
+        // A caller-supplied preference must be a member of the CONFIGURED
+        // pool: the param selects among operator-approved sponsors, it can
+        // never turn an arbitrary registry wallet into one.
+        const sponsorWallet = preferredWalletId && pool.includes(preferredWalletId)
+            ? preferredWalletId
+            : pool[0];
         const sponsorSession = await this.serverSigningSession(sponsorWallet);
         if (!sponsorSession) {
             cds.log('producer').warn(
@@ -285,8 +291,8 @@ export default class ProducerService extends cds.ApplicationService {
     // --- create + submit -----------------------------------------------------
 
     private createPassport = async (req: cds.Request) => {
-        const { passportJson, submit, sessionId, owner, walletId } = req.data as
-            { passportJson?: string; submit?: boolean; sessionId?: string; owner?: string; walletId?: string };
+        const { passportJson, submit, sessionId, owner, walletId, sponsorWalletId } = req.data as
+            { passportJson?: string; submit?: boolean; sessionId?: string; owner?: string; walletId?: string; sponsorWalletId?: string };
 
         let input: PassportInput;
         try { input = JSON.parse(String(passportJson ?? '')); }
@@ -343,7 +349,7 @@ export default class ProducerService extends cds.ApplicationService {
 
         const session = submit ? await this.effectiveSession(sessionId, walletId) : null;
         if (submit && session && contractAddress) {
-            return this.anchorRow(req, ID, passportId, payloadHash, passportIdHash, contractAddress, session, true);
+            return this.anchorRow(req, ID, passportId, payloadHash, passportIdHash, contractAddress, session, true, sponsorWalletId);
         }
         // Offline: record a placeholder tx row so the overview shows the draft.
         await INSERT.into(PassportTransactions).entries({ passport_ID: ID, kind: 'attest', status: 'offline' } as any);
@@ -351,8 +357,8 @@ export default class ProducerService extends cds.ApplicationService {
     };
 
     private submitPassport = async (req: cds.Request) => {
-        const { passportId, sessionId, walletId } = req.data as
-            { passportId?: string; sessionId?: string; walletId?: string };
+        const { passportId, sessionId, walletId, sponsorWalletId } = req.data as
+            { passportId?: string; sessionId?: string; walletId?: string; sponsorWalletId?: string };
         const row: any = await this.passportRef(String(passportId ?? ''));
         if (!row) return req.reject(404, `passport '${passportId}' not found`);
         const contractAddress = this.contractAddress() ?? row.contractAddress;
@@ -360,7 +366,7 @@ export default class ProducerService extends cds.ApplicationService {
         if (!session || !contractAddress) {
             return req.reject(400, 'no signing session / PASSPORT_CONTRACT_ADDRESS available; cannot submit on-chain');
         }
-        const r = await this.anchorRow(req, row.ID, row.passportId, row.payloadHash, row.passportIdHash, contractAddress, session, false);
+        const r = await this.anchorRow(req, row.ID, row.passportId, row.payloadHash, row.passportIdHash, contractAddress, session, false, sponsorWalletId);
         return { passportId: r.passportId, mode: r.mode, txHash: r.txHash };
     };
 
@@ -786,7 +792,8 @@ export default class ProducerService extends cds.ApplicationService {
      */
     private async anchorRow(
         req: cds.Request, ID: string, passportId: string, payloadHash: string,
-        passportIdHash: string, contractAddress: string, sessionId: string, includePayloadHash: boolean
+        passportIdHash: string, contractAddress: string, sessionId: string, includePayloadHash: boolean,
+        sponsorWalletId?: string
     ) {
         // The vault's attest circuit asserts the payload hash is not attested
         // yet, so byte-identical confidential content can never anchor twice.
@@ -817,7 +824,7 @@ export default class ProducerService extends cds.ApplicationService {
         // Sponsor session must be resolved HERE (request context: session
         // opening inherits the request's user); the detached runner just
         // carries the id.
-        const sponsorSessionId = await this.sponsorSessionIdFor(sessionId);
+        const sponsorSessionId = await this.sponsorSessionIdFor(sessionId, sponsorWalletId);
         // 'succeeded' fires after the request tx committed, so the detached
         // runner never contends with this request for the write lock. The
         // user is captured NOW: the NIGHTGATE calls must carry the caller's
@@ -976,9 +983,9 @@ export default class ProducerService extends cds.ApplicationService {
     // --- predicate proof -----------------------------------------------------
 
     private provePassportValue = async (req: cds.Request) => {
-        const { passportId, sourceField, predicate, threshold, unit, sessionId, walletId } = req.data as {
+        const { passportId, sourceField, predicate, threshold, unit, sessionId, walletId, sponsorWalletId } = req.data as {
             passportId?: string; sourceField?: string; predicate?: string;
-            threshold?: number; unit?: string; sessionId?: string; walletId?: string;
+            threshold?: number; unit?: string; sessionId?: string; walletId?: string; sponsorWalletId?: string;
         };
         const row: any = await this.passportRef(String(passportId ?? ''));
         if (!row) return req.reject(404, `passport '${passportId}' not found`);
@@ -1029,7 +1036,7 @@ export default class ProducerService extends cds.ApplicationService {
         // it only when no anchored root exists yet for this passport.
         const rootAnchored = await SELECT.one.from(PassportTransactions).columns('ID')
             .where({ passport_ID: row.ID, kind: 'anchorContentRoot', status: 'succeeded' });
-        const sponsorSessionId = await this.sponsorSessionIdFor(String(session));
+        const sponsorSessionId = await this.sponsorSessionIdFor(String(session), sponsorWalletId);
         const args = {
             payloadHash: row.payloadHash, fieldKey: proof.fieldKey, value: proof.value,
             ...(rootAnchored ? {} : { contentRoot: tree.contentRoot }),
