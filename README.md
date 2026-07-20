@@ -4,7 +4,9 @@
 
 **EU Battery Regulation 2023/1542 Digital Battery Passport with three disclosure tiers, backed by zero-knowledge attestations on Midnight.**
 
-**Live demo: [zkpassport.eu](https://zkpassport.eu)** a public explorer where anyone can inspect the anchored passports and verify them live against Midnight, no account needed.
+**Explorer: [zkpassport.eu](https://zkpassport.eu)** a public, block-explorer-style view where anyone can inspect the anchored passports, see the proven ZK claims (values stay hidden) and verify them live against Midnight, no account needed.
+
+**Try it yourself: [demo.zkpassport.eu](https://demo.zkpassport.eu)** an interactive live demo. Create a battery passport, prove a confidential number with zero-knowledge, and watch it anchor on Midnight in about five minutes. No account, no wallet, no funds; every fee is sponsored, and the finished passport shows up in the explorer above.
 
 [![Tests](https://github.com/ODATANO/NIGHTPASS/actions/workflows/test.yaml/badge.svg)](https://github.com/ODATANO/NIGHTPASS/actions/workflows/test.yaml)
 [![codecov](https://codecov.io/gh/ODATANO/NIGHTPASS/branch/main/graph/badge.svg)](https://codecov.io/gh/ODATANO/NIGHTPASS)
