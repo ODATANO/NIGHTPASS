@@ -72,6 +72,14 @@
   }
 
   $('btnStart').addEventListener('click', async () => {
+    // A cancelled (parked) identity is reused instead of minting a new one:
+    // startTester counts against the per-IP daily budget, so cancel + start
+    // must not burn a slot.
+    if (store.get('testerId') && store.get('night')) {
+      store.del('parked');
+      enterForm();
+      return;
+    }
     setLoading($('btnStart'), 'Creating your identity wallet…');
     try {
       const t = await api('POST', '/startTester', {});
@@ -132,9 +140,24 @@
       resetLoading($('btnCreate'));
       enterRun();
     } catch (e) {
+      // 404 = the parked identity no longer exists server-side (disposable
+      // demo DB was wiped). Reset to a fresh start instead of a dead end.
+      if (e && e.status === 404) {
+        restart();
+        return;
+      }
       $('formError').textContent = e.message;
       resetLoading($('btnCreate'));
     }
+  });
+
+  // Cancel before anything went on-chain: back to the landing page. The
+  // identity is parked locally (not deleted) so a later start reuses it.
+  $('btnCancelForm').addEventListener('click', () => {
+    if ($('btnCreate').classList.contains('loading')) return;
+    store.set('parked', '1');
+    $('formError').textContent = '';
+    void initLanding();
   });
 
   // ---------- run ----------
@@ -274,7 +297,7 @@
 
   function restart() {
     clearInterval(pollTimer);
-    for (const k of ['testerId', 'night', 'shielded', 'runId', 'passportId']) store.del(k);
+    for (const k of ['testerId', 'night', 'shielded', 'runId', 'passportId', 'parked']) store.del(k);
     $('btnStart').disabled = false;
     $('btnCreate').disabled = false;
     void initLanding();
@@ -293,6 +316,6 @@
   // ---------- boot: resume where the visitor left off ----------
 
   if (store.get('runId')) enterRun();
-  else if (store.get('testerId')) enterForm();
+  else if (store.get('testerId') && !store.get('parked')) enterForm();
   else void initLanding();
 })();
