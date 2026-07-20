@@ -4,10 +4,6 @@
 
 **EU Battery Regulation 2023/1542 Digital Battery Passport with three disclosure tiers, backed by zero-knowledge attestations on Midnight.**
 
-**Explorer: [zkpassport.eu](https://zkpassport.eu)** a public, block-explorer-style view where anyone can inspect the anchored passports, see the proven ZK claims (values stay hidden) and verify them live against Midnight, no account needed.
-
-**Try it yourself: [demo.zkpassport.eu](https://demo.zkpassport.eu)** an interactive live demo. Create a battery passport, prove a confidential number with zero-knowledge, and watch it anchor on Midnight in about five minutes. No account, no wallet, no funds; every fee is sponsored, and the finished passport shows up in the explorer above.
-
 [![Tests](https://github.com/ODATANO/NIGHTPASS/actions/workflows/test.yaml/badge.svg)](https://github.com/ODATANO/NIGHTPASS/actions/workflows/test.yaml)
 [![codecov](https://codecov.io/gh/ODATANO/NIGHTPASS/branch/main/graph/badge.svg)](https://codecov.io/gh/ODATANO/NIGHTPASS)
 [![@odatano/nightgate](https://img.shields.io/npm/v/@odatano/nightgate?logo=npm&label=%40odatano%2Fnightgate)](https://www.npmjs.com/package/@odatano/nightgate)
@@ -15,6 +11,10 @@
 [![Midnight](https://img.shields.io/badge/Midnight-preview-2b2b6f)](https://midnight.network/)
 [![Midnight](https://img.shields.io/badge/Midnight-preprod-2b2b6f)](https://midnight.network/)
 [![Catena-X](https://img.shields.io/badge/Catena--X-CX--0143-009f4d)](https://catena-x.net/)
+
+**Explorer: [zkpassport.eu](https://zkpassport.eu)** a public, block-explorer-style view where anyone can inspect the anchored passports, see the proven ZK claims (values stay hidden) and verify them live against Midnight, no account needed.
+
+**Try it yourself: [demo.zkpassport.eu](https://demo.zkpassport.eu)** an interactive live demo. Create a battery passport, prove a confidential number with zero-knowledge, and watch it anchor on Midnight in about five minutes. No account, no wallet, no funds; every fee is sponsored, and the finished passport shows up in the explorer above.
 
 NIGHTPASS implements the EU Battery Passport. One dataset is exposed with a different view per audience (consumer, recycler, authority), and sensitive numbers (for example "recycled cobalt share is at least the legal minimum") can be **proven without revealing the value**. Only a payload hash and public metadata are anchored on-chain; everything else stays encrypted off-chain, and the disclosure tier is enforced in the API layer.
 
