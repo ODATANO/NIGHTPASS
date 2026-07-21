@@ -62,4 +62,20 @@ service DemoService @(path: '/api/v1/demo', requires: 'any') {
         waitingCount   : Integer;
         dailyRemaining : Integer;
     };
+
+    /**
+     * Ops dust monitor: NIGHT + dust snapshot of the fee-sponsor pool, so an
+     * operator can spot a depleting sponsor before it starts failing anchors.
+     * Empty when no sponsor is configured or the demo is disabled.
+     */
+    function demoSponsorStatus() returns array of {
+        walletId             : String;
+        label                : String;
+        state                : String;  // 'ready' | 'warming' | 'cold' | 'error'
+        nightDisplay         : String;
+        dustPresent          : Boolean;
+        registeredNightUtxos : Integer;
+        healthy              : Boolean;
+        error                : String;
+    };
 }

@@ -70,6 +70,7 @@ export default class ProducerService extends cds.ApplicationService {
         this.on('listServerWallets', this.listServerWallets);
         this.on('prewarmServerWallet', this.prewarmServerWallet);
         this.on('serverWalletStatus', this.serverWalletStatus);
+        this.on('sponsorPoolStatus', this.sponsorPoolStatus);
         this.on('recordWalletAttest', this.recordWalletAttest);
         this.on('recordWalletDisclosure', this.recordWalletDisclosure);
         this.on('recordWalletPredicate', this.recordWalletPredicate);
@@ -257,6 +258,64 @@ export default class ProducerService extends cds.ApplicationService {
         }
         const sinceSeconds = warmth ? Math.round((Date.now() - warmth.startedAt) / 1000) : 0;
         return { walletId: secrets.id, state, sinceSeconds, error };
+    };
+
+    /**
+     * Dust monitor for the fee-sponsor pool. For each configured sponsor whose
+     * signing session is already open (the boot prewarm opens them), read its
+     * NIGHT + dust balance via NIGHTGATE. A cold/errored sponsor reports its
+     * state without a balance read, so this stays a cheap, non-blocking call
+     * (it never opens a session). Runs the balance reads under the caller's
+     * user, which for the demo path is the same technical principal that opened
+     * the sponsor sessions (NIGHTGATE binds sessions to the userId).
+     */
+    private sponsorPoolStatus = async (req: cds.Request) => {
+        const pool = feeSponsorWalletIds();
+        if (!pool.length) return [];
+        const labels = listProducerWallets();
+        const nightgate = await cds.connect.to('NightgateService');
+        const night = (atoms: unknown): string => {
+            try { return (Number(BigInt(String(atoms ?? 0))) / 1e6).toLocaleString('en-US'); }
+            catch { return ''; }
+        };
+        const cold = (walletId: string, label: string, state: string, error = '') => ({
+            walletId, label, state, nightDisplay: '', dustPresent: false,
+            registeredNightUtxos: 0, healthy: false, error
+        });
+        const out: unknown[] = [];
+        for (const walletId of pool) {
+            const secrets = producerWalletSecrets(walletId);
+            const label = labels.find((w) => w.id === walletId)?.label ?? walletId;
+            if (!secrets) { out.push(cold(walletId, label, 'error', 'not configured')); continue; }
+            const sessionId = this.serverSessions.get(secrets.id);
+            const warmth = this.walletWarmth.get(secrets.id);
+            if (!sessionId) {
+                out.push(cold(secrets.id, label, warmth?.state === 'error' ? 'error' : 'cold', warmth?.error ?? ''));
+                continue;
+            }
+            try {
+                const b: any = await nightgate.tx({ user: req.user }, (tx: any) =>
+                    tx.send('getWalletBalance', { sessionId }));
+                const registered = Number(b?.registeredNightUtxoCount ?? 0);
+                const dustPresent = Number(b?.dustBalance ?? 0) > 0;
+                // A successful balance read means the facade is live and serving
+                // this wallet's state, i.e. operational. The warmth 'warming'
+                // flag only flips to 'ready' when something polls
+                // serverWalletStatus, which nothing does for sponsors, so it
+                // would stay 'warming' forever; health keys off the real fee
+                // signals instead (spendable dust + registered NIGHT UTxOs).
+                out.push({
+                    walletId: secrets.id, label, state: 'ready',
+                    nightDisplay: night(b?.unshieldedNight),
+                    dustPresent, registeredNightUtxos: registered,
+                    healthy: registered > 0 && dustPresent,
+                    error: ''
+                });
+            } catch (e: any) {
+                out.push(cold(secrets.id, label, 'error', String(e?.message ?? e ?? 'balance read failed')));
+            }
+        }
+        return out;
     };
 
     private async passportRef(passportId: string) {

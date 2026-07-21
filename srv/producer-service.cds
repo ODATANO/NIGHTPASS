@@ -108,6 +108,23 @@ service ProducerService {
     };
 
     /**
+     * Balance snapshot of the fee-sponsor POOL (PASSPORT_FEE_SPONSOR_WALLET),
+     * for the ops dust monitor. Reads only sponsors whose signing session is
+     * already open (boot prewarm); a cold or errored sponsor reports its state
+     * rather than a balance. Never opens a session, so the call stays cheap.
+     */
+    function sponsorPoolStatus()                                         returns array of {
+        walletId             : String;  // registry id of the sponsor wallet
+        label                : String;  // display name
+        state                : String;  // 'ready' | 'warming' | 'cold' | 'error'
+        nightDisplay         : String;  // unshielded NIGHT in display units ('' if unknown)
+        dustPresent          : Boolean; // has spendable dust to pay fees
+        registeredNightUtxos : Integer; // UTxOs registered for dust generation
+        healthy              : Boolean; // ready AND registered AND dust present
+        error                : String;
+    };
+
+    /**
      * Record a wallet-driven (in-app Lace) attest tx in the cockpit: logs a
      * PassportTransactions row and marks the passport anchored. Called by the
      * Fiori app after the browser wallet flow submits, so the transaction

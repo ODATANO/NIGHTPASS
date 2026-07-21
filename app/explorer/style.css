@@ -333,6 +333,39 @@ tr.row-glow { animation: rowGlow 900ms ease-out 1; }
 }
 .zk-chip .shield { flex: none; }
 .claims-note { color: var(--ink-2); font-size: 13px; padding: 10px 16px 0; margin: 0; }
+
+/* ---------- Recently-anchored ticker ---------- */
+.ticker {
+  display: flex; align-items: center; gap: 12px;
+  margin: 0 0 20px; padding: 8px 14px;
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: 10px; overflow: hidden;
+}
+.ticker-label {
+  flex: none; font-size: 11px; letter-spacing: 0.08em;
+  text-transform: uppercase; color: var(--ink-2);
+  padding-right: 12px; border-right: 1px solid var(--border);
+}
+.ticker-track {
+  display: flex; align-items: center; gap: 18px;
+  overflow-x: auto; scrollbar-width: none;
+}
+.ticker-track::-webkit-scrollbar { display: none; }
+.tick { display: inline-flex; align-items: center; gap: 8px; flex: none; color: var(--ink-2); font-size: 13px; }
+.tick:hover { text-decoration: none; color: var(--accent); }
+.tick-pid { color: var(--ink); }
+.tick-zk { color: var(--accent); font-size: 11px; font-weight: 600; }
+.tick-age { color: var(--ink-3); font-size: 12px; }
+.tick-dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--good); flex: none;
+  animation: tickPulse 2.4s ease-out infinite;
+}
+@keyframes tickPulse {
+  0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--good) 45%, transparent); }
+  70%, 100% { box-shadow: 0 0 0 6px transparent; }
+}
+@media (prefers-reduced-motion: reduce) { .tick-dot { animation: none; } }
 .claims { display: flex; flex-direction: column; gap: 8px; padding: 12px 16px 16px; }
 .claim {
   display: flex;

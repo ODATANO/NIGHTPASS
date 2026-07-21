@@ -84,3 +84,23 @@ Prepared but NOT part of the default stack. Rollout:
 Ops notes: the demo DB volume is disposable (visitor data only); caps are
 env-tunable in `.env.demo`; the sponsor wallet is intentionally small, and
 rotating it means running the setup script again + updating `.env.demo`.
+
+### Periodic restart (stale sponsor sessions)
+
+Over long uptime (~30h+) the indexer websockets drop (`Wallet.Sync:
+[object CloseEvent]` in the logs) and the boot-prewarmed sponsor-pool
+sessions go inactive, so every anchor then fails with `Sponsor session not
+found, inactive, or not usable by this caller` while `startTester` /
+`createDemoPassport` still succeed. `demo-restart.sh` pre-empts this: it
+waits out any in-flight visitor run (up to 3 x 10 min), restarts only the
+`nightpass-demo` container (main site untouched), and logs the sponsor
+prewarm result. Install as a daily cron on the server:
+
+```bash
+chmod +x /root/nightpass/deploy/demo-restart.sh
+( crontab -l 2>/dev/null | grep -v demo-restart.sh; \
+  echo "17 5 * * * /root/nightpass/deploy/demo-restart.sh >> /root/nightpass-demo-restart.log 2>&1" ) | crontab -
+```
+
+Check runs with `tail -20 /root/nightpass-demo-restart.log` (expect
+`prewarm CAUGHT UP lines: 3`).

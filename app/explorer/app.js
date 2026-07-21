@@ -103,7 +103,7 @@ function scrambleIn(el, delayMs) {
 }
 
 var API = "/api/v1/passport";
-  var state = { rows: [], network: "", query: "", page: 1, crossVerify: false, peerNets: [], explorerLinks: {}, viewerBase: null, loaded: false };
+  var state = { rows: [], network: "", query: "", page: 1, crossVerify: false, peerNets: [], explorerLinks: {}, viewerBase: null, loaded: false, fingerprint: "" };
   var app = document.getElementById("app");
 
   // ---------- utils ----------
@@ -194,7 +194,41 @@ var API = "/api/v1/passport";
     return '<span class="zk-chip" title="' + esc(tip) + '">' + shieldSvg() + n + " ZK</span>";
   }
 
+  // ---------- recently anchored ticker ----------
+
+  /** The most recently anchored passports, newest first. Reuses the explorer
+   * feed (no separate endpoint); a small live strip above the stat tiles. */
+  function recentAnchored(rows) {
+    return rows.filter(function (r) { return r.status === "anchored" && r.createdAt; })
+      .slice()
+      .sort(function (a, b) { return a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : 0; })
+      .slice(0, 8);
+  }
+
+  function tickerHtml(rows) {
+    var recent = recentAnchored(rows);
+    if (!recent.length) return "";
+    var items = recent.map(function (r) {
+      return '<a class="tick" href="#/p/' + encodeURIComponent(r.passportId) + '">' +
+        '<span class="tick-dot"></span>' +
+        '<span class="tick-pid mono">' + esc(r.passportId) + "</span>" +
+        (r.claims && r.claims.length ? '<span class="tick-zk">' + r.claims.length + " ZK</span>" : "") +
+        '<span class="tick-age">' + esc(relTime(r.createdAt)) + "</span></a>";
+    }).join("");
+    return '<section class="ticker" aria-label="Recently anchored">' +
+      '<span class="ticker-label">Recently anchored</span>' +
+      '<div class="ticker-track">' + items + "</div></section>";
+  }
+
   // ---------- data ----------
+
+  // A cheap signature of the row set: changes only when a passport is added,
+  // re-anchored, or its claims change. Drives the poll's re-render guard.
+  function rowsFingerprint(rows) {
+    return rows.map(function (r) {
+      return r.passportId + ":" + r.status + ":" + r.createdAt + ":" + (r.claims || []).length;
+    }).join("|");
+  }
 
   function load() {
     var pNet = fetch(API + "/runtime-config")
@@ -218,6 +252,7 @@ var API = "/api/v1/passport";
       // = the internal work instance, null = pure explorer surface (no link).
       state.viewerBase = res[0].viewerBase !== undefined ? res[0].viewerBase : "";
       state.rows = res[1];
+      state.fingerprint = rowsFingerprint(state.rows);
       state.loaded = true;
       entranceDone = false; // fresh data, fresh entrance
       var badge = document.getElementById("networkBadge");
@@ -404,6 +439,7 @@ var API = "/api/v1/passport";
     var body = currentPageRows().map(function (r) { return rowHtml(r, state.rows.indexOf(r)); }).join("");
     app.innerHTML =
       heroHtml(all) +
+      tickerHtml(all) +
       statTiles(all) +
       '<section class="panel">' +
         '<div class="panel-head"><h2>Midnight ' + netBadge(state.network) + " passports" +
@@ -733,3 +769,28 @@ var API = "/api/v1/passport";
   load().then(render).catch(function (e) {
     app.innerHTML = '<div class="empty">Failed to load: ' + esc(e.message || e) + "</div>";
   });
+
+  // Gentle live refresh: poll the feed every 30s and re-render ONLY when the
+  // row set actually changed (fingerprint), and ONLY on the list view. This
+  // never yanks the detail page or an in-progress verify out from under the
+  // user, and it skips work while the tab is hidden.
+  var POLL_MS = 30000;
+  function pollTick() {
+    if (!state.loaded || (document.hidden === true)) return;
+    fetch(API + "/anchorExplorer()")
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (b) {
+        if (!b) return;
+        var rows = b.value || [];
+        var fp = rowsFingerprint(rows);
+        if (fp === state.fingerprint) return; // nothing new; leave the DOM alone
+        state.fingerprint = fp;
+        state.rows = rows;
+        if (!/^#\/p\//.test(location.hash || "")) {
+          entranceDone = true; // silent refresh, no entrance replay
+          render();
+        }
+      })
+      .catch(function () { /* transient; try again next tick */ });
+  }
+  setInterval(pollTick, POLL_MS);

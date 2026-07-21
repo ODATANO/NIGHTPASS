@@ -37,6 +37,7 @@ export default class DemoService extends cds.ApplicationService {
         this.on('createDemoPassport', this.createDemoPassport);
         this.on('demoRunStatus', this.demoRunStatus);
         this.on('demoInfo', this.demoInfo);
+        this.on('demoSponsorStatus', this.demoSponsorStatus);
         // Stale queued/running rows from a previous process are unrecoverable
         // (the queue is in-memory); fail them honestly on boot.
         cds.on('served', () => {
@@ -355,6 +356,23 @@ export default class DemoService extends cds.ApplicationService {
             waitingCount: this.queue.length,
             dailyRemaining: Math.max(0, this.maxPerDay() - used)
         };
+    };
+
+    /**
+     * Ops dust monitor: delegate to ProducerService (it owns the sponsor
+     * sessions) under the same technical principal that opened them, and
+     * surface the pool's NIGHT/dust snapshot on the anonymous demo surface so
+     * an operator can curl it without SSH. Never throws; degrades to [].
+     */
+    private demoSponsorStatus = async () => {
+        if (!this.enabled()) return [];
+        try {
+            const producer: any = await cds.connect.to('ProducerService');
+            return await producer.tx({ user: this.techUser() }, (tx: any) => tx.send('sponsorPoolStatus'));
+        } catch (e) {
+            cds.log('demo').warn('demoSponsorStatus failed:', (e as Error)?.message);
+            return [];
+        }
     };
 
     // --- run executor ---------------------------------------------------------
