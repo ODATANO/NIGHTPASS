@@ -67,6 +67,25 @@ npm start              # cds-tsx serve  ->  http://localhost:4004
 
 Open http://localhost:4004/ for the launchpad.
 
+NIGHTPASS owns the host-wide HTTP security policy in `srv/http-security.ts`;
+NIGHTGATE does not modify unrelated host routes. Cross-origin access is closed
+by default. Set `PASSPORT_CORS_ORIGINS` to a comma-separated allow-list when a
+separately hosted wallet or frontend must read `/contract-manifest` or
+`/zk-config/...`; set `PASSPORT_CORS_API=true` only when the OData APIs must
+also be cross-origin.
+
+The current NIGHTGATE runtime is deliberately single-instance and
+single-tenant. NIGHTPASS declares `runtimeMode: "single-instance"` and
+`replicaCount: 1`; deployments set `NIGHTGATE_REPLICA_COUNT=1`. Starting with
+a declared higher count or CAP multitenancy fails closed before the wallet
+worker or crawler starts.
+
+Local development and tests use SQLite. The CAP `production` profile selects
+PostgreSQL through `@cap-js/postgres`; credentials are supplied only by the
+deployment environment. Production startup fails closed if SQLite is still
+effective. The supplied Compose stack includes PostgreSQL 16 with a persistent
+volume and health check.
+
 ### Apps and services on :4004
 
 | Surface | Path |
@@ -84,7 +103,8 @@ Open http://localhost:4004/ for the launchpad.
 | Command | What it does |
 |---|---|
 | `npm start` | Serve via `cds-tsx serve` |
-| `npm run deploy` | Deploy the merged model to `db/passport.db` |
+| `npm run deploy` | Deploy/evolve the merged model in the database selected by the active CAP profile |
+| `npm run test:postgres` | Deploy the full model to the bound PostgreSQL database and query core NIGHTPASS/NIGHTGATE entities |
 | `npm run build:connector-lib` | Build the connector into `app/connector/lib` (self-contained ESM, WASM inlined) |
 | `npm run producer:smoke` | Producer cockpit offline-path smoke test |
 | `npm run pac:demo` | Build a PAC and verify it (`tractusx/pac/`) |

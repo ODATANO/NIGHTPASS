@@ -21,23 +21,19 @@ secrets; it reads and verifies only.
 2. **Local prep** (on your dev machine, in the repo):
    ```bash
    node scripts/set-qr-host.mjs https://passport.<your-domain>   # QR urls -> real host
-   node scripts/bake-demo-db.mjs                                 # sanitized deploy/passport-demo.db
    cp deploy/.env.example deploy/.env                            # then fill it in
    ```
    Fill `deploy/.env`: domain, ENCRYPTION_KEY (same as local .env), strong
-   DEMO_PASS_* values.
+   DEMO_PASS_* values and a high-entropy `POSTGRES_PASSWORD`.
 
 3. **Server prep**: install Docker (`curl -fsSL https://get.docker.com | sh`),
    then copy the repo onto the server (`git clone` + copy `deploy/.env` and
-   `deploy/passport-demo.db` over, they are gitignored).
+   `deploy/.env` over; it is gitignored).
 
-4. **Seed the volume, then start** (from the repo root on the server):
+4. **Start PostgreSQL and the app** (from the repo root on the server):
    ```bash
    cd deploy
-   docker compose create nightpass
-   docker compose run --rm --entrypoint sh nightpass -c "cp /src/passport-demo.db /data/passport.db" \
-     || docker run --rm -v deploy_passport-db:/data -v $(pwd):/src alpine cp /src/passport-demo.db /data/passport.db
-   docker compose up -d
+   docker compose up -d --build
    ```
 
 5. **Smoke check** from anywhere:
@@ -48,8 +44,14 @@ secrets; it reads and verifies only.
 
 ## Notes
 
-- `deploy/.env` and `deploy/passport-demo.db` are gitignored; move them to the
-  server via scp, never commit them.
+- `deploy/.env` is gitignored; move it to the server via scp, never commit it.
+- PostgreSQL data lives in `passport-pg-data`. Back up with `pg_dump` before
+  upgrades and verify restores regularly; a Docker volume is persistence, not
+  a backup.
+  ```bash
+  docker compose exec -T postgres pg_dump -U nightpass -Fc nightpass > nightpass.dump
+  # Verify into a separate disposable database/container before relying on it.
+  ```
 - The DPP conformance API stays OFF on public hosts (`DPP_API_ENABLED` unset);
   it is a test surface with unauthenticated writes by design.
 - Anchoring/proving stays on your work machine; the public instance only
@@ -75,7 +77,7 @@ Prepared but NOT part of the default stack. Rollout:
 4. **Caddy**: `cp Caddyfile.demo Caddyfile` on the server (adds the demo
    site), then `docker compose restart caddy`.
 5. **Start**: `docker compose --profile demo up -d --build`. First boot
-   deploys a fresh scratch DB into `passport-demo-db` and prewarms the
+  deploys/evolves a fresh PostgreSQL schema in `passport-demo-pg-data` and prewarms the
    sponsor (~1 min); check `https://demo.<your-domain>/api/v1/demo/demoInfo()`
    shows `"enabled": true`.
 6. **Smoke**: run one visitor flow from a phone; the finished passport must

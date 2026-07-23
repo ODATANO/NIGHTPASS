@@ -119,7 +119,8 @@ services:
     environment:
       PASSPORT_VERIFY_PEERS: preprod=http://nightpass-preprod:4004
       PASSPORT_EXPLORER_LINKS: preprod=https://preprod.<demo-host>/explorer/
-    volumes: ["passport-db:/data"]
+      cds_requires_db_credentials_host: postgres-preview
+      cds_requires_db_credentials_database: nightpass_preview
   nightpass-preprod:
     build: .
     ports: ["4005:4004"]
@@ -128,12 +129,11 @@ services:
       NIGHTGATE_NETWORK: preprod
       PASSPORT_VERIFY_PEERS: preview=http://nightpass-preview:4004
       PASSPORT_EXPLORER_LINKS: preview=https://preview.<demo-host>/explorer/
-    volumes: ["passport-db:/data"]
+      cds_requires_db_credentials_host: postgres-preprod
+      cds_requires_db_credentials_database: nightpass_preprod
   proof-server:
     image: midnightnetwork/proof-server:latest
     command: ["midnight-proof-server", "--port", "6300"]
-volumes:
-  passport-db:
 ```
 
 Only testnet (preview) funds belong on that wallet. Treat the host as
@@ -145,23 +145,20 @@ compromised by default and fund it accordingly.
 docker build -t nightpass-demo .
 docker run -d --name nightpass -p 4004:4004 \
   --env-file .env.public \
-  -v passport-db:/data \
   nightpass-demo
 ```
 
-The database lives at `/data/passport.db` inside the container (NOT `/app/db`:
-mounting there would shadow the CDS model files).
+Production uses PostgreSQL through the CAP production profile. Use the supplied
+Compose stack, which injects the database binding and keeps data in a dedicated
+PostgreSQL volume. A standalone `docker run` also needs an external PostgreSQL
+service and the `cds_requires_db_credentials_host/port/user/password/database`
+variables.
 
-The container deploys a fresh schema + CSV seeds on first start when the volume
-is empty. To ship your already-anchored demo passports instead, copy a
-sanitized database into the volume BEFORE the first start:
-
-```bash
-# sanitize: drop runtime wallet state, it does not belong on a public host
-cp db/passport.db /tmp/passport.db
-sqlite3 /tmp/passport.db "DELETE FROM midnight_WalletSyncStates; DELETE FROM midnight_WalletSessions;"
-docker run --rm -v passport-db:/data -v /tmp:/src alpine cp /src/passport.db /data/passport.db
-```
+Do not mount or copy a development SQLite file into the production container.
+To retain existing data, deploy the CDS schema to PostgreSQL, stop SQLite
+writers, migrate only sanitized rows through a reviewed ETL, compare table row
+counts and application-level passport/anchor results, and keep the original
+SQLite file read-only until a PostgreSQL restore test succeeds.
 
 Put a TLS reverse proxy (Caddy, nginx, Cloudflare) in front of port 4004; QR
 scans from phones need HTTPS anyway.
@@ -200,8 +197,8 @@ the printed URL as `PASSPORT_DEMO_HOST`.
   `https://<demo-host>/resolve/<payloadHash>`.
 - The verifiable credential JSON is at
   `/api/v1/passport/passportCredential(payloadHash='<hash>')`.
-- Prefer linking over iframing: the viewer is a full SAPUI5 app and the plugin
-  CSP is not tuned for cross-origin framing.
+- Prefer linking over iframing: the viewer is a full SAPUI5 app and NIGHTPASS's
+  host CSP intentionally denies framing.
 
 ## Security checklist before going public
 
@@ -209,10 +206,16 @@ the printed URL as `PASSPORT_DEMO_HOST`.
       (defaults equal the user names and are public knowledge).
 - [ ] `ENCRYPTION_KEY` is a fresh random 32-byte hex, not the dev default.
 - [ ] Mode A: no `LACE_*` / `PRODUCER_*` / `ERP_WEBHOOK_SECRET` on the host.
-- [ ] Database in the image/volume is sanitized (no `midnight_WalletSyncStates`
-      / `midnight_WalletSessions` rows from live runs).
+- [ ] PostgreSQL contains no copied `midnight_WalletSyncStates` /
+      `midnight_WalletSessions` rows from live development runs.
+- [ ] `pg_dump` backup and restore have been tested outside the live volume.
 - [ ] Page labels the demo as Midnight testnet (preview); a network reset
       requires re-anchoring.
+- [ ] `PASSPORT_CORS_ORIGINS` is unset unless a specific external wallet or
+      frontend requires connector access; never use `*` on the write-capable
+      work surface.
+- [ ] Each NIGHTPASS service runs exactly one container/process and declares
+      `NIGHTGATE_REPLICA_COUNT=1`; do not use Compose `--scale` for it.
 - [ ] Write actions are producer-gated: `generatePassport`, `registerPartner`,
       `triggerGoodsReceipt` and the whole ProducerService reject anonymous
       callers. `verifyOnChain`, the viewer entities and the credential export

@@ -6,9 +6,32 @@ services:
     build: ..
     restart: unless-stopped
     env_file: .env
+    environment:
+      NIGHTGATE_REPLICA_COUNT: "1"
+      cds_requires_db_credentials_host: postgres
+      cds_requires_db_credentials_port: "5432"
+      cds_requires_db_credentials_user: nightpass
+      cds_requires_db_credentials_password: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in deploy/.env}
+      cds_requires_db_credentials_database: nightpass
     expose: ["4004"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: nightpass
+      POSTGRES_USER: nightpass
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in deploy/.env}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nightpass -d nightpass"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
     volumes:
-      - passport-db:/data
+      - passport-pg-data:/var/lib/postgresql/data
 
   # ---- "Try it" demo instance (profile: demo, off by default) --------------
   # Anchors visitor passports on preview with a dedicated sponsor wallet and
@@ -20,11 +43,35 @@ services:
     restart: unless-stopped
     profiles: ["demo"]
     env_file: .env.demo
+    environment:
+      NIGHTGATE_REPLICA_COUNT: "1"
+      cds_requires_db_credentials_host: postgres-demo
+      cds_requires_db_credentials_port: "5432"
+      cds_requires_db_credentials_user: nightpass_demo
+      cds_requires_db_credentials_password: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in deploy/.env}
+      cds_requires_db_credentials_database: nightpass_demo
     expose: ["4004"]
-    volumes:
-      - passport-demo-db:/data
     depends_on:
-      - proof-server
+      proof-server:
+        condition: service_started
+      postgres-demo:
+        condition: service_healthy
+
+  postgres-demo:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    profiles: ["demo"]
+    environment:
+      POSTGRES_DB: nightpass_demo
+      POSTGRES_USER: nightpass_demo
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in deploy/.env}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nightpass_demo -d nightpass_demo"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    volumes:
+      - passport-demo-pg-data:/var/lib/postgresql/data
 
   # ZK proof server for the demo instance's anchor/proof transactions.
   # Internal network only, never published to the host.
@@ -53,7 +100,7 @@ services:
       - caddy-config:/config
 
 volumes:
-  passport-db:
-  passport-demo-db:
+  passport-pg-data:
+  passport-demo-pg-data:
   caddy-data:
   caddy-config:

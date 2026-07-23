@@ -1,8 +1,3 @@
-# check=skip=SecretsUsedInArgOrEnv
-# The skipped check is a false positive: cds_requires_db_credentials_url is
-# CAP's env mapping for cds.requires.db.credentials.url and holds a SQLite
-# file path, not a secret. The variable name is fixed by CAP's convention.
-
 # NIGHTPASS public demo image (see docs/public-demo.md).
 #
 # Serves the SAPUI5 passport viewer, the QR resolver (/p/:id, /qr/:id.png) and
@@ -24,16 +19,11 @@ WORKDIR /app
 COPY . .
 RUN npm ci
 
-# The runtime database lives at /data, NOT the repo default db/passport.db:
-# mounting a volume over /app/db would shadow the CDS model files (db/*.cds)
-# that live next to it. /data holds only the SQLite file.
-ENV NODE_ENV=production \
-    cds_requires_db_credentials_url=/data/passport.db
-RUN mkdir -p /data
+ENV NODE_ENV=production
 
 EXPOSE 4004
 
-# Deploy a fresh schema + CSV seeds at startup when no database is present.
-# Mount a volume at /data (optionally pre-loaded with an anchored passport.db)
-# to persist passports across restarts; see docs/public-demo.md.
-CMD ["sh", "-c", "test -f /data/passport.db || npm run deploy; exec npx cds-tsx serve"]
+# CAP's PostgreSQL deployer performs non-destructive schema evolution and then
+# starts the application. Connection credentials arrive through the runtime
+# service binding / cds_requires_db_credentials_* environment variables.
+CMD ["sh", "-c", "npm run deploy && exec npx cds-tsx serve"]
