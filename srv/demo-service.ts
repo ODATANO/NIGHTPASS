@@ -5,7 +5,7 @@ import { Passports, PassportTransactions, PredicateProofLog } from '#cds-models/
 import { validateDemoInput, validNickname } from './lib/demo-validation';
 import { feeSponsorWalletIds } from './lib/producer-wallets';
 import { encryptSecret, decryptSecret } from './lib/demo-crypto';
-import { sendDetached, waitForJob, detachedFromRequest, explorerTxUrl } from './lib/passport-anchor';
+import { sendDetached, waitForJobResult, detachedFromRequest, explorerTxUrl } from './lib/passport-anchor';
 
 const { INSERT, SELECT, UPDATE } = cds.ql;
 
@@ -495,7 +495,7 @@ export default class DemoService extends cds.ApplicationService {
                 { sessionId, seedHex, ...(skipCallerSync ? { prewarm: false } : {}) }, user);
             if (signing?.prewarmJobId && !skipCallerSync) {
                 log.info(`run ${runId}: waiting for tester wallet sync...`);
-                await waitForJob(nightgate, String(signing.prewarmJobId), sessionId, user);
+                await waitForJobResult(nightgate, String(signing.prewarmJobId), sessionId, user);
             }
             await setStep('sync', { status: 'succeeded' });
 

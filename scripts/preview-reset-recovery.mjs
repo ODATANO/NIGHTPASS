@@ -132,11 +132,12 @@ async function api(method, path, body) {
     return json;
 }
 
-async function pollJob(jobId, sessionId, label, timeoutMin = 45) {
+async function pollJob(jobId, sessionId, label, timeoutMin = 45, requireChainSuccess = false) {
     const started = Date.now();
     for (;;) {
         const j = await api('POST', 'getJobStatus', { jobId, sessionId });
-        if (j.status === 'succeeded') return j;
+        if (j.status === 'succeeded' && requireChainSuccess && j.chainStatus === 'failure') throw new Error(`${label} failed on-chain`);
+        if (j.status === 'succeeded' && (!requireChainSuccess || j.chainStatus === 'success')) return j;
         if (j.status === 'failed') throw new Error(`${label} failed: ${j.errorCode} ${j.errorMessage}`);
         const min = (Date.now() - started) / 60000;
         if (min > timeoutMin) throw new Error(`${label} timed out after ${timeoutMin} min`);
@@ -201,7 +202,7 @@ for (const w of selected) {
             continue;
         }
         const reg = await api('POST', 'registerForDustGeneration', { sessionId });
-        const job = await pollJob(reg.jobId, sessionId, `${w.id} dust-register`);
+        const job = await pollJob(reg.jobId, sessionId, `${w.id} dust-register`, 45, true);
         const result = JSON.parse(job.result || '{}');
         console.log(`\n[${w.id}] dust registration tx ${result.txId} (${result.registeredCount}/${result.totalNightUtxos} UTXOs)`);
         bal = await api('GET', `getWalletBalance(sessionId=${sessionId})`);
