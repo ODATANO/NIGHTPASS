@@ -2,6 +2,9 @@ import cds from '@sap/cds';
 import { blake2b } from '@noble/hashes/blake2b';
 import { bytesToHex } from '@noble/hashes/utils';
 import { createCipheriv, hkdfSync, randomBytes } from 'node:crypto';
+import { AsyncResource } from 'node:async_hooks';
+
+const detachedRequestScope = new AsyncResource('nightpass.detached-service-call');
 
 /**
  * Shared passport-anchoring primitives, used by both PassportService
@@ -21,6 +24,38 @@ import { createCipheriv, hkdfSync, randomBytes } from 'node:crypto';
 export function effectiveNetwork(): string {
     const cfg = ((cds.env as unknown as Record<string, any>).requires?.nightgate ?? {}) as { network?: string };
     return process.env.NIGHTGATE_NETWORK?.trim() || cfg.network || 'preview';
+}
+
+/**
+ * Whether NIGHTGATE runs its block crawler. Mirrors the plugin's own resolution
+ * (env `NIGHTGATE_CRAWLER_ENABLED` overrides `cds.requires.nightgate.crawler.enabled`,
+ * with false/0/no/off read as off).
+ */
+export function crawlerEnabled(): boolean {
+    const env = process.env.NIGHTGATE_CRAWLER_ENABLED?.trim();
+    if (env != null && env !== '') return !/^(false|0|no|off)$/i.test(env);
+    const cfg = ((cds.env as unknown as Record<string, any>).requires?.nightgate?.crawler ?? {}) as { enabled?: boolean };
+    return cfg.enabled === true;
+}
+
+/**
+ * Whether NIGHTGATE can advance a job's `chainStatus` past `pending` at all, i.e.
+ * whether waiting on chain success can ever succeed. Two sources exist:
+ *   - the block crawler (populates Transactions/TransactionResults), or
+ *   - the crawler-free chain-outcome confirmer (NIGHTGATE >= 0.9.2, a per-tx
+ *     indexer lookup; defaults ON when the crawler is off, opt out with
+ *     `NIGHTGATE_CRAWLERLESS_CHAIN_CONFIRM=false` / `crawlerlessChainConfirm:false`).
+ * Mirrors the plugin's `resolveCrawlerlessChainConfirmEnabled`. When neither runs
+ * (crawler off AND confirmer opted out) chainStatus stays pending forever, so a
+ * caller must not block on it (see waitForJobResult).
+ */
+export function chainConfirmationAvailable(): boolean {
+    if (crawlerEnabled()) return true;
+    const env = process.env.NIGHTGATE_CRAWLERLESS_CHAIN_CONFIRM?.trim();
+    if (env != null && env !== '') return !/^(false|0|no|off)$/i.test(env);
+    const cfg = ((cds.env as unknown as Record<string, any>).requires?.nightgate ?? {}) as { crawlerlessChainConfirm?: boolean };
+    if (typeof cfg.crawlerlessChainConfirm === 'boolean') return cfg.crawlerlessChainConfirm;
+    return true; // crawler off + no opt-out: the 0.9.2 confirmer runs by default
 }
 
 /** Public explorer URL of a transaction on the given network (both testnets exist). */
@@ -285,7 +320,7 @@ export function encryptPayload(plaintext: string, passportId: string): Buffer {
  * is allowed to start.
  */
 export function detachedFromRequest<T>(fn: () => Promise<T>): Promise<T> {
-    return (cds as any)._with(undefined, fn);
+    return detachedRequestScope.runInAsyncScope(fn);
 }
 
 /**
@@ -308,21 +343,56 @@ export function sendDetached(nightgate: cds.Service, action: string, args: Recor
 
 /**
  * Poll a NIGHTGATE async job to completion and return its parsed result
- * object. Throws on job failure. 10 min cap (120 x 5s): the ZK proof takes
- * 1.5-3s and block inclusion a few seconds more, so the cap only covers
- * proof-server queueing. Each poll runs in its own short root tx so it sees
- * the job's committed status updates.
+ * object. With `requireChainSuccess`, workflow completion alone is not enough:
+ * polling continues until NIGHTGATE has indexed the canonical chain outcome.
+ * Each poll runs in its own short root tx so it sees committed status updates.
+ *
+ * Chain-success enforcement applies whenever NIGHTGATE can advance `chainStatus`
+ * at all: with the block crawler, or with the crawler-free confirmer (>= 0.9.2,
+ * on by default when the crawler is off). Only when neither runs would the status
+ * never arrive; there the server-side workflow `succeeded` is accepted and the
+ * anchor is confirmed via verifyAttestationState instead.
  */
-export async function waitForJobResult(nightgate: cds.Service, jobId: string, sessionId: string, user?: unknown): Promise<any> {
+export async function waitForJobResult(
+    nightgate: cds.Service,
+    jobId: string,
+    sessionId: string,
+    user?: unknown,
+    options: { requireChainSuccess?: boolean; pollIntervalMs?: number } = {}
+): Promise<any> {
+    const pollIntervalMs = options.pollIntervalMs ?? 5000;
+    // Only wait on chainStatus when NIGHTGATE can actually advance it.
+    const enforceChain = options.requireChainSuccess === true && chainConfirmationAvailable();
     for (let i = 0; i < 120; i++) {
         const job: any = await sendDetached(nightgate, 'getJobStatus', { jobId, sessionId }, user);
         if (job.status === 'succeeded') {
-            return job.result ? JSON.parse(job.result) : {};
+            if (enforceChain) {
+                if (job.chainStatus === 'failure') {
+                    const handle = job.txHash || job.submissionId || 'no submission handle persisted';
+                    throw new Error(`chain execution failed (${handle}): CHAIN_EXECUTION_FAILED`);
+                }
+                // `succeeded` only describes NIGHTGATE's server-side workflow.
+                // A submitted transaction remains pending until the indexer has
+                // observed its canonical System.Events outcome.
+                if (job.chainStatus !== 'success') {
+                    await new Promise(r => setTimeout(r, pollIntervalMs));
+                    continue;
+                }
+            }
+            if (!job.result) return {};
+            return typeof job.result === 'string' ? JSON.parse(job.result) : job.result;
         }
         if (job.status === 'failed') {
             throw new Error(`job failed: ${job.errorCode ?? ''} ${job.errorMessage ?? ''}`.trim());
         }
-        await new Promise(r => setTimeout(r, 5000));
+        if (job.status === 'reconciliation_required') {
+            const handle = job.txHash || job.submissionId || 'no submission handle persisted';
+            throw new Error(
+                `job requires reconciliation (${handle}): ` +
+                `${job.errorCode ?? ''} ${job.errorMessage ?? ''}`.trim()
+            );
+        }
+        await new Promise(r => setTimeout(r, pollIntervalMs));
     }
     throw new Error(`job ${jobId} did not complete within timeout`);
 }
@@ -333,8 +403,10 @@ export async function waitForJobResult(nightgate: cds.Service, jobId: string, se
  * a PAC envelope carrying the hash at `proof.proofValue` instead.
  */
 export async function waitForJob(nightgate: cds.Service, jobId: string, sessionId: string, user?: unknown): Promise<string> {
-    const result = await waitForJobResult(nightgate, jobId, sessionId, user);
-    return String(result.txHash ?? '');
+    const result = await waitForJobResult(nightgate, jobId, sessionId, user, { requireChainSuccess: true });
+    const txHash = result.txHash ?? result.txId;
+    if (!txHash) throw new Error(`chain job ${jobId} succeeded without a transaction hash`);
+    return String(txHash);
 }
 
 /**

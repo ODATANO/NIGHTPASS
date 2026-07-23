@@ -66,6 +66,7 @@ service ProducerService {
     )                                                                    returns {
         passportId  : String;
         payloadHash : String;
+        contentRoot : String; // 64-hex Merkle root anchored on-chain (empty when nothing to anchor); pass to verifyAttestationState
         mode        : String;
         txHash      : String;
     };
@@ -207,9 +208,10 @@ service ProducerService {
                             walletId: String, // optional: which SERVER wallet signs
                             sponsorWalletId: String // optional: pool member of PASSPORT_FEE_SPONSOR_WALLET
     )                                                                    returns {
-        passportId : String;
-        mode       : String;
-        txHash     : String;
+        passportId  : String;
+        contentRoot : String; // 64-hex Merkle root anchored on-chain (empty when nothing to anchor)
+        mode        : String;
+        txHash      : String;
     };
 
     /**

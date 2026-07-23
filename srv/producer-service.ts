@@ -247,6 +247,9 @@ export default class ProducerService extends cds.ApplicationService {
                     else if (job?.status === 'failed') {
                         state = 'error';
                         error = `${job.errorCode ?? ''} ${job.errorMessage ?? ''}`.trim() || 'prewarm failed';
+                    } else if (job?.status === 'reconciliation_required') {
+                        state = 'error';
+                        error = `${job.errorCode ?? ''} ${job.errorMessage ?? ''}`.trim() || 'prewarm requires reconciliation';
                     }
                 } catch { /* job read hiccup: keep reporting 'warming' */ }
             }
@@ -411,8 +414,9 @@ export default class ProducerService extends cds.ApplicationService {
             return this.anchorRow(req, ID, passportId, payloadHash, passportIdHash, contractAddress, session, true, sponsorWalletId);
         }
         // Offline: record a placeholder tx row so the overview shows the draft.
+        // No on-chain anchor here, so there is no content root to report.
         await INSERT.into(PassportTransactions).entries({ passport_ID: ID, kind: 'attest', status: 'offline' } as any);
-        return { passportId, payloadHash, mode: 'offline', txHash: '' };
+        return { passportId, payloadHash, contentRoot: '', mode: 'offline', txHash: '' };
     };
 
     private submitPassport = async (req: cds.Request) => {
@@ -426,7 +430,7 @@ export default class ProducerService extends cds.ApplicationService {
             return req.reject(400, 'no signing session / PASSPORT_CONTRACT_ADDRESS available; cannot submit on-chain');
         }
         const r = await this.anchorRow(req, row.ID, row.passportId, row.payloadHash, row.passportIdHash, contractAddress, session, false, sponsorWalletId);
-        return { passportId: r.passportId, mode: r.mode, txHash: r.txHash };
+        return { passportId: r.passportId, contentRoot: r.contentRoot ?? '', mode: r.mode, txHash: r.txHash };
     };
 
     /**
@@ -895,7 +899,9 @@ export default class ProducerService extends cds.ApplicationService {
             ).catch((e: unknown) =>
                 cds.log('producer').error(`detached anchor runner crashed for ${passportId}:`, e));
         });
-        return { passportId, payloadHash: includePayloadHash ? payloadHash : undefined, mode: 'anchoring', txHash: '' };
+        // Return the anchored content root so the caller can pass it back to
+        // verifyAttestationState (contentRootOk is only meaningful with it).
+        return { passportId, payloadHash: includePayloadHash ? payloadHash : undefined, contentRoot: contentRoot ?? '', mode: 'anchoring', txHash: '' };
     }
 
     /**
@@ -920,7 +926,7 @@ export default class ProducerService extends cds.ApplicationService {
             if (prewarmJob) {
                 this.serverPrewarmJobs.delete(sessionId);
                 log.info(`awaiting server-session prewarm ${prewarmJob} before first anchor...`);
-                await waitForJob(nightgate, prewarmJob, sessionId, user);
+                await waitForJobResult(nightgate, prewarmJob, sessionId, user);
                 log.info('server-session prewarm complete');
             }
             if (sponsorSessionId) log.info(`anchor fees for ${passportId} sponsored by session ${sponsorSessionId.slice(0, 8)}...`);
@@ -1014,7 +1020,7 @@ export default class ProducerService extends cds.ApplicationService {
             const prewarmJob = this.serverPrewarmJobs.get(sessionId);
             if (prewarmJob) {
                 this.serverPrewarmJobs.delete(sessionId);
-                await waitForJob(nightgate, prewarmJob, sessionId, user);
+                await waitForJobResult(nightgate, prewarmJob, sessionId, user);
             }
             const res: any = await sendDetached(nightgate, action, args, user);
             const txHash = await waitForJob(nightgate, res.jobId, sessionId, user);
@@ -1135,10 +1141,12 @@ export default class ProducerService extends cds.ApplicationService {
             const prewarmJob = this.serverPrewarmJobs.get(args.sessionId);
             if (prewarmJob) {
                 this.serverPrewarmJobs.delete(args.sessionId);
-                await waitForJob(nightgate, prewarmJob, args.sessionId, user);
+                await waitForJobResult(nightgate, prewarmJob, args.sessionId, user);
             }
             const res: any = await sendDetached(nightgate, 'issueFieldPredicateAttestation', args, user);
-            const jobResult: any = await waitForJobResult(nightgate, res.jobId, args.sessionId, user);
+            const jobResult: any = await waitForJobResult(
+                nightgate, res.jobId, args.sessionId, user, { requireChainSuccess: true }
+            );
             const txHash = String(jobResult?.proof?.proofValue ?? jobResult?.txHash ?? '');
             const paId = String(res.predicateAttestationId ?? jobResult?.predicateAttestationId ?? '');
             const rootTx = await this.contentRootTxOf(args.sessionId, args.contractAddress, startedAt);

@@ -76,17 +76,26 @@ async function get(base, path) {
     return r.json();
 }
 
-async function pollJob(sessionId, jobId, label, timeoutMs = PREWARM_TIMEOUT_MS) {
+async function pollJob(sessionId, jobId, label, timeoutMs = PREWARM_TIMEOUT_MS, requireChainSuccess = false) {
     const deadline = Date.now() + timeoutMs;
     let last = null;
     while (Date.now() < deadline) {
         const r = await post(NG, '/getJobStatus', { jobId, sessionId }, 120_000);
         if (r.status !== 200) fail(`getJobStatus(${jobId}) -> HTTP ${r.status}: ${pretty(r.body)}`);
-        const { status, result, errorCode, errorMessage } = r.body;
+        const { status, chainStatus, result, errorCode, errorMessage } = r.body;
         if (status !== last) { process.stdout.write(`\n     [${label}] ${jobId.slice(0, 8)} status=${status}`); last = status; }
         else process.stdout.write('.');
-        if (status === 'succeeded') { process.stdout.write('\n'); return result ? JSON.parse(result) : {}; }
+        if (status === 'succeeded' && requireChainSuccess && chainStatus === 'failure') {
+            process.stdout.write('\n'); fail(`[${label}] canonical chain execution failed`);
+        }
+        if (status === 'succeeded' && (!requireChainSuccess || chainStatus === 'success')) {
+            process.stdout.write('\n'); return result ? JSON.parse(result) : {};
+        }
         if (status === 'failed') { process.stdout.write('\n'); fail(`[${label}] job ${jobId} failed: ${errorCode} - ${errorMessage}`); }
+        if (status === 'reconciliation_required') {
+            process.stdout.write('\n');
+            fail(`[${label}] job ${jobId} requires reconciliation: ${errorCode} - ${errorMessage}`);
+        }
         await new Promise(r2 => setTimeout(r2, POLL_MS));
     }
     fail(`[${label}] job ${jobId} did not finish within ${timeoutMs / 1000}s`);
@@ -134,7 +143,7 @@ async function phaseA(sessionId) {
         step('registerForDustGeneration');
         const r = await post(NG, '/registerForDustGeneration', { sessionId, dustReceiverAddress: '' }, 10 * 60_000);
         if (r.status !== 200 && r.status !== 201) fail(`registerForDustGeneration -> HTTP ${r.status}: ${pretty(r.body)}`);
-        const reg = await pollJob(sessionId, r.body.jobId, 'dust-reg');
+        const reg = await pollJob(sessionId, r.body.jobId, 'dust-reg', PREWARM_TIMEOUT_MS, true);
         console.log(`OK   result: ${pretty(reg)}`);
         if (reg.registeredCount > 0) {
             step(`Waiting ${DUST_WAIT_S}s for first DUST accrual`);
@@ -149,7 +158,7 @@ async function phaseA(sessionId) {
         compiledArtifactRef: 'attestation-vault', sessionId, initialPrivateState: '{}'
     }, 10 * 60_000);
     if (r.status >= 400) fail(`deployContract -> HTTP ${r.status}: ${pretty(r.body)}`);
-    const dep = await pollJob(sessionId, r.body.jobId, 'deploy');
+    const dep = await pollJob(sessionId, r.body.jobId, 'deploy', PREWARM_TIMEOUT_MS, true);
     console.log(`OK   result: ${pretty(dep)}`);
     if (!dep.contractAddress) fail(`deploy returned no contractAddress: ${pretty(dep)}`);
 
@@ -183,6 +192,10 @@ async function phaseB(sessionId) {
     if (r.status >= 400) fail(`createPassport -> HTTP ${r.status}: ${pretty(r.body)}`);
     console.log(`OK   response: ${pretty(r.body)}`);
     if (r.body?.mode !== 'anchoring') fail(`expected mode=anchoring, got '${r.body?.mode}' (is PASSPORT_CONTRACT_ADDRESS set in the SERVER's env?)`);
+    // The server returns the Merkle content root it anchors; verifyAttestationState
+    // needs it to confirm the anchored root (contentRootOk is false without it).
+    const contentRoot = String(r.body?.contentRoot ?? '');
+    if (!/^[0-9a-f]{64}$/i.test(contentRoot)) fail(`expected a 64-hex contentRoot in the createPassport response, got '${contentRoot}'`);
 
     step('Poll passport row until anchored (attest + bindPassport + contentRoot; expect ~1-3 min)');
     const rowUrl = `/Passports?$filter=passportId eq '${passportId}'&$select=ID,passportId,status,attestationTxHash,payloadHash,contractAddress`;
@@ -208,9 +221,11 @@ async function phaseB(sessionId) {
 
     step('Crawler-free on-chain confirm: verifyAttestationState');
     // OData FUNCTION (GET with inline parameters), not an action: POST gets 405.
-    const v = await get(NG, `/verifyAttestationState(contractAddress='${row.contractAddress}',payloadHash='${row.payloadHash}',compiledArtifactRef='attestation-vault')`);
+    // Pass the anchored contentRoot so the anchored Merkle root is checked too.
+    const v = await get(NG, `/verifyAttestationState(contractAddress='${row.contractAddress}',payloadHash='${row.payloadHash}',contentRoot='${contentRoot}',compiledArtifactRef='attestation-vault')`);
     console.log(`verifyAttestationState -> ${pretty(v)}`);
     if (v?.verified !== true) fail('on-chain state did NOT confirm the attested payload hash');
+    if (v?.contentRootOk !== true) fail(`anchored content root did NOT match (contentRootOk=${v?.contentRootOk}); anchored root ${contentRoot}`);
 
     console.log('\nPHASE B PASSED. Passport anchored on preprod and state-verified crawler-free.');
     console.log(`Passport:  ${passportId}`);
