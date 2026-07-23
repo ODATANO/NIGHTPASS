@@ -3,6 +3,7 @@ import QRCode from 'qrcode';
 import crypto from 'node:crypto';
 import express from 'express';
 import { verifyPeers, explorerLinks, passportSources } from './lib/passport-anchor';
+import { passportHttpSecurity } from './http-security';
 
 const { SELECT, INSERT, UPDATE, DELETE } = cds.ql;
 
@@ -17,6 +18,10 @@ const { SELECT, INSERT, UPDATE, DELETE } = cds.ql;
  * so the view preselects the battery.
  */
 cds.on('bootstrap', (app: any) => {
+    // NIGHTPASS owns host-wide HTTP policy. Plugins (including NIGHTGATE) must
+    // not alter unrelated routes in the shared CAP process.
+    app.use(passportHttpSecurity);
+
     // Behind a reverse proxy (Caddy on the public hosts) req.ip is the proxy
     // container's address unless Express is told to trust X-Forwarded-For.
     // Without this every visitor shares ONE per-IP rate/cap bucket (demo caps,
