@@ -9,18 +9,19 @@
     "url": "https://github.com/ODATANO/NIGHTPASS"
   },
   "dependencies": {
-    "@odatano/nightgate": "^0.8.3",
-    "@sap/cds": "^9",
+    "@cap-js/postgres": "^3",
+    "@odatano/nightgate": "^0.9.2",
+    "@sap/cds": "^10",
     "animejs": "^4.5.0",
     "express": "^4",
     "qrcode": "^1.5.4",
     "sharp": "^0.35.3"
   },
   "devDependencies": {
-    "@cap-js/cds-typer": "^0.39.1",
-    "@cap-js/cds-types": "^0.16.0",
-    "@cap-js/sqlite": "^2",
-    "@sap/cds-dk": "^9.9.2",
+    "@cap-js/cds-typer": "^0.40.0",
+    "@cap-js/cds-types": "^0.18.0",
+    "@cap-js/sqlite": "^3",
+    "@sap/cds-dk": "^10",
     "@types/node": "^24.0.0",
     "@types/qrcode": "^1.5.6",
     "playwright": "^1.60.0",
@@ -33,19 +34,19 @@
     "node": ">=22"
   },
   "overrides": {
-    "@midnight-ntwrk/ledger-v8": "8.1.0",
-    "@midnight-ntwrk/compact-js": "2.5.1"
+    "@midnight-ntwrk/ledger-v8": "8.1.0"
   },
   "scripts": {
     "postinstall": "npm run gen:types && npm run build:connector-lib && npm run vendor:explorer",
     "vendor:explorer": "node scripts/vendor-explorer.mjs",
     "start": "cds-tsx serve",
     "build:connector-lib": "vite build app/connector -c app/connector/vite.lib.config.mjs",
-    "deploy": "node -e \"const cds=require('@sap/cds');(async()=>{await cds.plugins;const m=await cds.load('*');await cds.deploy(m).to('db');console.log('deployed to db/passport.db')})().catch(e=>{console.error(e);process.exit(1)})\"",
-    "gen:types": "cds-typer \"*\"",
+    "deploy": "node -e \"const cds=require('@sap/cds');(async()=>{await cds.plugins;const m=await cds.load('*');await cds.deploy(m).to('db');console.log('database schema deployed')})().catch(e=>{console.error(e);process.exit(1)})\"",
+    "gen:types": "cds-typer \"*\" --outputDTsFiles false",
     "typecheck": "tsc --noEmit",
     "test": "node --import tsx --test \"test/unit/**/*.test.ts\"",
     "test:ci": "node --import tsx --test-reporter=spec --test \"test/unit/**/*.test.ts\"",
+    "test:postgres": "node scripts/test-postgres.mjs",
     "test:coverage": "node -e \"require('fs').mkdirSync('coverage',{recursive:true})\" && node --import tsx --experimental-test-coverage --test-reporter=lcov --test-reporter-destination=coverage/lcov.info --test-reporter=spec --test-reporter-destination=stdout --test \"test/unit/**/*.test.ts\"",
     "pac:demo": "node --experimental-strip-types tractusx/pac/build-pac.mts",
     "producer:smoke": "node test/integration/producer-smoke.mjs",
@@ -55,24 +56,33 @@
   "cds": {
     "requires": {
       "db": {
-        "kind": "sqlite",
-        "credentials": {
-          "url": "db/passport.db"
+        "[development]": {
+          "kind": "sqlite",
+          "credentials": {
+            "url": "db/passport.db"
+          },
+          "pool": {
+            "max": 4
+          },
+          "client": {
+            "timeout": 20000
+          }
         },
-        "pool": {
-          "max": 4
-        },
-        "client": {
-          "timeout": 20000
+        "[production]": {
+          "kind": "postgres",
+          "credentials": {
+            "url": null
+          }
         }
       },
       "nightgate": {
         "network": "preview",
+        "runtimeMode": "single-instance",
+        "replicaCount": 1,
         "granteeBinding": "did",
         "crawler": {
           "enabled": false
         },
-        "contentSecurityPolicy": "default-src 'self' https://ui5.sap.com; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://ui5.sap.com; style-src 'self' 'unsafe-inline' https://ui5.sap.com; img-src 'self' data: blob: https:; font-src 'self' data: https://ui5.sap.com; connect-src 'self' ws: wss: https://ui5.sap.com http://localhost:* https://*.midnight.network",
         "contracts": {
           "attestation-vault": {
             "artifactPath": "node_modules/@odatano/nightgate/contracts/attestation-vault/src/managed/attestation-vault/contract/index.js",
