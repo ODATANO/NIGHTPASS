@@ -70,6 +70,7 @@ export default class ProducerService extends cds.ApplicationService {
         this.on('listServerWallets', this.listServerWallets);
         this.on('prewarmServerWallet', this.prewarmServerWallet);
         this.on('serverWalletStatus', this.serverWalletStatus);
+        this.on('serverWalletSession', this.serverWalletSession);
         this.on('sponsorPoolStatus', this.sponsorPoolStatus);
         this.on('recordWalletAttest', this.recordWalletAttest);
         this.on('recordWalletDisclosure', this.recordWalletDisclosure);
@@ -222,6 +223,21 @@ export default class ProducerService extends cds.ApplicationService {
      * is synced to the chain tip. Never rejects on job-read hiccups; it just
      * reports the last known state.
      */
+    /**
+     * The (cached, or newly opened) NIGHTGATE session of a server wallet.
+     * Exists so in-process consumers (demo executor's registrar step) reuse
+     * the ONE session per wallet instead of connecting a second facade for
+     * the same accountId, which wedges the wallet worker.
+     */
+    private serverWalletSession = async (req: cds.Request) => {
+        const { walletId } = req.data as { walletId?: string };
+        const secrets = producerWalletSecrets(walletId);
+        if (!secrets) return req.reject(404, `unknown server wallet '${walletId ?? ''}'`);
+        const sessionId = await this.serverSigningSession(secrets.id);
+        if (!sessionId) return req.reject(503, `server wallet '${secrets.id}' has no signing session`);
+        return { sessionId };
+    };
+
     private serverWalletStatus = async (req: cds.Request) => {
         const { walletId } = req.data as { walletId?: string };
         const secrets = producerWalletSecrets(walletId);
@@ -296,9 +312,39 @@ export default class ProducerService extends cds.ApplicationService {
                 out.push(cold(secrets.id, label, warmth?.state === 'error' ? 'error' : 'cold', warmth?.error ?? ''));
                 continue;
             }
+            // Resolve warmth via the prewarm JOB (a cheap job-row read that
+            // returns immediately), NEVER via a facade call: getWalletBalance
+            // on a still-syncing facade blocks for minutes inside NIGHTGATE's
+            // request transaction, and one leaked pg connection per status
+            // poll starved the pool live (2026-07-24, battery gauge).
+            let state: 'warming' | 'ready' = 'ready';
+            const prewarmJobId = this.serverPrewarmJobs.get(sessionId);
+            if (prewarmJobId) {
+                try {
+                    const job: any = await sendDetached(nightgate, 'getJobStatus', { jobId: prewarmJobId, sessionId }, req.user);
+                    if (job?.status === 'succeeded') {
+                        this.serverPrewarmJobs.delete(sessionId);
+                        this.walletWarmth.set(secrets.id, { state: 'ready', startedAt: Date.now() });
+                    } else if (job?.status === 'failed') {
+                        const msg = `${job.errorCode ?? ''} ${job.errorMessage ?? ''}`.trim() || 'prewarm failed';
+                        this.walletWarmth.set(secrets.id, { state: 'error', startedAt: Date.now(), error: msg });
+                        out.push(cold(secrets.id, label, 'error', msg));
+                        continue;
+                    } else {
+                        state = 'warming';
+                    }
+                } catch {
+                    state = 'warming';
+                }
+            }
+            if (state !== 'ready') { out.push(cold(secrets.id, label, 'warming')); continue; }
             try {
-                const b: any = await nightgate.tx({ user: req.user }, (tx: any) =>
-                    tx.send('getWalletBalance', { sessionId }));
+                // Belt and braces: the facade is provably at the tip here, so
+                // this returns fast; the bound only guards regressions.
+                const b: any = await Promise.race([
+                    sendDetached(nightgate, 'getWalletBalance', { sessionId }, req.user),
+                    new Promise((_, rej) => setTimeout(() => rej(new Error('WARMING_TIMEOUT')), 8000))
+                ]);
                 const registered = Number(b?.registeredNightUtxoCount ?? 0);
                 const dustPresent = Number(b?.dustBalance ?? 0) > 0;
                 // A successful balance read means the facade is live and serving
@@ -315,7 +361,12 @@ export default class ProducerService extends cds.ApplicationService {
                     error: ''
                 });
             } catch (e: any) {
-                out.push(cold(secrets.id, label, 'error', String(e?.message ?? e ?? 'balance read failed')));
+                const msg = String(e?.message ?? e ?? 'balance read failed');
+                if (msg === 'WARMING_TIMEOUT') {
+                    out.push(cold(secrets.id, label, 'warming', ''));
+                } else {
+                    out.push(cold(secrets.id, label, 'error', msg));
+                }
             }
         }
         return out;

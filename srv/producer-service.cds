@@ -109,6 +109,18 @@ service ProducerService {
     };
 
     /**
+     * NIGHTGATE session id of a configured server wallet, opening (and
+     * caching) it on first use. For trusted in-process consumers that must
+     * act with an EXISTING server-wallet session instead of opening a second
+     * one for the same account (two facades on one accountId wedge the wallet
+     * worker; documented same-account race). The id is only usable by the
+     * same authenticated user the session belongs to.
+     */
+    function serverWalletSession(walletId: String)                       returns {
+        sessionId : String;
+    };
+
+    /**
      * Balance snapshot of the fee-sponsor POOL (PASSPORT_FEE_SPONSOR_WALLET),
      * for the ops dust monitor. Reads only sponsors whose signing session is
      * already open (boot prewarm); a cold or errored sponsor reports its state

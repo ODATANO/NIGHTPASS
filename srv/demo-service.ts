@@ -3,9 +3,9 @@ import { randomBytes, createHash } from 'node:crypto';
 import { Testers, Runs } from '#cds-models/demo';
 import { Passports, PassportTransactions, PredicateProofLog } from '#cds-models/passport';
 import { validateDemoInput, validNickname } from './lib/demo-validation';
-import { feeSponsorWalletIds } from './lib/producer-wallets';
+import { feeSponsorWalletIds, producerWalletSecrets } from './lib/producer-wallets';
 import { encryptSecret, decryptSecret } from './lib/demo-crypto';
-import { sendDetached, waitForJobResult, detachedFromRequest, explorerTxUrl } from './lib/passport-anchor';
+import { sendDetached, waitForJobResult, detachedFromRequest, explorerTxUrl, blake2b256Hex } from './lib/passport-anchor';
 
 const { INSERT, SELECT, UPDATE } = cds.ql;
 
@@ -367,8 +367,12 @@ export default class DemoService extends cds.ApplicationService {
     private demoSponsorStatus = async () => {
         if (!this.enabled()) return [];
         try {
+            // DETACHED, never inside a managed tx: the pool reads talk to the
+            // wallet worker and can take seconds; an open DB transaction held
+            // across that leaked one postgres connection per poll until the
+            // pool starved (found live 2026-07-24 with the battery gauge).
             const producer: any = await cds.connect.to('ProducerService');
-            return await producer.tx({ user: this.techUser() }, (tx: any) => tx.send('sponsorPoolStatus'));
+            return await sendDetached(producer, 'sponsorPoolStatus', {}, this.techUser());
         } catch (e) {
             cds.log('demo').warn('demoSponsorStatus failed:', (e as Error)?.message);
             return [];
@@ -383,9 +387,23 @@ export default class DemoService extends cds.ApplicationService {
         input: NonNullable<ReturnType<typeof validateDemoInput>['value']>;
     }>();
 
+    /**
+     * Whether runs pre-register passport ownership on-chain (0.10.x vault
+     * feature). Explicit opt-in per deployment: the DEPLOYED vault must carry
+     * the `registerPassport` circuit (0.10.0 contract) and the registrar
+     * wallet (the vault DEPLOYER) must be configured on this instance; neither
+     * is detectable from the model alone.
+     */
+    private registerOwnershipEnabled(): boolean {
+        return /^(true|1|yes|on)$/i.test(String(process.env.DEMO_REGISTER_OWNERSHIP ?? ''));
+    }
+
     private initialSteps() {
         return [
             { kind: 'sync', label: 'Create passport & sync wallet', status: 'pending' },
+            ...(this.registerOwnershipEnabled()
+                ? [{ kind: 'registerPassport', label: 'Register passport ownership', status: 'pending' }]
+                : []),
             { kind: 'attest', label: 'Anchor payload hash (attest)', status: 'pending' },
             { kind: 'bindPassport', label: 'Bind passport id on-chain', status: 'pending' },
             { kind: 'anchorContentRoot', label: 'Anchor field Merkle root', status: 'pending' },
@@ -498,6 +516,47 @@ export default class DemoService extends cds.ApplicationService {
                 await waitForJobResult(nightgate, String(signing.prewarmJobId), sessionId, user);
             }
             await setStep('sync', { status: 'succeeded' });
+
+            // 1b. Pre-register passport ownership (0.10.x vault): the
+            //     registrar (the vault deployer's wallet on this instance)
+            //     assigns the passportId to the TESTER's attester identity
+            //     (deriveWalletInfo.attesterId, 0.10.1) BEFORE the first bind,
+            //     so the id is squat-proof from the very first on-chain
+            //     second. NEVER fatal: an unregistered id still binds
+            //     first-come, and a SUCCESSFUL registration points at exactly
+            //     the identity the tester binds with.
+            if (this.registerOwnershipEnabled()) {
+                await setStep('registerPassport', { status: 'running' });
+                try {
+                    const info: any = await sendDetached(nightgate, 'deriveWalletInfo', { seedHex }, user);
+                    if (!info?.attesterId) throw new Error('plugin lacks deriveWalletInfo.attesterId (NIGHTGATE >= 0.10.1 required)');
+                    const reg = producerWalletSecrets(process.env.PASSPORT_REGISTRAR_WALLET);
+                    if (!reg) throw new Error('no registrar wallet configured (PASSPORT_REGISTRAR_WALLET / default)');
+                    const contractAddress = process.env.PASSPORT_CONTRACT_ADDRESS;
+                    if (!contractAddress) throw new Error('PASSPORT_CONTRACT_ADDRESS not set');
+                    // REUSE the producer-cached session of the registrar
+                    // wallet. Never connectWallet here: that would open a
+                    // SECOND facade for an account the boot prewarm already
+                    // holds, and two facades on one accountId wedge the
+                    // wallet worker (this exact run hung on it live).
+                    const sess: any = await producer.tx({ user }, (tx: any) =>
+                        tx.send('serverWalletSession', { walletId: reg.id }));
+                    const regSession = String(sess.sessionId);
+                    const job: any = await sendDetached(nightgate, 'registerPassport', {
+                        passportId: blake2b256Hex(passportId),
+                        ownerId: info.attesterId,
+                        sessionId: regSession,
+                        contractAddress
+                    }, user);
+                    const res: any = await waitForJobResult(nightgate, String(job.jobId), regSession, user, { requireChainSuccess: true });
+                    await setStep('registerPassport', {
+                        status: 'succeeded', txHash: res.txHash, explorerUrl: explorerTxUrl(res.txHash)
+                    });
+                } catch (e) {
+                    log.warn(`run ${runId}: ownership registration failed (continuing unregistered):`, (e as Error)?.message);
+                    await setStep('registerPassport', { status: 'failed' });
+                }
+            }
 
             // 2. Create + anchor through the standard cockpit action. MANAGED
             //    tx (callback form) so its 'succeeded' event fires and the

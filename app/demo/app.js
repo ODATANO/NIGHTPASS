@@ -46,12 +46,82 @@
 
   // ---------- landing ----------
 
+  // ---------- sponsor battery (landing) ----------
+  // Small battery gauge next to the start button: fill = share of the
+  // fee-sponsor pool that is synced ('ready'), charging animation while any
+  // sponsor is still syncing. Purely informational; the start button stays
+  // usable as soon as the service says enabled.
+  const BATT_MAX_W = 26; // inner width of the battery body (x 3..29)
+
+  // The start button stays disabled until BOTH the service says the demo is
+  // open (budget left) AND the sponsor pool reports enough capacity. Without
+  // a configured pool the battery is hidden and only the service state rules.
+  let demoOpen = false;
+  let sponsorReady = false;
+
+  function updateStartButton() {
+    $('btnStart').disabled = !(demoOpen && sponsorReady);
+  }
+
+  function renderSponsorBattery(pool) {
+    const box = $('sponsorBattery');
+    if (!Array.isArray(pool) || pool.length === 0) {
+      box.hidden = true;
+      sponsorReady = true; // no pool configured: don't block the button
+      updateStartButton();
+      return;
+    }
+    box.hidden = false;
+    const ready = pool.filter((s) => s.state === 'ready').length;
+    const warming = pool.some((s) => s.state === 'warming' || s.state === 'cold');
+    const error = pool.some((s) => s.state === 'error');
+    // Capacity view: full once enough sponsors for max parallelism (3) are
+    // synced, even while spare pool members are still charging up.
+    const needed = Math.min(3, pool.length);
+    const pct = Math.min(1, ready / needed);
+    const fill = $('battFill');
+    const targetW = Math.round(BATT_MAX_W * Math.max(pct, warming ? 0.18 : 0));
+    if (!renderSponsorBattery.animated) {
+      // First paint: let the battery visibly charge up from empty instead of
+      // snapping to its level (the CSS width transition does the sweep).
+      renderSponsorBattery.animated = true;
+      fill.setAttribute('width', '0');
+      setTimeout(() => fill.setAttribute('width', String(targetW)), 500);
+    } else {
+      fill.setAttribute('width', String(targetW));
+    }
+    box.classList.toggle('ready', ready >= needed);
+    box.classList.toggle('charging', warming && ready < needed);
+    box.classList.toggle('error', error && ready === 0);
+    const label = $('sponsorBatteryLabel');
+    if (ready >= needed) label.textContent = 'dust sponsor ready';
+    else if (warming) label.textContent = needed > 1 ? `dust sponsor charging… (${ready}/${needed})` : 'dust sponsor charging…';
+    else if (error) label.textContent = 'dust sponsor offline';
+    else label.textContent = `dust sponsor ready (${ready}/${needed})`;
+    // At least one ready sponsor can carry runs (fewer in parallel, but real).
+    sponsorReady = ready >= 1;
+    updateStartButton();
+  }
+
+  async function pollSponsorBattery() {
+    if ($('viewLanding').hidden) return;
+    try {
+      const res = await api('GET', '/demoSponsorStatus()');
+      renderSponsorBattery(Array.isArray(res) ? res : res.value);
+    } catch { $('sponsorBattery').hidden = true; }
+  }
+
+  let batteryTimer = null;
+
   async function initLanding() {
     show('viewLanding');
+    void pollSponsorBattery();
+    if (!batteryTimer) batteryTimer = setInterval(pollSponsorBattery, 12000);
     try {
       const info = await api('GET', '/demoInfo()');
       if (!info.enabled) {
-        $('btnStart').disabled = true;
+        demoOpen = false;
+        updateStartButton();
         $('landingInfo').textContent = 'The demo is currently closed. Try again later.';
         return;
       }
@@ -61,8 +131,9 @@
         ? `${running} passport${running === 1 ? '' : 's'} being anchored now${waiting ? `, ${waiting} waiting` : ''}. `
         : '';
       $('landingInfo').textContent = `${busy}${info.dailyRemaining} demo passports left today.`;
+      demoOpen = info.dailyRemaining > 0;
+      updateStartButton();
       if (info.dailyRemaining <= 0) {
-        $('btnStart').disabled = true;
         $('landingInfo').textContent = 'Today’s on-chain budget is used up. Come back tomorrow.';
       }
     } catch {
@@ -96,9 +167,30 @@
 
   // ---------- form ----------
 
+  // Pre-fill the form with a plausible random battery so visitors can go
+  // straight to anchoring. Only fills the empty text fields (a returning
+  // visitor's own edits stay untouched); numbers are re-rolled each time.
+  const RAND_MODEL_A = ['Volt', 'Ion', 'Nova', 'Flux', 'Amp', 'Watt', 'Zap', 'Core', 'Polar', 'Titan'];
+  const RAND_MODEL_B = ['Cell', 'Pack', 'Drive', 'Grid', 'Store'];
+  const RAND_MODEL_C = ['EV-60', 'EV-75', 'EV-90', 'X-120', 'S-45', 'Max-80', 'Ultra-100', 'Go-55'];
+  const RAND_WERK = ['DemoWorks', 'NordCell', 'VoltFab', 'PowerHaus', 'CellSmith', 'ElectroWerk', 'GigaZelle', 'BatterieWerk', 'RheinVolt', 'HansaCell'];
+  const pick = (a) => a[Math.floor(Math.random() * a.length)];
+
+  function randomizeForm() {
+    if (!$('fModel').value) $('fModel').value = `${pick(RAND_MODEL_A)}${pick(RAND_MODEL_B)} ${pick(RAND_MODEL_C)}`;
+    if (!$('fManufacturer').value) $('fManufacturer').value = pick(RAND_WERK);
+    $('fWeight').value = String(250 + 10 * Math.floor(Math.random() * 40));
+    $('fPerf').value = pick(['A', 'B', 'B', 'C', 'C', 'D']);
+    const co2 = 2800 + 50 * Math.floor(Math.random() * 36);
+    $('fCo2').value = String(co2);
+    $('fThreshold').value = String(Math.ceil((co2 * 1.05) / 100) * 100);
+    syncClaimBounds(false);
+  }
+
   function enterForm() {
     $('idNight').textContent = store.get('night') || '';
     $('idShielded').textContent = store.get('shielded') || '';
+    randomizeForm();
     show('viewForm');
   }
 
@@ -177,6 +269,7 @@
   // One-line explanation per timeline step, shown under the label.
   const STEP_INFO = {
     sync: 'Creates your producer identity and connects it to Midnight. The passport is issued under it.',
+    registerPassport: 'The registrar locks your passport id to YOUR identity on-chain, before anything else happens. Nobody else can ever claim or re-bind this id.',
     attest: 'Writes a fingerprint (hash) of your passport data to the blockchain. The data itself stays off-chain.',
     bindPassport: 'Links your passport id (hashed with blake2b-256) to that fingerprint on-chain, so anyone can look the passport up later.',
     anchorContentRoot: 'Anchors a Merkle root over the passport fields. This is what single values can be proven against.',
@@ -200,10 +293,84 @@
     return `waiting for a free slot (${running || 'busy'}${ahead})`;
   }
 
+  // The three anchor circuits ride in ONE batched Midnight transaction
+  // (NIGHTGATE 0.10.x deterministic batch order). Rendered as one grouped
+  // timeline entry so the batching is visible, not just implied by three
+  // identical tx links.
+  const BATCH_KINDS = ['attest', 'bindPassport', 'anchorContentRoot'];
+
+  function groupStatus(subs) {
+    if (subs.some((s) => s.status === 'failed')) return 'failed';
+    if (subs.some((s) => s.status === 'running')) return 'running';
+    if (subs.every((s) => s.status === 'succeeded')) return 'succeeded';
+    if (subs.some((s) => s.status === 'succeeded')) return 'running';
+    return 'pending';
+  }
+
+  function renderBatchGroup(subs, st) {
+    const li = document.createElement('li');
+    const status = groupStatus(subs);
+    li.className = status + ' batch-group';
+    const dot = document.createElement('span'); dot.className = 'step-dot';
+    const main = document.createElement('span'); main.className = 'step-main';
+    const label = document.createElement('span'); label.className = 'step-label';
+    label.textContent = 'Anchor passport on-chain';
+    const badge = document.createElement('span'); badge.className = 'batch-badge';
+    badge.textContent = subs.length + ' circuits · 1 batched transaction';
+    const state = document.createElement('span'); state.className = 'step-state';
+    state.textContent = status === 'pending' && st && st.state === 'queued' ? waitingText(st) : status;
+    main.append(label, badge, state);
+    const info = document.createElement('div');
+    info.className = 'step-info';
+    info.textContent = 'All three anchor circuits are merged into a SINGLE Midnight transaction: the data fingerprint, your passport id binding and the provable-field root land together, atomically.';
+    main.append(info);
+
+    const sub = document.createElement('ul'); sub.className = 'batch-sub';
+    for (const s of subs) {
+      const item = document.createElement('li');
+      item.className = s.status;
+      const sdot = document.createElement('span'); sdot.className = 'step-dot sub-dot';
+      const slabel = document.createElement('span'); slabel.textContent = s.label || s.kind;
+      item.append(sdot, slabel);
+      sub.append(item);
+    }
+    main.append(sub);
+
+    // One shared tx link; per-substep links only if the server ever anchors
+    // in separate transactions (older plugin fallback).
+    const txs = [...new Set(subs.filter((s) => s.txHash).map((s) => s.txHash))];
+    if (txs.length === 1) {
+      const s = subs.find((x) => x.txHash);
+      const tx = document.createElement('div'); tx.className = 'step-tx';
+      const a = document.createElement('a');
+      a.href = s.explorerUrl || '#'; a.target = '_blank'; a.rel = 'noopener';
+      a.textContent = 'batched tx ' + s.txHash.slice(0, 20) + '…';
+      tx.append(a); main.append(tx);
+    } else if (txs.length > 1) {
+      for (const s of subs.filter((x) => x.txHash)) {
+        const tx = document.createElement('div'); tx.className = 'step-tx';
+        const a = document.createElement('a');
+        a.href = s.explorerUrl || '#'; a.target = '_blank'; a.rel = 'noopener';
+        a.textContent = (s.label || s.kind) + ': tx ' + s.txHash.slice(0, 20) + '…';
+        tx.append(a); main.append(tx);
+      }
+    }
+    li.append(dot, main);
+    return li;
+  }
+
   function renderSteps(steps, st) {
     const ol = $('timeline');
     ol.innerHTML = '';
+    let batchSubs = null;
     for (const s of steps) {
+      if (BATCH_KINDS.includes(s.kind)) {
+        if (!batchSubs) {
+          batchSubs = steps.filter((x) => BATCH_KINDS.includes(x.kind));
+          ol.append(renderBatchGroup(batchSubs, st));
+        }
+        continue; // rendered inside the group
+      }
       const li = document.createElement('li');
       li.className = s.status;
       const dot = document.createElement('span'); dot.className = 'step-dot';
@@ -277,14 +444,13 @@
     const pid = store.get('passportId') || '';
     $('donePassportId').textContent = pid;
     const links = [];
-    // Explorer link only when the run actually published there. The local
-    // '/explorer/' fallback is deliberately gone: on the deployed demo host
-    // the surface gate 404s it (only /demo is public), so the link would
-    // point at a dead route exactly when publish failed.
     const published = steps.some((s) => s.kind === 'publish' && s.status === 'succeeded');
     if (published) {
       links.push(`<a href="https://zkpassport.eu/p/${encodeURIComponent(pid)}" target="_blank" rel="noopener">View it on the public explorer (zkpassport.eu)</a>`);
     }
+    // This instance's own passport explorer (with auto-verify on open). The
+    // deployed demo host serves it too: PASSPORT_PUBLIC_SURFACE=demo,explorer.
+    links.push(`<a href="/explorer/#/p/${encodeURIComponent(pid)}" target="_blank" rel="noopener">View your passport in the explorer (with live on-chain verification)</a>`);
     const proof = steps.find((s) => s.kind === 'provePredicate' && s.txHash);
     if (proof) {
       links.push(`<a href="${proof.explorerUrl}" target="_blank" rel="noopener">View the proof predicate transaction on the Midnight explorer</a>`);

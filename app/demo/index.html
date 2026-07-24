@@ -12,7 +12,7 @@
   <meta property="og:site_name" content="zkpassport.eu" />
   <meta property="og:title" content="Anchor your own battery passport on Midnight" />
   <meta property="og:description"
-    content="No wallet, no tokens, no signup. Five minutes, zero-knowledge proof included. Live on Midnight preview." />
+    content="No wallet, no tokens, no signup. Five minutes, zero-knowledge proof included. Live on a Midnight testnet." />
   <meta property="og:url" content="https://demo.zkpassport.eu/demo/" />
   <meta property="og:image" content="https://demo.zkpassport.eu/demo/og-image.png" />
   <meta property="og:image:width" content="2400" />
@@ -20,7 +20,7 @@
   <meta name="twitter:card" content="summary_large_image" />
   <meta name="twitter:title" content="Anchor your own battery passport on Midnight" />
   <meta name="twitter:description"
-    content="No wallet, no tokens, no signup. Five minutes, zero-knowledge proof included. Live on Midnight preview." />
+    content="No wallet, no tokens, no signup. Five minutes, zero-knowledge proof included. Live on a Midnight testnet." />
   <meta name="twitter:image" content="https://demo.zkpassport.eu/demo/og-image.png" />
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='14' fill='%230e0f13'/%3E%3Ccircle cx='16' cy='16' r='7' fill='none' stroke='%237aa2ff' stroke-width='3'/%3E%3C/svg%3E" />
   <link rel="stylesheet" href="style.css" />
@@ -41,13 +41,32 @@
     <section id="viewLanding" class="view">
       <h1 class="hero-title">Create your own <em>battery passport</em><br />and anchor it on Midnight.</h1>
       <p class="hero-sub">
+        From February 2027 the EU Battery Regulation requires a digital
+        passport for every EV, industrial and light-transport battery sold in
+        Europe: public, verifiable data without exposing competitive secrets.
+        Exactly what you get to try here, live on a real Midnight testnet:
+      </p>
+      <div class="feature-row">
+        <span class="feature-pill"><span class="fdot"></span>dust-sponsored fees</span>
+        <span class="feature-pill"><span class="fdot"></span>on-chain ownership registration</span>
+        <span class="feature-pill"><span class="fdot"></span>batched circuit calls, one tx</span>
+        <span class="feature-pill"><span class="lock" aria-hidden="true"></span>zero-knowledge proof, value hidden</span>
+      </div>
+      <p class="hero-sub">
         In about five minutes you will create a small battery passport, anchor
         it on the Midnight blockchain and prove a confidential claim about it,
-        without revealing the number. <strong>No wallet extension, no tokens,
-          no signup.</strong>
+        without revealing the number.
       </p>
       <div class="cta-row">
-        <button id="btnStart" class="btn-primary">Start the demo</button>
+        <button id="btnStart" class="btn-primary" disabled>Start the demo</button>
+        <span id="sponsorBattery" class="sponsor-battery" hidden>
+          <svg class="batt" viewBox="0 0 36 18" aria-hidden="true">
+            <rect class="batt-body" x="1" y="1" width="30" height="16" rx="3"></rect>
+            <rect class="batt-cap" x="32" y="5" width="3.5" height="8" rx="1.5"></rect>
+            <rect id="battFill" class="batt-fill" x="3" y="3" width="0" height="12" rx="2"></rect>
+          </svg>
+          <span id="sponsorBatteryLabel" class="batt-label"></span>
+        </span>
         <span id="landingInfo" class="muted"></span>
       </div>
       <div class="fact-row">
@@ -56,12 +75,12 @@
           <div class="fact-v">custom fields per Passport</div>
         </div>
         <div class="fact">
-          <div class="fact-k">4</div>
-          <div class="fact-v">real transactions on Midnight Preview per Passport</div>
+          <div class="fact-k">5</div>
+          <div class="fact-v">on-chain operations per Passport, 3 of them batched into a single transaction</div>
         </div>
         <div class="fact">
           <div class="fact-k">1</div>
-          <div class="fact-v">confidential value, proven not revealed</div>
+          <div class="fact-v"><span class="lock" aria-hidden="true"></span>secret value (CO2 emissions): prove it stays under a threshold, without ever revealing the clear value</div>
         </div>
       </div>
     </section>
@@ -131,7 +150,7 @@
         <p class="muted small">Freshly generated for you. The bind step anchors the blake2b-256 hash of exactly
           this id on-chain, and the explorer will list your passport under it.</p>
       </div>
-      <p class="muted" id="runHint">This runs live on Midnight preview. Every step with a tx link is a real on-chain transaction.</p>
+      <p class="muted" id="runHint">This runs live on a Midnight testnet. Every tx link opens a real on-chain transaction; the whole anchor (fingerprint, passport binding, field root) rides in ONE batched transaction.</p>
       <ol id="timeline" class="timeline"></ol>
       <div id="runError" class="panel err-panel" hidden></div>
       <div class="cta-row">

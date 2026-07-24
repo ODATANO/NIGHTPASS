@@ -12,9 +12,9 @@
 [![Midnight](https://img.shields.io/badge/Midnight-preprod-2b2b6f)](https://midnight.network/)
 [![Catena-X](https://img.shields.io/badge/Catena--X-CX--0143-009f4d)](https://catena-x.net/)
 
-**Explorer: [zkpassport.eu](https://zkpassport.eu)** a public, block-explorer-style view where anyone can inspect the anchored passports, see the proven ZK claims (values stay hidden) and verify them live against Midnight, no account needed.
+**Explorer: [zkpassport.eu](https://zkpassport.eu)** a public, block-explorer-style view (Midnight preprod) where anyone can inspect the anchored passports, see the proven ZK claims (values stay hidden) and verify them live against Midnight, no account needed. Every passport finished on the demo below shows up here automatically.
 
-**Try it yourself: [demo.zkpassport.eu](https://demo.zkpassport.eu)** an interactive live demo. Create a battery passport, prove a confidential number with zero-knowledge, and watch it anchor on Midnight in about five minutes. No account, no wallet, no funds; every fee is sponsored, and the finished passport shows up in the explorer above.
+**Try it yourself: [demo.zkpassport.eu](https://demo.zkpassport.eu)** an interactive live demo on Midnight preprod. Create a battery passport, get its id registered to your (generated, forever-empty) wallet on-chain, watch the whole anchor land as ONE batched transaction, and prove a confidential number with zero-knowledge, all in about five minutes. No account, no wallet extension, no funds; every fee is sponsored, and the finished passport shows up in the demo's own [explorer](https://demo.zkpassport.eu/explorer/) with live on-chain verification.
 
 NIGHTPASS implements the EU Battery Passport. One dataset is exposed with a different view per audience (consumer, recycler, authority), and sensitive numbers (for example "recycled cobalt share is at least the legal minimum") can be **proven without revealing the value**. Only a payload hash and public metadata are anchored on-chain; everything else stays encrypted off-chain, and the disclosure tier is enforced in the API layer.
 
@@ -29,9 +29,23 @@ NIGHTPASS passes the official [BatteryPass-Ready](https://batterypass-ready.gefe
 - **One contract**, `attestation-vault` (shipped by the plugin): attest, passport binding, disclosure ACL, content-root anchoring, field-bound predicates.
 - **Two submit paths** to the same contract: server (NIGHTGATE worker wallet, async jobs) or wallet (the user's own Lace via DApp-Connector). Offline-first: without a session or contract, actions land as local log rows and everything still works.
 - **Zero-funding onboarding (fee sponsoring)**: set `PASSPORT_FEE_SPONSOR_WALLET=<walletId>` and that server wallet pays the dust fees for every other wallet's on-chain legs (anchoring, disclosure grants, predicate proofs) via NIGHTGATE 0.8.0 per-tx sponsoring; the acting wallet builds and signs, the sponsor balances only the fee and submits. A new producer needs neither NIGHT nor dust, ever. Live proof: [`BAT-SPOND-20260718162027`](https://zkpassport.eu/p/BAT-SPOND-20260718162027) runs on delegated dust GENERATION (mechanism A), and [`BAT-SPONF-20260718183121`](https://zkpassport.eu/p/BAT-SPONF-20260718183121) was anchored by a wallet that never held NIGHT or dust at all, every fee paid per-tx by the platform wallet (attest [`9b3bcc5a...2f2aa0f3`](https://preview.midnightexplorer.com/transactions/0x9b3bcc5a2ed1670bc4fbeda8c05ddc09e4bd36385e6cfcfbf4d7c4732f2aa0f3)).
+- **Single-transaction anchoring (batched circuit calls)**: with NIGHTGATE >= 0.10.0 the three anchor circuits (attest, bindPassport, anchorContentRoot) are merged into ONE Midnight transaction with deterministic apply order, dependencies included. Three round trips become one; the demo anchors a full passport in a single tx. Live proof: [`13f59684...7073d9f1`](https://preprod.midnightexplorer.com/transactions/0x13f59684936604bb6abb3fad1eaf7e4366fc2d26fd3eef5a4847d7687073d9f1) carries all three calls for `BAT-TRY-20260724160746-D4B4`.
+- **On-chain passport ownership (registrar)**: the 0.10.0 vault locks the deployer in as registrar, who can pre-assign a passportId to an attester identity BEFORE that wallet ever touches the chain (`deriveWalletInfo.attesterId` is derived offline). A registered id can only ever be bound or re-bound by its owner: no first-bind squatting, no re-bind hijacking. Live proof: [`6810c6bd...12de9150`](https://preprod.midnightexplorer.com/transactions/0x6810c6bda905eafed75055daefafbc390357be6ab26b2276c46aeb9c12de9150) registered the demo passport above to a visitor wallet that had never been on-chain.
 - **Catena-X**: the cockpit exports the CX-0143 battery-passport aspect JSON and a **Predicate Attestation Credential (PAC)**, carrying the proven predicates with `valueDisclosed: false`. That predicate capability is what Tractus-X currently lacks.
 
-### Live example (Midnight preview)
+### Live demo flow (Midnight preprod, 0.10.x)
+
+Every visitor run of [demo.zkpassport.eu](https://demo.zkpassport.eu) produces exactly three on-chain transactions. `BAT-TRY-20260724205823-7A26` ([zkpassport.eu](https://zkpassport.eu/p/BAT-TRY-20260724205823-7A26)) was anchored 2026-07-24 by an anonymous PUBLIC visitor flow: a zero-funded generated wallet, every fee sponsored, finished in 4.1 minutes and independently verified on the public explorer:
+
+| Step | Transaction |
+|---|---|
+| registerPassport (registrar assigns the id to the visitor's attester identity, before its first bind) | [`83cc57ae...b22b9b7b`](https://preprod.midnightexplorer.com/transactions/0x83cc57aea9e77a86245be38955c6881fb143c907b904141d992c93bbb22b9b7b) |
+| attest + bindPassport + anchorContentRoot, ONE batched transaction | [`9246872d...e74517f6`](https://preprod.midnightexplorer.com/transactions/0x9246872d5158a497ac72860bdddac5999be8a0ee10b5e6a3c043d65de74517f6) |
+| prove: carbon footprint <= 4000 kg CO2e (value hidden) | [`a30968d6...3ba0647e`](https://preprod.midnightexplorer.com/transactions/0xa30968d63339a92240fd818de2fa56562412d9477dacb242c84bd40a3ba0647e) |
+
+### Live example (Midnight preview, historical)
+
+The public explorer runs on preprod since 2026-07-24, so the preview-era passports below are no longer listed there; their on-chain anchors on the preview vault remain verifiable against the preview indexer.
 
 One passport, end to end: `BAT-FRESH-20260717125619`, created through the standard producer flow (all 65 guide attributes seeded automatically and included in the anchored payload hash), zero-error validated by the official BatteryPass-Ready test environment, then server-signed, anchored and predicate-proven on Midnight preview on 2026-07-17. `verifyOnChain` confirms the anchor live against the indexer. The proof transactions prove each claim against the passport's anchored content root; the value enters only as a private witness, and the ledger accepts the transaction only if the in-circuit asserts hold, so an included tx IS the verified proof.
 

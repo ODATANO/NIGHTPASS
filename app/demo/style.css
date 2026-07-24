@@ -194,3 +194,91 @@ label.confidential { position: relative; }
 @media (prefers-reduced-motion: reduce) {
   .timeline li.running .step-dot { animation: none; }
 }
+
+/* ---------- Batched-anchor group (0.10.x: 3 circuits, 1 transaction) ---------- */
+
+.batch-badge {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 1px 8px;
+  border: 1px solid var(--accent-2);
+  border-radius: 999px;
+  color: var(--accent);
+  font-size: 11px;
+  white-space: nowrap;
+  vertical-align: 1px;
+}
+.batch-sub {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 6px 0 2px 10px;
+  border-left: 2px solid var(--border);
+}
+.batch-sub li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--ink-2);
+  padding: 2px 0;
+}
+.batch-sub .sub-dot { width: 8px; height: 8px; flex: none; }
+.batch-sub li.succeeded { color: var(--ink); }
+.batch-sub li.succeeded .sub-dot { border-color: var(--good); background: var(--good); }
+.batch-sub li.running .sub-dot { border-color: var(--accent); }
+.batch-sub li.failed .sub-dot { border-color: var(--critical); background: var(--critical); }
+
+/* ---------- Sponsor battery gauge (landing, next to the start button) ---------- */
+
+.sponsor-battery {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.sponsor-battery .batt { width: 84px; height: 42px; }
+.batt-body { fill: none; stroke: var(--accent-2); stroke-width: 1.5; }
+.batt-cap  { fill: var(--accent-2); }
+.batt-fill { fill: var(--accent); transition: width 1.2s cubic-bezier(0.25, 0.8, 0.4, 1); }
+.sponsor-battery.ready .batt-fill { fill: var(--accent); }
+.sponsor-battery.ready .batt-body { stroke: var(--accent); }
+.sponsor-battery.error .batt-fill { fill: var(--critical); }
+.batt-label { font-size: 14px; color: var(--ink-2); white-space: nowrap; }
+.sponsor-battery.ready .batt-label { color: var(--accent); }
+
+/* Charging: the fill breathes while a sponsor is still syncing. */
+.sponsor-battery.charging .batt-fill {
+  animation: batt-charge 1.6s ease-in-out infinite;
+}
+@keyframes batt-charge {
+  0%, 100% { opacity: 0.35; }
+  50%      { opacity: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .sponsor-battery.charging .batt-fill { animation: none; opacity: 0.8; }
+}
+
+/* ---------- Hero feature pills (the 0.10.x stack, in timeline dot language) ---------- */
+
+.feature-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin: 4px 0 18px;
+}
+.feature-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  padding: 7px 15px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--panel);
+  color: var(--ink-2);
+  font-size: 14px;
+  white-space: nowrap;
+}
+.feature-pill .fdot {
+  width: 9px; height: 9px; border-radius: 50%;
+  background: var(--accent); flex: none;
+}
+.feature-pill .lock { margin-right: 0; flex: none; }

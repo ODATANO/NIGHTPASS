@@ -35,13 +35,18 @@ cds.on('bootstrap', (app: any) => {
     // (static app + anonymous GET read API + QR/resolver); cockpit, tiered
     // viewer, webhook and every write stay on the internal work instance.
     // Registered on bootstrap, so it runs before CAP's static/OData middlewares.
+    // Comma-separated combinations are allowed (e.g. 'demo,explorer' for the
+    // preprod demo host, whose done view links the passport explorer).
     const surface = process.env.PASSPORT_PUBLIC_SURFACE?.trim() || '';
-    if (surface === 'explorer') {
+    const surfaces = new Set(surface ? surface.split(',').map((s: string) => s.trim()).filter(Boolean) : []);
+    if (surfaces.has('explorer')) {
         app.use((req: any, res: any, next: any) => {
             const p = String(req.path || '');
             const allowed =
                 p === '/' ||
                 p.startsWith('/explorer') ||
+                p.startsWith('/demo') ||   // pass-through; the demo gate (if enabled) rules on it
+                p.startsWith('/api/v1/demo') ||
                 p.startsWith('/qr/') ||
                 p.startsWith('/p/') ||
                 p.startsWith('/resolve/') ||
@@ -55,30 +60,37 @@ cds.on('bootstrap', (app: any) => {
             if (!allowed) return res.status(404).json({ error: 'not on this surface' });
             next();
         });
-        app.get('/', (_req: any, res: any) => res.redirect(302, '/explorer/'));
     }
     // The "Try it" demo instance: only the demo app + its service surface.
     // Anchoring runs server-side through internal service calls, so none of
     // the cockpit/NIGHTGATE HTTP surfaces need to be public here.
-    if (surface === 'demo') {
+    if (surfaces.has('demo')) {
         app.use((req: any, res: any, next: any) => {
             const p = String(req.path || '');
             // Only the demo app + its service; the service surface is
             // additionally method-narrowed (actions/functions only need
-            // GET + POST, so PATCH/DELETE/PUT are cut at the gate).
+            // GET + POST, so PATCH/DELETE/PUT are cut at the gate). With the
+            // explorer surface ALSO enabled, its paths were already admitted
+            // by the explorer gate above and pass through here.
             const allowed =
                 p === '/' ||
                 p === '/demo' || p.startsWith('/demo/') ||
-                (p.startsWith('/api/v1/demo') && (req.method === 'GET' || req.method === 'POST'));
+                (p.startsWith('/api/v1/demo') && (req.method === 'GET' || req.method === 'POST')) ||
+                (surfaces.has('explorer') && !p.startsWith('/demo') && !p.startsWith('/api/v1/demo'));
             if (!allowed) return res.status(404).json({ error: 'not on this surface' });
             next();
         });
-        app.get('/', (_req: any, res: any) => res.redirect(302, '/demo/'));
+    }
+    if (surfaces.size) {
+        // Root redirect: the demo is the landing surface when enabled.
+        const home = surfaces.has('demo') ? '/demo/' : '/explorer/';
+        app.get('/', (_req: any, res: any) => res.redirect(302, home));
     }
     // FAIL CLOSED on unknown surface values: a typo'd PASSPORT_PUBLIC_SURFACE
     // on a public host must never silently expose the full internal surface.
-    if (surface && surface !== 'explorer' && surface !== 'demo') {
-        console.error(`[surface] UNKNOWN PASSPORT_PUBLIC_SURFACE='${surface}': denying ALL requests (use 'explorer' or 'demo')`);
+    const unknownSurfaces = [...surfaces].filter((s) => s !== 'explorer' && s !== 'demo');
+    if (unknownSurfaces.length) {
+        console.error(`[surface] UNKNOWN PASSPORT_PUBLIC_SURFACE tokens '${unknownSurfaces.join(',')}': denying ALL requests (use 'explorer', 'demo' or a comma list of them)`);
         app.use((_req: any, res: any) =>
             res.status(503).json({ error: `unknown public surface '${surface}'` }));
     }

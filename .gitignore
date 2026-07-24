@@ -42,7 +42,10 @@ coverage/
 
 # secrets / local env
 .env
+.env.backup-*
 secrets/
+# wallet sync-state dumps (zz-export-syncstates.mjs; as sensitive as the DB)
+syncstates.json
 
 # agent / editor local state
 .claude/

@@ -65,23 +65,50 @@ A second container (`nightpass-demo` + an internal `proof-server`) lets
 visitors anchor their OWN sponsored passport on `demo.<your-domain>`.
 Prepared but NOT part of the default stack. Rollout:
 
+Since 2026-07-24 the demo runs on PREPROD with the 0.10.x feature set:
+ownership pre-registration (registrar step), the whole anchor as ONE batched
+transaction, and the instance's own passport explorer
+(`PASSPORT_PUBLIC_SURFACE=demo,explorer`; the done view links
+`/explorer/#/p/<id>`). Publishing to zkpassport.eu (a preview instance) is
+off.
+
 1. **DNS**: A record for `demo.<your-domain>` (the wildcard already covers it
    on zkpassport.eu).
-2. **Sponsor wallet** (dev machine): `scripts/zz-demo-sponsor-setup.mjs`
-   creates + funds the dedicated sponsor (1000 tNIGHT from Main, dust
-   registered) and stores its secrets as `DEMO_SPONSOR_*` in
-   `secrets/producer-wallets.env`.
-3. **Config**: `cp deploy/.env.demo.example deploy/.env.demo`, fill it from
-   the `DEMO_SPONSOR_*` values; add `TRY_DOMAIN=demo.<your-domain>` to
-   `deploy/.env`; scp `.env.demo` to the server (gitignored).
+2. **Sponsor pool** (dev machine): `scripts/zz-demo-sponsors-preprod.mjs`
+   derives the PREPROD identities of the existing S1..S3 sponsor mnemonics,
+   funds each with 1000 tNIGHT from Main and dust-registers them (run against
+   a local preprod instance, e.g. `scripts/zz-demo-server-preprod.mjs`).
+3. **Config**: `cp deploy/.env.demo.example deploy/.env.demo` and fill it:
+   sponsor secrets from `DEMO_SPONSOR*_*`, the REGISTRAR pair (Main; the
+   viewing key MUST be the derived account-0 value, see the example's note),
+   fresh ENCRYPTION_KEY. Add `TRY_DOMAIN=demo.<your-domain>` to
+   `deploy/.env`; scp `.env.demo` to the server (gitignored, mode 600).
 4. **Caddy**: `cp Caddyfile.demo Caddyfile` on the server (adds the demo
    site), then `docker compose restart caddy`.
-5. **Start**: `docker compose --profile demo up -d --build`. First boot
-  deploys/evolves a fresh PostgreSQL schema in `passport-demo-pg-data` and prewarms the
-   sponsor (~1 min); check `https://demo.<your-domain>/api/v1/demo/demoInfo()`
-   shows `"enabled": true`.
-6. **Smoke**: run one visitor flow from a phone; the finished passport must
-   appear on the MAIN explorer (publish/ingest path) with its ZK claim.
+5. **Fresh DB on the preview -> preprod switch**: the old demo data (preview
+   testers/runs/wallet sync states) is dead weight on preprod. Stop the demo
+   container and drop its data volume once:
+   `docker compose --profile demo down nightpass-demo && docker volume rm deploy_passport-demo-pg-data`.
+   The next boot deploys a fresh schema (0.10.1 incl. `accountIndex`).
+6. **Start + seed the sponsor sync states**: a fresh server DB would cold-sync
+   every pool wallet for hours on preprod. Instead, carry the warm states over
+   from the dev machine (blobs are keyed to each wallet's viewing key, so they
+   restore as-is):
+   ```bash
+   node scripts/zz-export-syncstates.mjs                 # dev machine -> syncstates.json
+   scp syncstates.json root@<server>:/root/nightpass/
+   docker compose --profile demo up -d --build           # first boot creates the schema
+   docker compose --profile demo cp ../syncstates.json nightpass-demo:/tmp/
+   docker compose --profile demo exec nightpass-demo node scripts/zz-import-syncstates.mjs /tmp/syncstates.json
+   docker compose --profile demo restart nightpass-demo  # boot prewarm now restores warm
+   rm ../syncstates.json                                 # and delete the local copy too
+   ```
+   Then check `https://demo.<your-domain>/api/v1/demo/demoInfo()` shows
+   `"enabled": true` and the landing's battery gauge fills up as the pool
+   reports ready.
+7. **Smoke**: run one visitor flow from a phone. Expect the register step
+   with its own tx, ONE batched anchor tx, the proof tx, and a working
+   explorer link on the done view (auto-verify green on the detail page).
 
 Ops notes: the demo DB volume is disposable (visitor data only); caps are
 env-tunable in `.env.demo`; the sponsor wallet is intentionally small, and
