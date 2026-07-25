@@ -740,15 +740,20 @@ export default class DemoService extends cds.ApplicationService {
             UPDATE.entity(Runs).set(patch).where({ ID: runId }) as any);
     }
 
-    /** Kick every pool sponsor's session + sync at boot (non-blocking). */
+    /** Kick every pool sponsor's session + sync at boot (non-blocking). The
+     *  registrar wallet joins the round: it signs registerPassport for every
+     *  run, so a cold registrar stalls the first visitor for minutes. */
     private async prewarmSponsor(): Promise<void> {
-        const pool = feeSponsorWalletIds();
-        if (!this.enabled() || !pool.length) return;
+        if (!this.enabled()) return;
+        const wallets = new Set(feeSponsorWalletIds());
+        if (this.registerOwnershipEnabled())
+            wallets.add(process.env.PASSPORT_REGISTRAR_WALLET || 'default');
+        if (!wallets.size) return;
         const producer: any = await cds.connect.to('ProducerService');
-        for (const walletId of pool) {
+        for (const walletId of wallets) {
             await producer.tx({ user: this.techUser() }, (tx: any) =>
                 tx.send('prewarmServerWallet', { walletId }));
-            cds.log('demo').info(`fee sponsor '${walletId}' prewarm kicked at boot`);
+            cds.log('demo').info(`server wallet '${walletId}' prewarm kicked at boot`);
         }
     }
 
