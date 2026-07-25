@@ -8,7 +8,7 @@ For cockpit screenshots per step see the [producer walkthrough](producer-walkthr
 
 1. **Connect wallet** (no tx). The cockpit reads the shielded address from Lace; that address *is* the producer identity and scopes the passport list to the owner. No login, no central user store: holding the key is holding the identity.
 2. **Create passport** (no tx, deliberately). `createPassport` canonicalizes the Annex XIII payload, computes the blake2b-256 `payloadHash`, encrypts the payload with AES-256-GCM (HKDF key per passport), and stores an off-chain draft. Creating data is ERP territory; anchoring it is a separate, wallet-signed decision.
-3. **Attest** (transactions). One flow anchors three things on the `attestation-vault`: `attest` locks the `payloadHash` under the attester identity (from now on any change to the payload is detectable), `bindPassport` binds `passportId -> payloadHash` for QR resolution, and `anchorContentRoot` anchors a Merkle root over the provable fields, which every later field-bound proof binds to. Only after this does the cockpit enable Grant / Revoke / Prove / Share.
+3. **Attest** (one transaction). The anchor writes three things on the `attestation-vault`: `attest` locks the `payloadHash` under the attester identity (any later change to the payload is detectable), `bindPassport` binds `passportId -> payloadHash` for QR resolution, and `anchorContentRoot` anchors a Merkle root over the provable fields for later field-bound proofs. Since NIGHTGATE 0.10.0 all three circuit calls ride in ONE batched transaction with deterministic apply order. Only after this does the cockpit enable Grant / Revoke / Prove / Share.
 4. **Register partner** (no tx). Self-service registry mapping a Catena-X BPN to a `granteeId` (`Bytes<32>`), the partner's on-chain identity as a grant target.
 5. **Grant disclosure** (tx `grantDisclosure(payloadHash, grantee, level)`). Writes the entitlement on-chain: this partner may see this passport up to level 0 (consumer), 1 (recycler) or 2 (authority), mirroring the Annex XIII tiers. Entitlement is enforced on-chain and auditable; cleartext delivery stays in the API layer, which reads the grant and redacts accordingly (a public ledger cannot decrypt per role).
 6. **Prove** (tx `proveFieldPredicate`). The server supplies the field value plus its Merkle inclusion path against the anchored content root; the wallet generates the ZK proof locally and submits it. On-chain lands only "field X of this passport satisfies <= / >= threshold". The value itself never leaves the producer, and because the proof is bound to the anchored root, a made-up value cannot be substituted. A predicate that does not hold is rejected in-circuit: no transaction lands, and the cockpit records a failed proof.
@@ -25,12 +25,12 @@ Create and Register partner produce no transactions by design: data custody stay
 
 ## Reading a transaction in the explorer
 
-Every tx link in the cockpit (Transactions / Disclosure / Predicate tabs) opens the [Midnight explorer](https://preview.midnightexplorer.com/). Using an `attest` tx as the example, the page breaks down like this:
+Every tx link in the cockpit (Transactions / Disclosure / Predicate tabs) opens the [Midnight explorer](https://preprod.midnightexplorer.com/). Using an `attest` tx as the example, the page breaks down like this:
 
 | Explorer field | What it means here |
 |---|---|
 | Status / block / timestamp | The public, immutable proof of **when** the passport was anchored. |
-| Contract address | The `attestation-vault` the cockpit targets (`0x93f0c359…6109b1`). |
+| Contract address | The `attestation-vault` the cockpit targets (currently `da9b0bcf…0812` on preprod). |
 | Entry point (`attest`, `anchorContentRoot`, `grantDisclosure`, `proveFieldPredicate`, …) | Which circuit ran. Publicly auditable: anyone can see **that** an attestation / grant / proof happened on this contract. |
 | Outputs created/spent: 0 | No tokens moved. These are pure contract-state updates (a registry write), not payments. |
 | Serialized size (~8 KB for a "state-only" tx) | Mostly the zero-knowledge proof, generated locally in the wallet (the `prove -> balance -> submit` steps in the cockpit's wallet log). Nodes verify the proof, never the private inputs. |
@@ -38,19 +38,6 @@ Every tx link in the cockpit (Transactions / Disclosure / Predicate tabs) opens 
 | Ledger parameters / identifiers (hex) | The public circuit inputs, e.g. the payload hash. Recomputable by anyone who holds the passport data; opaque bytes to anyone who does not. |
 
 Just as important is what the page does **not** show. There is no sender address (the wallet is shielded, so the producer's identity is not publicly linked to the tx), no passport data (no carbon value, supplier, chemistry), and no cleartext call arguments (only commitments and hashes). Publicly verifiable are the *what* and *when*; the *who* and the *content* stay private. That separation is the point of anchoring on Midnight instead of a transparent chain.
-
-## Live verification (Preview)
-
-Full round-trip proven live on the Midnight Preview network via Lace, all transactions from a funded wallet:
-
-| Step | On-chain result |
-|---|---|
-| Deploy `attestation-vault` | contract [`0x93f0c359…6109b1`](https://preview.midnightexplorer.com/contracts/0x93f0c359aaaaedcf213f0945003e985f0045c12b8c46cba6d620ec6f9f6109b1) · tx [`0x577b94c2…f02b2e`](https://preview.midnightexplorer.com/transactions/0x577b94c221f3ecc00014be56c5bc298871a88d80fa3a0419faf467c76ef02b2e) (block 1425388) |
-| `attest` | tx [`0x4775a800…f9bdd`](https://preview.midnightexplorer.com/transactions/0x4775a800ab048228e3b9b44a6f94b292a38b5067048f20d84eb305c9b51f9bdd) (block 1425593) |
-| `anchorContentRoot` | tx [`0x8cea99f5…b6591`](https://preview.midnightexplorer.com/transactions/0x8cea99f5611de5b8dd65848c840772278c2a104a089cb48eae2e084aa11b6591) (block 1425602) |
-| `proveFieldPredicate` (carbon <= threshold) | tx [`0x7e405996…6b2278`](https://preview.midnightexplorer.com/transactions/0x7e4059961cb78b0c4aab8aacb8b047789f79d8ec112117a422e8da21346b2278) (block 1425633) |
-
-Runtime notes: the network follows the wallet (Lace `getConfiguration()` supplies the indexer and network id; `NETWORK` in `connector.mjs` is `preview`). Prove runs against a local proof server at `http://localhost:6300` because the hosted one omits the CORS header on the POST response. `submitTx` returns the transaction identifier (not the serialized tx), derived via `ledger.Transaction.deserialize(...).identifiers()[0]`.
 
 ## Glossary
 

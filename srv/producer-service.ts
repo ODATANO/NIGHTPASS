@@ -124,11 +124,19 @@ export default class ProducerService extends cds.ApplicationService {
         const { mnemonic, viewingKey } = secrets;
         try {
             const nightgate = await cds.connect.to('NightgateService');
-            const conn: any = await nightgate.send('connectWallet', { viewingKey });
+            // DETACHED sends: since NIGHTGATE 0.10.2 connectWalletForSigning
+            // reads the session row on its own autocommit connection. If
+            // connectWallet's INSERT still sits in this request's open tx,
+            // that read cannot see it (404 Session not found). Detaching
+            // commits the session row before the signing call looks it up.
+            // The user must ride along explicitly (sessions are userId-bound
+            // and the detached scope drops the ambient context).
+            const user = (cds.context as any)?.user;
+            const conn: any = await sendDetached(nightgate, 'connectWallet', { viewingKey }, user);
             const sessionId = String(conn.sessionId);
-            const signing: any = await nightgate.send('connectWalletForSigning', {
+            const signing: any = await sendDetached(nightgate, 'connectWalletForSigning', {
                 sessionId, mnemonic
-            });
+            }, user);
             // Remember the prewarm job: the detached anchor runner must await it
             // before its first submission (the facade does not exist until then).
             if (signing?.prewarmJobId) this.serverPrewarmJobs.set(sessionId, String(signing.prewarmJobId));
@@ -261,8 +269,16 @@ export default class ProducerService extends cds.ApplicationService {
                     const job: any = await sendDetached(nightgate, 'getJobStatus', { jobId, sessionId }, req.user);
                     if (job?.status === 'succeeded') state = 'ready';
                     else if (job?.status === 'failed') {
-                        state = 'error';
-                        error = `${job.errorCode ?? ''} ${job.errorMessage ?? ''}`.trim() || 'prewarm failed';
+                        const failMsg = `${job.errorCode ?? ''} ${job.errorMessage ?? ''}`.trim() || 'prewarm failed';
+                        if (/SUPERSEDED/i.test(failMsg)) {
+                            // 0.10.2: a fresh prewarm superseded this one; the
+                            // successor carries the sync, so keep 'warming'.
+                            state = 'warming';
+                            this.serverPrewarmJobs.delete(sessionId);
+                        } else {
+                            state = 'error';
+                            error = failMsg;
+                        }
                     } else if (job?.status === 'reconciliation_required') {
                         state = 'error';
                         error = `${job.errorCode ?? ''} ${job.errorMessage ?? ''}`.trim() || 'prewarm requires reconciliation';
@@ -312,39 +328,12 @@ export default class ProducerService extends cds.ApplicationService {
                 out.push(cold(secrets.id, label, warmth?.state === 'error' ? 'error' : 'cold', warmth?.error ?? ''));
                 continue;
             }
-            // Resolve warmth via the prewarm JOB (a cheap job-row read that
-            // returns immediately), NEVER via a facade call: getWalletBalance
-            // on a still-syncing facade blocks for minutes inside NIGHTGATE's
-            // request transaction, and one leaked pg connection per status
-            // poll starved the pool live (2026-07-24, battery gauge).
-            let state: 'warming' | 'ready' = 'ready';
-            const prewarmJobId = this.serverPrewarmJobs.get(sessionId);
-            if (prewarmJobId) {
-                try {
-                    const job: any = await sendDetached(nightgate, 'getJobStatus', { jobId: prewarmJobId, sessionId }, req.user);
-                    if (job?.status === 'succeeded') {
-                        this.serverPrewarmJobs.delete(sessionId);
-                        this.walletWarmth.set(secrets.id, { state: 'ready', startedAt: Date.now() });
-                    } else if (job?.status === 'failed') {
-                        const msg = `${job.errorCode ?? ''} ${job.errorMessage ?? ''}`.trim() || 'prewarm failed';
-                        this.walletWarmth.set(secrets.id, { state: 'error', startedAt: Date.now(), error: msg });
-                        out.push(cold(secrets.id, label, 'error', msg));
-                        continue;
-                    } else {
-                        state = 'warming';
-                    }
-                } catch {
-                    state = 'warming';
-                }
-            }
-            if (state !== 'ready') { out.push(cold(secrets.id, label, 'warming')); continue; }
             try {
-                // Belt and braces: the facade is provably at the tip here, so
-                // this returns fast; the bound only guards regressions.
-                const b: any = await Promise.race([
-                    sendDetached(nightgate, 'getWalletBalance', { sessionId }, req.user),
-                    new Promise((_, rej) => setTimeout(() => rej(new Error('WARMING_TIMEOUT')), 8000))
-                ]);
+                // NIGHTGATE >= 0.10.2: this read holds no request tx server-side
+                // and is bounded (NIGHTGATE_WALLET_READ_SYNC_TIMEOUT_MS, default
+                // 10s) - a still-syncing facade answers 503 WALLET_SYNCING
+                // instead of blocking, so this poll is always cheap.
+                const b: any = await sendDetached(nightgate, 'getWalletBalance', { sessionId }, req.user);
                 const registered = Number(b?.registeredNightUtxoCount ?? 0);
                 const dustPresent = Number(b?.dustBalance ?? 0) > 0;
                 // A successful balance read means the facade is live and serving
@@ -362,7 +351,9 @@ export default class ProducerService extends cds.ApplicationService {
                 });
             } catch (e: any) {
                 const msg = String(e?.message ?? e ?? 'balance read failed');
-                if (msg === 'WARMING_TIMEOUT') {
+                // 503 WALLET_SYNCING = retryable per the 0.10.2 contract; a
+                // SUPERSEDED prewarm just means a fresh one took over.
+                if (/WALLET_SYNCING|SUPERSEDED/i.test(msg)) {
                     out.push(cold(secrets.id, label, 'warming', ''));
                 } else {
                     out.push(cold(secrets.id, label, 'error', msg));

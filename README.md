@@ -2,73 +2,51 @@
 
 ![alt text](/docs/readme_header.png)
 
-**EU Battery Regulation 2023/1542 Digital Battery Passport with three disclosure tiers, backed by zero-knowledge attestations on Midnight.**
-
 [![Tests](https://github.com/ODATANO/NIGHTPASS/actions/workflows/test.yaml/badge.svg)](https://github.com/ODATANO/NIGHTPASS/actions/workflows/test.yaml)
 [![codecov](https://codecov.io/gh/ODATANO/NIGHTPASS/branch/main/graph/badge.svg)](https://codecov.io/gh/ODATANO/NIGHTPASS)
 [![@odatano/nightgate](https://img.shields.io/npm/v/@odatano/nightgate?logo=npm&label=%40odatano%2Fnightgate)](https://www.npmjs.com/package/@odatano/nightgate)
 [![SAP CAP](https://img.shields.io/badge/SAP%20CAP-%40sap%2Fcds%20%5E10-0faaff?logo=sap)](https://cap.cloud.sap/)
-[![Midnight](https://img.shields.io/badge/Midnight-preview-2b2b6f)](https://midnight.network/)
 [![Midnight](https://img.shields.io/badge/Midnight-preprod-2b2b6f)](https://midnight.network/)
-[![Catena-X](https://img.shields.io/badge/Catena--X-CX--0143-009f4d)](https://catena-x.net/)
+
+**EU Battery Regulation 2023/1542 Digital Battery Passport with three disclosure tiers, backed by zero-knowledge attestations on Midnight.**
+NIGHTPASS implements the EU Battery Passport. One dataset is exposed with a different view per audience (consumer, recycler, authority), and sensitive numbers (for example "recycled cobalt share is at least the legal minimum") can be **proven without revealing the value**. Only a payload hash and public metadata are anchored on-chain; everything else stays encrypted off-chain, and the disclosure tier is enforced in the API layer.
+
+## How it works
+
+- **Disclosure tiers** (Annex XIII): one dataset, three server-enforced views (consumer / recycler / authority); an on-chain disclosure grant elevates a partner's tier per passport.
+- **Field-bound ZK predicates**: prove `carbon footprint <= threshold` without revealing the value, bound to the passport's anchored Merkle root, so the proven value comes from *this* passport.
+- **One contract**, `attestation-vault` (shipped by the plugin): attest, passport binding, ownership registry, disclosure ACL, content root, predicates.
+- **Two submit paths**: server-signed (async NIGHTGATE jobs) or the user's own Lace wallet; offline-first fallback without either.
+- **Fee sponsoring**: the `PASSPORT_FEE_SPONSOR_WALLET` pool pays every other wallet's dust fees; a new producer needs neither NIGHT nor dust. Every demo visitor runs on a zero-funded wallet.
+- **Single-transaction anchoring**: attest + bindPassport + anchorContentRoot ride in ONE batched transaction with deterministic apply order (NIGHTGATE >= 0.10.0), see the demo flow below.
+- **On-chain passport ownership**: the registrar pre-assigns a passportId to an offline-derived attester identity before its first bind; registered ids cannot be squatted or hijacked, see the demo flow below.
+- **Catena-X**: exports the CX-0143 aspect JSON plus a **Predicate Attestation Credential (PAC)** with `valueDisclosed: false`, the predicate capability Tractus-X currently lacks.
+
+## Public demo and explorer (Midnight preprod)
+
+**Try it yourself: [demo.zkpassport.eu](https://demo.zkpassport.eu)** an interactive live demo on Midnight preprod. Create a simple battery passport, get its id registered to your (generated, forever-empty) wallet on-chain, watch the whole anchor land as ONE batched transaction, and prove a confidential number with zero-knowledge, all in about five minutes.
 
 **Explorer: [zkpassport.eu](https://zkpassport.eu)** a public, block-explorer-style view (Midnight preprod) where anyone can inspect the anchored passports, see the proven ZK claims (values stay hidden) and verify them live against Midnight, no account needed. Every passport finished on the demo below shows up here automatically.
 
-**Try it yourself: [demo.zkpassport.eu](https://demo.zkpassport.eu)** an interactive live demo on Midnight preprod. Create a battery passport, get its id registered to your (generated, forever-empty) wallet on-chain, watch the whole anchor land as ONE batched transaction, and prove a confidential number with zero-knowledge, all in about five minutes. No account, no wallet extension, no funds; every fee is sponsored, and the finished passport shows up in the demo's own [explorer](https://demo.zkpassport.eu/explorer/) with live on-chain verification.
+## Example live demo flow
 
-NIGHTPASS implements the EU Battery Passport. One dataset is exposed with a different view per audience (consumer, recycler, authority), and sensitive numbers (for example "recycled cobalt share is at least the legal minimum") can be **proven without revealing the value**. Only a payload hash and public metadata are anchored on-chain; everything else stays encrypted off-chain, and the disclosure tier is enforced in the API layer.
-
-It consumes [`@odatano/nightgate`](https://github.com/ODATANO/NIGHTGATE) as a CAP plugin, which provides the contract, the ZK proof library, and the Nightgate worker for async on-chain submission.
-
-NIGHTPASS passes the official [BatteryPass-Ready](https://batterypass-ready.gefeg.com/) test environment (GEFEG / Fraunhofer IPK, DIN DKE SPEC 99100): zero-error data validation and all 11 interoperability scenarios of the DPP Life Cycle API, including the access-rights checks, verified 2026-07-17. On top of the standard API, a NIGHTPASS extension (`GET /dpp-api/v1/dpps/{id}/verification`) lets any caller verify a served passport live against its Midnight anchor.
-
-## How it works, in short
-
-- **Disclosure tiers** (Annex XIII): consumer sees public metadata, recycler additionally chemistry / capacity / recycled shares, authority everything including supplier identities. Enforced server-side by `after READ` handlers; an active on-chain disclosure grant elevates a partner's tier per passport.
-- **Field-bound ZK predicates**: claims like `carbon footprint <= threshold` are proven on-chain without revealing the value, bound to a Merkle root over the passport's fields anchored at attest time, so the proven value provably comes from *this* passport.
-- **One contract**, `attestation-vault` (shipped by the plugin): attest, passport binding, disclosure ACL, content-root anchoring, field-bound predicates.
-- **Two submit paths** to the same contract: server (NIGHTGATE worker wallet, async jobs) or wallet (the user's own Lace via DApp-Connector). Offline-first: without a session or contract, actions land as local log rows and everything still works.
-- **Zero-funding onboarding (fee sponsoring)**: set `PASSPORT_FEE_SPONSOR_WALLET=<walletId>` and that server wallet pays the dust fees for every other wallet's on-chain legs (anchoring, disclosure grants, predicate proofs) via NIGHTGATE 0.8.0 per-tx sponsoring; the acting wallet builds and signs, the sponsor balances only the fee and submits. A new producer needs neither NIGHT nor dust, ever. Live proof: [`BAT-SPOND-20260718162027`](https://zkpassport.eu/p/BAT-SPOND-20260718162027) runs on delegated dust GENERATION (mechanism A), and [`BAT-SPONF-20260718183121`](https://zkpassport.eu/p/BAT-SPONF-20260718183121) was anchored by a wallet that never held NIGHT or dust at all, every fee paid per-tx by the platform wallet (attest [`9b3bcc5a...2f2aa0f3`](https://preview.midnightexplorer.com/transactions/0x9b3bcc5a2ed1670bc4fbeda8c05ddc09e4bd36385e6cfcfbf4d7c4732f2aa0f3)).
-- **Single-transaction anchoring (batched circuit calls)**: with NIGHTGATE >= 0.10.0 the three anchor circuits (attest, bindPassport, anchorContentRoot) are merged into ONE Midnight transaction with deterministic apply order, dependencies included. Three round trips become one; the demo anchors a full passport in a single tx. Live proof: [`13f59684...7073d9f1`](https://preprod.midnightexplorer.com/transactions/0x13f59684936604bb6abb3fad1eaf7e4366fc2d26fd3eef5a4847d7687073d9f1) carries all three calls for `BAT-TRY-20260724160746-D4B4`.
-- **On-chain passport ownership (registrar)**: the 0.10.0 vault locks the deployer in as registrar, who can pre-assign a passportId to an attester identity BEFORE that wallet ever touches the chain (`deriveWalletInfo.attesterId` is derived offline). A registered id can only ever be bound or re-bound by its owner: no first-bind squatting, no re-bind hijacking. Live proof: [`6810c6bd...12de9150`](https://preprod.midnightexplorer.com/transactions/0x6810c6bda905eafed75055daefafbc390357be6ab26b2276c46aeb9c12de9150) registered the demo passport above to a visitor wallet that had never been on-chain.
-- **Catena-X**: the cockpit exports the CX-0143 battery-passport aspect JSON and a **Predicate Attestation Credential (PAC)**, carrying the proven predicates with `valueDisclosed: false`. That predicate capability is what Tractus-X currently lacks.
-
-### Live demo flow (Midnight preprod, 0.10.x)
-
-Every visitor run of [demo.zkpassport.eu](https://demo.zkpassport.eu) produces exactly three on-chain transactions. `BAT-TRY-20260724205823-7A26` ([zkpassport.eu](https://zkpassport.eu/p/BAT-TRY-20260724205823-7A26)) was anchored 2026-07-24 by an anonymous PUBLIC visitor flow: a zero-funded generated wallet, every fee sponsored, finished in 4.1 minutes and independently verified on the public explorer:
+Every Demo run produces exactly three on-chain transactions. [BAT-TRY-20260724205823-7A26](https://zkpassport.eu/p/BAT-TRY-20260724205823-7A26) was anchored 2026-07-24 by an anonymous PUBLIC visitor flow: a zero-funded generated wallet, every fee sponsored, finished in 4.1 minutes and independently verified on the public explorer:
 
 | Step | Transaction |
 |---|---|
-| registerPassport (registrar assigns the id to the visitor's attester identity, before its first bind) | [`83cc57ae...b22b9b7b`](https://preprod.midnightexplorer.com/transactions/0x83cc57aea9e77a86245be38955c6881fb143c907b904141d992c93bbb22b9b7b) |
+| registerPassport (registrar assigns the id to the visitor's attester identity) | [`83cc57ae...b22b9b7b`](https://preprod.midnightexplorer.com/transactions/0x83cc57aea9e77a86245be38955c6881fb143c907b904141d992c93bbb22b9b7b) |
 | attest + bindPassport + anchorContentRoot, ONE batched transaction | [`9246872d...e74517f6`](https://preprod.midnightexplorer.com/transactions/0x9246872d5158a497ac72860bdddac5999be8a0ee10b5e6a3c043d65de74517f6) |
 | prove: carbon footprint <= 4000 kg CO2e (value hidden) | [`a30968d6...3ba0647e`](https://preprod.midnightexplorer.com/transactions/0xa30968d63339a92240fd818de2fa56562412d9477dacb242c84bd40a3ba0647e) |
-
-### Live example (Midnight preview, historical)
-
-The public explorer runs on preprod since 2026-07-24, so the preview-era passports below are no longer listed there; their on-chain anchors on the preview vault remain verifiable against the preview indexer.
-
-One passport, end to end: `BAT-FRESH-20260717125619`, created through the standard producer flow (all 65 guide attributes seeded automatically and included in the anchored payload hash), zero-error validated by the official BatteryPass-Ready test environment, then server-signed, anchored and predicate-proven on Midnight preview on 2026-07-17. `verifyOnChain` confirms the anchor live against the indexer. The proof transactions prove each claim against the passport's anchored content root; the value enters only as a private witness, and the ledger accepts the transaction only if the in-circuit asserts hold, so an included tx IS the verified proof.
-
-| Step | Transaction |
-|---|---|
-| attest (payload hash into the vault) | [`6071a396...248673b8`](https://preview.midnightexplorer.com/transactions/0x6071a39608d172d3a7a3b34593263992e7621f7d9e7250e533d1f1fd248673b8) |
-| bindPassport (passport id -> payload hash) | [`374c61d9...e0df2cb4`](https://preview.midnightexplorer.com/transactions/0x374c61d9777a67f2e1e8d9a05a39ef394989e6671c4cc8a64fc35d23e0df2cb4) |
-| anchorContentRoot (Merkle root over provable fields) | [`f7f10047...6512a0aa`](https://preview.midnightexplorer.com/transactions/0xf7f10047e248b726ec7c22b36efe4086fe7ccece068978fd72f8132a6512a0aa) |
-| prove: carbon footprint <= 4000 kg CO2e (value hidden) | [`771e6b7f...171581e2`](https://preview.midnightexplorer.com/transactions/0x771e6b7fdcacc8638f9aefa27b8d919ed80793a4a4f7156466d353f7171581e2) |
-| prove: recycled cobalt share >= 16 % (value hidden) | [`f632a4fc...9bdda074`](https://preview.midnightexplorer.com/transactions/0xf632a4fc6e336c576924ff618fab00d95aa6d154601d1149dde9af9e9bdda074) |
-| prove: usable capacity >= 70 kWh (value hidden) | [`33cffbeb...41dfa669`](https://preview.midnightexplorer.com/transactions/0x33cffbeb5ebfdc97fcaf4d26e6693db3399a9991e45e26cf216248c441dfa669) |
-
-Vault contract: `f7c755235cc9408bc6664f7cae88b445798726ccdf9a6a560e7c873c807aabe1`.
 
 ## Documentation
 
 | Doc | Contents |
 |---|---|
-| [docs/producer-flow.md](docs/producer-flow.md) | Step-by-step lifecycle: which steps produce transactions and why, how to read them in the explorer, live Preview transactions, glossary |
+| [docs/producer-flow.md](docs/producer-flow.md) | Step-by-step lifecycle: which steps produce transactions and why, how to read them in the explorer, live transactions, glossary |
 | [docs/producer-walkthrough.md](docs/producer-walkthrough.md) | Producer cockpit with screenshots, tab by tab |
 | [docs/architecture.md](docs/architecture.md) | Layers, data flow, security model, field-bound proof construction, plugin build & deploy |
 
-## Quick start
+## Quick start full local dev environment
 
 Requires Node.js >= 22
 
@@ -80,25 +58,6 @@ npm start              # cds-tsx serve  ->  http://localhost:4004
 ```
 
 Open http://localhost:4004/ for the launchpad.
-
-NIGHTPASS owns the host-wide HTTP security policy in `srv/http-security.ts`;
-NIGHTGATE does not modify unrelated host routes. Cross-origin access is closed
-by default. Set `PASSPORT_CORS_ORIGINS` to a comma-separated allow-list when a
-separately hosted wallet or frontend must read `/contract-manifest` or
-`/zk-config/...`; set `PASSPORT_CORS_API=true` only when the OData APIs must
-also be cross-origin.
-
-The current NIGHTGATE runtime is deliberately single-instance and
-single-tenant. NIGHTPASS declares `runtimeMode: "single-instance"` and
-`replicaCount: 1`; deployments set `NIGHTGATE_REPLICA_COUNT=1`. Starting with
-a declared higher count or CAP multitenancy fails closed before the wallet
-worker or crawler starts.
-
-Local development and tests use SQLite. The CAP `production` profile selects
-PostgreSQL through `@cap-js/postgres`; credentials are supplied only by the
-deployment environment. Production startup fails closed if SQLite is still
-effective. The supplied Compose stack includes PostgreSQL 16 with a persistent
-volume and health check.
 
 ### Apps and services on :4004
 

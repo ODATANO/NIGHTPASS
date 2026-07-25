@@ -136,7 +136,7 @@ services:
     command: ["midnight-proof-server", "--port", "6300"]
 ```
 
-Only testnet (preview) funds belong on that wallet. Treat the host as
+Only testnet funds belong on that wallet. Treat the host as
 compromised by default and fund it accordingly.
 
 ## Build and run
@@ -209,7 +209,7 @@ the printed URL as `PASSPORT_DEMO_HOST`.
 - [ ] PostgreSQL contains no copied `midnight_WalletSyncStates` /
       `midnight_WalletSessions` rows from live development runs.
 - [ ] `pg_dump` backup and restore have been tested outside the live volume.
-- [ ] Page labels the demo as Midnight testnet (preview); a network reset
+- [ ] Page labels the demo as a Midnight testnet; a network reset
       requires re-anchoring.
 - [ ] `PASSPORT_CORS_ORIGINS` is unset unless a specific external wallet or
       frontend requires connector access; never use `*` on the write-capable

@@ -40,10 +40,13 @@ Two write surfaces, one contract, one read surface.
 **Write (producer):** the producer cockpit (`app/producer/webapp`, `ProducerService`)
 creates a passport from Annex XIII fields, computes the `blake2b-256` payload hash,
 AES-encrypts the payload off-chain, and anchors it on-chain. Anchoring runs three
-circuits: `attest` (locks the payload hash under the attester identity),
+circuits, batched into ONE transaction with deterministic apply order since
+NIGHTGATE 0.10.0: `attest` (locks the payload hash under the attester identity),
 `bindPassport` (binds `passportId -> payloadHash` for QR resolution), and
-`anchorContentRoot` (pins the Merkle root over the provable fields). Disclosure
-grants and predicate proofs are further circuit calls.
+`anchorContentRoot` (pins the Merkle root over the provable fields). A registrar
+(the vault deployer) can pre-register a `passportId` to an attester identity, so
+a registered id can only ever be bound by its owner. Disclosure grants and
+predicate proofs are further circuit calls.
 
 **Two ways to submit,** same contract, differ only in who holds the key:
 
@@ -148,7 +151,7 @@ points at the artifact shipped inside the installed plugin:
   "cds": { "requires": {
     "db": { "kind": "sqlite" },
     "nightgate": {
-      "network": "preview",
+      "network": "preprod",
       "granteeBinding": "did",
       "crawler": { "enabled": false },
       "contracts": {
@@ -190,4 +193,4 @@ offline path (hash, encrypt, persist, QR, local log rows) still runs.
 - Contract: one `attestation-vault` (plugin-shipped): tiered disclosure, passport binding, numeric predicate, and field-bound predicate.
 - Crypto: blake2b-256 integrity hash, AES-256-GCM + HKDF-SHA256 payload encryption, persistentHash Merkle content root, ZK-proof authorization.
 - UI: producer cockpit (with in-app Lace wallet flow), consumer viewer (three tiers), QR resolver at `/p/:passportId`.
-- Chain: Midnight Preview: public metadata, hash, binding, content root, disclosure and predicate results only.
+- Chain: Midnight (preprod): public metadata, hash, binding, content root, disclosure and predicate results only.

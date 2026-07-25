@@ -150,14 +150,10 @@ label.confidential { position: relative; }
   border-radius: 999px; font-size: 11px; letter-spacing: .04em;
 }
 .lock {
-  display: inline-block; width: 11px; height: 9px; margin-right: 6px;
-  border: 1.5px solid var(--warning); border-radius: 2px; position: relative; top: 1px;
+  display: inline-block; width: 13px; height: 15px; margin-right: 6px;
+  vertical-align: -2px; flex: none;
 }
-.lock::before {
-  content: ""; position: absolute; left: 1.5px; top: -6px;
-  width: 5px; height: 5px; border: 1.5px solid var(--warning);
-  border-bottom: 0; border-radius: 4px 4px 0 0;
-}
+.lock path, .lock rect { stroke: var(--warning); stroke-width: 1.6; stroke-linecap: round; }
 
 /* ---------- Timeline ---------- */
 

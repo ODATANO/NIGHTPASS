@@ -19,9 +19,9 @@ From the main list, Connect wallet (this scopes the list to your own passports),
 
 ## Overview
 
-The passport header, the on-chain contract and attestation transaction (linked to the Preview Explorer once anchored), and the battery cells. The top bar carries the mode toggle and the Attest / Grant / Revoke / Prove actions.
+The passport header, the on-chain contract and attestation transaction (linked to the Midnight explorer once anchored), and the battery cells. The top bar carries the mode toggle and the Attest / Grant / Revoke / Prove actions.
 
-Attest anchors three transactions in one flow: `attest` (locks the payload hash under the attester identity), `bindPassport` (binds `passportId` to `payloadHash` for QR resolution), and `anchorContentRoot` (the Merkle root over the provable fields, which later field-bound proofs bind to).
+Attest anchors three circuit calls in ONE batched transaction (NIGHTGATE >= 0.10.0): `attest` (locks the payload hash under the attester identity), `bindPassport` (binds `passportId` to `payloadHash` for QR resolution), and `anchorContentRoot` (the Merkle root over the provable fields, which later field-bound proofs bind to).
 
 ![Overview](overview.png)
 
@@ -39,7 +39,7 @@ Prove a field value against a threshold without revealing it. Pick a source fiel
 
 ## Transactions
 
-Every submitted step for this passport (attest, grant, prove, and so on) with its status and a link to the transaction on the Preview Explorer, newest first.
+Every submitted step for this passport (attest, grant, prove, and so on) with its status and a link to the transaction on the Midnight explorer, newest first.
 
 ![Transactions](transactions.png)
 
