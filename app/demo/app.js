@@ -12,11 +12,12 @@
     del: (k) => { try { localStorage.removeItem('nightpass-demo-' + k); } catch { /* ignore */ } }
   };
 
-  async function api(method, path, body) {
+  async function api(method, path, body, opts) {
     const res = await fetch(API + path, {
       method,
       headers: body === undefined ? {} : { 'Content-Type': 'application/json' },
-      body: body === undefined ? undefined : JSON.stringify(body)
+      body: body === undefined ? undefined : JSON.stringify(body),
+      signal: opts && opts.signal
     });
     const text = await res.text();
     let json; try { json = JSON.parse(text); } catch { json = {}; }
@@ -103,12 +104,38 @@
     updateStartButton();
   }
 
+  // During the boot catch-up the wallet worker is fully busy syncing and the
+  // status read times out. That is CHARGING, not offline: keep the battery in
+  // its charging state instead of hiding it or claiming the sponsor is dead.
+  function renderSponsorBatteryIndeterminate() {
+    const box = $('sponsorBattery');
+    box.hidden = false;
+    box.classList.remove('ready', 'error');
+    box.classList.add('charging');
+    const fill = $('battFill');
+    if (!renderSponsorBattery.animated) {
+      renderSponsorBattery.animated = true;
+      fill.setAttribute('width', '0');
+    }
+    const cur = Number(fill.getAttribute('width') || 0);
+    const min = Math.round(BATT_MAX_W * 0.18);
+    setTimeout(() => fill.setAttribute('width', String(Math.max(cur, min))), cur ? 0 : 500);
+    $('sponsorBatteryLabel').textContent = 'dust sponsor charging…';
+    sponsorReady = false;
+    updateStartButton();
+  }
+
   async function pollSponsorBattery() {
     if ($('viewLanding').hidden) return;
     try {
-      const res = await api('GET', '/demoSponsorStatus()');
+      const res = await api('GET', '/demoSponsorStatus()', undefined, { signal: AbortSignal.timeout(10000) });
       renderSponsorBattery(Array.isArray(res) ? res : res.value);
-    } catch { $('sponsorBattery').hidden = true; }
+    } catch (e) {
+      // A real HTTP error (404 on an old server) hides the widget; a network
+      // failure or timeout is indeterminate = keep charging.
+      if (e && e.status) $('sponsorBattery').hidden = true;
+      else renderSponsorBatteryIndeterminate();
+    }
   }
 
   let batteryTimer = null;
