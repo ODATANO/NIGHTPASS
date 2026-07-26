@@ -355,6 +355,17 @@ export default class ProducerService extends cds.ApplicationService {
                 // SUPERSEDED prewarm just means a fresh one took over.
                 if (/WALLET_SYNCING|SUPERSEDED/i.test(msg)) {
                     out.push(cold(secrets.id, label, 'warming', ''));
+                } else if (/No facade/i.test(msg)) {
+                    // SELF-HEAL: NIGHTGATE's session-expiry sweep evicts facades
+                    // by accountId, so an expiring STALE session of this wallet
+                    // (from an earlier boot) takes the live facade down with it.
+                    // Drop the cached session and reconnect; the fresh
+                    // connectWalletForSigning restores the facade and prewarm.
+                    cds.log('producer').warn(
+                        `sponsor '${secrets.id}' facade evicted (stale-session sweep?); reconnecting`);
+                    this.serverSessions.delete(secrets.id);
+                    void this.serverSigningSession(secrets.id).catch(() => { /* logged inside */ });
+                    out.push(cold(secrets.id, label, 'warming', ''));
                 } else {
                     out.push(cold(secrets.id, label, 'error', msg));
                 }

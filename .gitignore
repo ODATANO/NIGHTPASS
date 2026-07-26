@@ -58,6 +58,7 @@ CLAUDE.md
 CAP_GUIDE.MD
 IMPLEMENTATION.MD
 docs/development.md
+docs/btp*
 
 # internal dev/helper scripts (not part of the published repo)
 docs/render-diagram.mjs
@@ -95,3 +96,4 @@ deploy/passport-demo.db
 
 # internal planning docs stay local
 docs/try-it-demo-plan.md
+docs/roadmap-complete-solution.md
