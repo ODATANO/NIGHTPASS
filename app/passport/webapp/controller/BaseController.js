@@ -111,10 +111,12 @@ sap.ui.define([
 
     formatCategory: function (s) {
       switch (s) {
-        case "EV":         return "Electric Vehicle";
-        case "INDUSTRIAL": return "Industrial";
-        case "LMT":        return "Light Means of Transport";
-        default:           return s || "";
+        case "EV":                return "Electric Vehicle";
+        case "INDUSTRIAL":        return "Industrial";
+        case "LMT":               return "Light Means of Transport";
+        case "STATIONARY":        return "Stationary Industrial";
+        case "INDUSTRIAL_NO_BMS": return "Industrial (no BMS)";
+        default:                  return s || "";
       }
     },
 

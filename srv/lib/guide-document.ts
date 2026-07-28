@@ -34,6 +34,9 @@ const CATEGORY_LABEL: Record<string, string> = {
     // passports validate against); plain "industrial battery" is rejected.
     INDUSTRIAL: 'industrial/non-stationary battery',
     LMT: 'LMT battery',
+    STATIONARY: 'industrial/stationary battery',
+    // The Without-BMS guide keeps the non-stationary enum value.
+    INDUSTRIAL_NO_BMS: 'industrial/non-stationary battery',
 };
 
 const CHEMISTRY_CODES = ['Li-ion LCO', 'Li-ion LFP', 'Li-ion LMO', 'Li-ion NCA', 'Li-ion NMC', 'Li-metal', 'Na-ion', 'Ni-Cd', 'Ni-MH', 'Pb'];
@@ -67,7 +70,10 @@ export function buildGuideDocument(
         UniqueBatteryIdentifierUniqueProductIdentifier: `urn:odatano:battery:${p.passportId}`,
         ...(b.serialNumber ? { BatterySerialNumber: b.serialNumber } : {}),
         UniqueManufacturerIdentifier: p.manufacturerId ?? undefined,
-        ...(p.manufactureDate ? { ManufacturingDate: p.manufactureDate } : {}),
+        // The Industrial_Without_BMS_Guide rejects ManufacturingDate.
+        ...(p.manufactureDate && p.batteryCategory !== 'INDUSTRIAL_NO_BMS'
+            ? { ManufacturingDate: p.manufactureDate }
+            : {}),
         ...(p.batteryCategory
             ? { BatteryCategory: { batteryCategoryValue: CATEGORY_LABEL[p.batteryCategory] ?? p.batteryCategory } }
             : {}),

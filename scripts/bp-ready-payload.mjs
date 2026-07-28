@@ -28,6 +28,9 @@ const CATEGORY_LABEL = {
   // Enum value of the Other_Industrial_2kWh_Guide; plain "industrial battery" is rejected.
   INDUSTRIAL: 'industrial/non-stationary battery',
   LMT: 'LMT battery',
+  STATIONARY: 'industrial/stationary battery',
+  // The Without-BMS guide keeps the non-stationary enum value.
+  INDUSTRIAL_NO_BMS: 'industrial/non-stationary battery',
 };
 
 // The guide restricts chemicalCodeValue to a closed list; our free-text
@@ -61,7 +64,10 @@ const identifiers = {
   UniqueBatteryIdentifierUniqueProductIdentifier: `urn:odatano:battery:${p.passportId}`,
   ...(b.serialNumber ? { BatterySerialNumber: b.serialNumber } : {}),
   UniqueManufacturerIdentifier: p.manufacturerId,
-  ...(p.manufactureDate ? { ManufacturingDate: p.manufactureDate } : {}),
+  // The Industrial_Without_BMS_Guide rejects ManufacturingDate.
+  ...(p.manufactureDate && p.batteryCategory !== 'INDUSTRIAL_NO_BMS'
+    ? { ManufacturingDate: p.manufactureDate }
+    : {}),
   ...(p.batteryCategory
     ? { BatteryCategory: { batteryCategoryValue: CATEGORY_LABEL[p.batteryCategory] ?? p.batteryCategory } }
     : {}),

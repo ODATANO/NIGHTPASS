@@ -21,6 +21,8 @@ const GUIDE_BY_CATEGORY: Record<string, string> = {
     EV: 'EV_Guide',
     LMT: 'LMT_Guide',
     INDUSTRIAL: 'Other_Industrial_2kWh_Guide',
+    STATIONARY: 'Stationary_Industrial_2kWh_Guide',
+    INDUSTRIAL_NO_BMS: 'Industrial_Without_BMS_Guide',
 };
 
 export interface ConformanceIssue { path: string; message: string }

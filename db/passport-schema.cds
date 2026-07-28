@@ -21,9 +21,11 @@ namespace passport;
 
 /** Battery category per Regulation 2023/1542 Art. 2. */
 type BatteryCategory : String enum {
-    EV;          // electric-vehicle battery
-    INDUSTRIAL;  // industrial battery (>2 kWh)
-    LMT;         // light means of transport (e-bike, scooter)
+    EV;                 // electric-vehicle battery
+    INDUSTRIAL;         // industrial battery (>2 kWh, non-stationary, with BMS)
+    LMT;                // light means of transport (e-bike, scooter)
+    STATIONARY;         // stationary industrial battery energy storage (>2 kWh)
+    INDUSTRIAL_NO_BMS;  // industrial battery without a battery management system
 }
 
 /** Producer-cockpit lifecycle of a passport (save-then-submit split). */

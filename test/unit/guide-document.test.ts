@@ -70,6 +70,16 @@ describe('buildGuideDocument', () => {
         assert.equal(ind.Battery_Passport.PerformanceAndDurability, undefined);
         assert.equal(bp.PerformanceAndDurability.CertifiedUsableBatteryEnergy.kilowattHourValue, 75);
     });
+    it('maps STATIONARY to the stationary guide enum', () => {
+        const st = buildGuideDocument({ ...PASSPORT, batteryCategory: 'STATIONARY' }, [BATTERY], RECYCLED, []) as any;
+        assert.equal(st.Battery_Passport.IdentifiersAndProductData.BatteryCategory.batteryCategoryValue, 'industrial/stationary battery');
+        assert.equal(st.Battery_Passport.IdentifiersAndProductData.ManufacturingDate, '2026-07-01');
+    });
+    it('INDUSTRIAL_NO_BMS keeps the non-stationary enum but drops ManufacturingDate', () => {
+        const nb = buildGuideDocument({ ...PASSPORT, batteryCategory: 'INDUSTRIAL_NO_BMS' }, [BATTERY], RECYCLED, []) as any;
+        assert.equal(nb.Battery_Passport.IdentifiersAndProductData.BatteryCategory.batteryCategoryValue, 'industrial/non-stationary battery');
+        assert.equal(nb.Battery_Passport.IdentifiersAndProductData.ManufacturingDate, undefined);
+    });
 });
 
 describe('defaultGuideAttributes', () => {
@@ -100,5 +110,23 @@ describe('defaultGuideAttributes', () => {
         assert.equal(byName.get('RemainingCapacity')?.accessClass, 'legitimateInterest');
         assert.equal(JSON.parse(byName.get('TimeSpentInExtremeTemperaturesAboveBoundary')!.valueJson), 42);
         assert.equal(JSON.parse(byName.get('CapacityThroughput')!.valueJson).amperehourMiliamperehour, 'Ah');
+    });
+    it('STATIONARY set combines the industrial cobalt share with the dynamic attributes', () => {
+        const st = defaultGuideAttributes({ passportId: 'BAT-X', batteryCategory: 'STATIONARY' });
+        assert.equal(st.length, 76);
+        const names = new Set(st.map((r) => r.attribute));
+        assert.ok(!names.has('StateOfCertifiedEnergySOCE'));
+        assert.ok(names.has('Post-consumerRecycledCobaltShare'));
+        assert.ok(names.has('RemainingCapacity'));
+        assert.ok(names.has('DateOfPuttingTheBatteryIntoService'));
+    });
+    it('INDUSTRIAL_NO_BMS set drops the BMS-measured attributes', () => {
+        const nb = defaultGuideAttributes({ passportId: 'BAT-X', batteryCategory: 'INDUSTRIAL_NO_BMS' });
+        assert.equal(nb.length, 61);
+        const names = new Set(nb.map((r) => r.attribute));
+        assert.ok(!names.has('InitialInternalResistanceOfBatteryCellAndPackModuleRecommended'));
+        assert.ok(!names.has('InternalResistanceIncreaseOfPackCellAndModuleRecommended'));
+        assert.ok(!names.has('NumberOfFullChargingAndDischargingCycles'));
+        assert.ok(names.has('Post-consumerRecycledCobaltShare'));
     });
 });

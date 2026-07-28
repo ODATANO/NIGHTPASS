@@ -18,6 +18,8 @@
               <core:Item key="EV" text="EV"/>
               <core:Item key="INDUSTRIAL" text="Industrial"/>
               <core:Item key="LMT" text="LMT"/>
+              <core:Item key="STATIONARY" text="Stationary industrial"/>
+              <core:Item key="INDUSTRIAL_NO_BMS" text="Industrial (no BMS)"/>
             </Select>
             <Label text="Validation guide"/>
             <Text text="{create>/guide}" class="sapUiTinyMarginTop"/>

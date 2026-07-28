@@ -22,6 +22,8 @@ const CATEGORY_LABEL: Record<string, string> = {
     EV: 'Electric Vehicle battery',
     INDUSTRIAL: 'Industrial battery',
     LMT: 'Light Means of Transport battery',
+    STATIONARY: 'Stationary Industrial battery',
+    INDUSTRIAL_NO_BMS: 'Industrial battery (no BMS)',
 };
 
 const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');

@@ -58,6 +58,33 @@ sap.ui.define([
       recycled: [
         { material: "Co", recycledPercentage: 16.9, sourceSupplierName: "ReCobalt Recyclers SA" }
       ]
+    },
+    STATIONARY: {
+      guide: "Stationary_Industrial_2kWh_Guide",
+      manufacturerId: "DE-GRIDVAULT-004", model: "GridVault ST-200",
+      weightKg: 1620.0, performanceClass: "B",
+      battery: {
+        cellChemistry: "LFP", capacityKwh: 200.0, carbonFootprintKgCO2: 7800.5,
+        supplierName: "FerroPhos AG", recycledContentPct: 6.5,
+        cycleLife: 8000, roundTripEfficiencyPct: 90.0, leadContentPpm: 10.0
+      },
+      recycled: [
+        { material: "Li", recycledPercentage: 7.2, sourceSupplierName: "LiLoop Recycling BV" },
+        { material: "Ni", recycledPercentage: 5.0, sourceSupplierName: "NickelBack Materials Oy" }
+      ]
+    },
+    INDUSTRIAL_NO_BMS: {
+      guide: "Industrial_Without_BMS_Guide",
+      manufacturerId: "DE-RAILCELL-005", model: "RailCell RB-40",
+      weightKg: 310.0, performanceClass: "D",
+      battery: {
+        cellChemistry: "Pb", capacityKwh: 40.0, carbonFootprintKgCO2: 1550.0,
+        supplierName: "PlumbusCell GmbH", recycledContentPct: 55.0,
+        cycleLife: 1500, roundTripEfficiencyPct: 82.0, leadContentPpm: 850000.0
+      },
+      recycled: [
+        { material: "Pb", recycledPercentage: 72.0, sourceSupplierName: "LeadLoop Recycling GmbH" }
+      ]
     }
   };
 

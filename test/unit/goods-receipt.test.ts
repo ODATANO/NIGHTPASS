@@ -38,7 +38,7 @@ describe('generateGoodsReceipt', () => {
     it('produces regulation-valid header fields', () => {
         for (let i = 1; i <= 20; i++) {
             const gr = generateGoodsReceipt(i);
-            assert.ok(['EV', 'INDUSTRIAL', 'LMT'].includes(gr.public.batteryCategory));
+            assert.ok(['EV', 'INDUSTRIAL', 'LMT', 'STATIONARY', 'INDUSTRIAL_NO_BMS'].includes(gr.public.batteryCategory));
             assert.match(gr.public.performanceClass, /^[A-G]$/);
             assert.match(gr.public.manufactureDate, /^2026-\d{2}-\d{2}$/);
             assert.ok(gr.public.weightKg > 0);

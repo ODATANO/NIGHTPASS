@@ -13,7 +13,7 @@
  * persistence and the emit counter; this owns the shape and the generator.
  */
 
-export type BatteryCategory = 'EV' | 'INDUSTRIAL' | 'LMT';
+export type BatteryCategory = 'EV' | 'INDUSTRIAL' | 'LMT' | 'STATIONARY' | 'INDUSTRIAL_NO_BMS';
 
 export interface GoodsReceiptPublic {
     manufacturerId: string;
@@ -50,7 +50,7 @@ export type Batch = GoodsReceipt;
 // --- deterministic value pools ----------------------------------------------
 
 const MANUFACTURERS = ['DE-CELLCO-001', 'FR-VOLTAIC-002', 'PL-AKUMA-003', 'SE-NORDCELL-004', 'ES-IBERION-005'] as const;
-const CATEGORIES: readonly BatteryCategory[] = ['EV', 'INDUSTRIAL', 'LMT'] as const;
+const CATEGORIES: readonly BatteryCategory[] = ['EV', 'INDUSTRIAL', 'LMT', 'STATIONARY', 'INDUSTRIAL_NO_BMS'] as const;
 const MODELS = ['PowerCell EV-75', 'GridStack IND-250', 'UrbanGlide LMT-2', 'LongHaul EV-110', 'FlowCore IND-400'] as const;
 const CHEMISTRIES = ['NMC-811', 'LFP', 'NCA', 'NMC-622', 'LMFP'] as const;
 const CELL_SUPPLIERS = ['CathodeWorks GmbH', 'ElectroChem SA', 'AnodeTech BV', 'IonForge Oy', 'CellCraft AB'] as const;

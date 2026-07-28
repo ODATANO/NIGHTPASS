@@ -40,11 +40,21 @@ const volt = (v: number) => ({ voltValue: v, volt: 'V' });
  */
 const EV_ONLY_ATTRIBUTES = new Set(['StateOfCertifiedEnergySOCE', 'CapacityThresholdForExhaustion']);
 
+/**
+ * BMS-measured attributes the Industrial_Without_BMS_Guide rejects ("false
+ * schema"): a battery without a battery management system cannot report them.
+ */
+const NO_BMS_REJECTED_ATTRIBUTES = new Set([
+    'InitialInternalResistanceOfBatteryCellAndPackModuleRecommended',
+    'InternalResistanceIncreaseOfPackCellAndModuleRecommended',
+    'NumberOfFullChargingAndDischargingCycles',
+]);
+
 export function defaultGuideAttributes(p: {
     passportId: string;
     model?: string | null;
     performanceClass?: string | null;
-    batteryCategory?: string | null; // EV (default) | INDUSTRIAL | LMT; picks the guide-specific set
+    batteryCategory?: string | null; // EV (default) | INDUSTRIAL | LMT | STATIONARY | INDUSTRIAL_NO_BMS; picks the guide-specific set
 }): GuideAttributeRow[] {
     const pid = p.passportId;
     const category = p.batteryCategory ?? 'EV';
@@ -141,15 +151,19 @@ export function defaultGuideAttributes(p: {
         [SYM, 'ResultsOfTestReportsProvingCompliance', urn('compliance', `test-reports-${pid}`), AUTH],
     ];
 
-    const filtered = category === 'EV' ? rows : rows.filter(([, attribute]) => !EV_ONLY_ATTRIBUTES.has(attribute));
+    let filtered = category === 'EV' ? rows : rows.filter(([, attribute]) => !EV_ONLY_ATTRIBUTES.has(attribute));
 
-    if (category === 'INDUSTRIAL') {
-        // Required by Other_Industrial_2kWh_Guide beyond the common set.
+    if (category === 'INDUSTRIAL_NO_BMS') {
+        filtered = filtered.filter(([, attribute]) => !NO_BMS_REJECTED_ATTRIBUTES.has(attribute));
+    }
+    if (category === 'INDUSTRIAL' || category === 'STATIONARY' || category === 'INDUSTRIAL_NO_BMS') {
+        // Required by the industrial guides beyond the common set.
         filtered.push([CIRC, 'Post-consumerRecycledCobaltShare', pct(5.2), PUB]);
     }
-    if (category === 'LMT') {
-        // The LMT guide requires the dynamic battery-state attributes
-        // (longlist #53-93, legitimate interest) plus the in-service date.
+    if (category === 'LMT' || category === 'STATIONARY') {
+        // The LMT and stationary-industrial guides require the dynamic
+        // battery-state attributes (longlist #53-93, legitimate interest)
+        // plus the in-service date.
         filtered.push(
             [ID, 'DateOfPuttingTheBatteryIntoService', '2026-07-10', LI],
             [PERF, 'RemainingCapacity', { amperehourMiliamperehourValue: 198, ampereHourMiliamperehour: 'Ah' }, LI],
