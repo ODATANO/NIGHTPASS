@@ -46,7 +46,7 @@
               <ObjectStatus text="{status}"
                 state="{= ${status} === 'anchored' ? 'Success' : ${status} === 'failed' ? 'Error' : ${status} === 'anchoring' ? 'Warning' : 'None' }"/>
               <Link text="{= ${attestationTxHash} ? ${attestationTxHash} : 'not anchored' }"
-                    href="{= ${attestationTxHash} ? 'https://preview.midnightexplorer.com/transactions/0x' + ${attestationTxHash} : '' }"
+                    href="{parts: ['attestationTxHash', 'anchorNetwork'], formatter: '.explorerTx'}"
                     target="_blank" enabled="{= !!${attestationTxHash} }"/>
             </cells>
           </ColumnListItem>

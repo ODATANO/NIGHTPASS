@@ -184,7 +184,7 @@ cds.on('bootstrap', (app: any) => {
     // per-network hosts as default.
     app.get('/api/v1/passport/runtime-config', (_req: any, res: any) => {
         const cfg: any = (cds.env as any).requires?.nightgate ?? {};
-        const network = process.env.NIGHTGATE_NETWORK?.trim() || cfg.network || 'preview';
+        const network = process.env.NIGHTGATE_NETWORK?.trim() || cfg.network || 'preprod';
         const httpOverride = process.env.NIGHTGATE_INDEXER_HTTP_URL?.trim() || cfg.indexerHttpUrl;
         const indexerHttpUrl = httpOverride
             || `https://indexer.${network}.midnight.network/api/v4/graphql`;

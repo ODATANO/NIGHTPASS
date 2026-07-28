@@ -76,7 +76,7 @@
         }
       },
       "nightgate": {
-        "network": "preview",
+        "network": "preprod",
         "runtimeMode": "single-instance",
         "replicaCount": 1,
         "granteeBinding": "did",

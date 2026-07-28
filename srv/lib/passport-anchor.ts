@@ -23,7 +23,7 @@ const detachedRequestScope = new AsyncResource('nightpass.detached-service-call'
  */
 export function effectiveNetwork(): string {
     const cfg = ((cds.env as unknown as Record<string, any>).requires?.nightgate ?? {}) as { network?: string };
-    return process.env.NIGHTGATE_NETWORK?.trim() || cfg.network || 'preview';
+    return process.env.NIGHTGATE_NETWORK?.trim() || cfg.network || 'preprod';
 }
 
 /**

@@ -1,4 +1,4 @@
-# NIGHTPASS public demo, single preview instance behind Caddy (auto-TLS).
+# NIGHTPASS public demo, single preprod instance behind Caddy (auto-TLS).
 # See deploy/README.md for the five manual steps; full background in
 # docs/public-demo.md.
 services:
@@ -34,7 +34,7 @@ services:
       - passport-pg-data:/var/lib/postgresql/data
 
   # ---- "Try it" demo instance (profile: demo, off by default) --------------
-  # Anchors visitor passports on preview with a dedicated sponsor wallet and
+  # Anchors visitor passports on preprod with a dedicated sponsor wallet and
   # publishes them into the main explorer via the ingest endpoint. Start with
   # `docker compose --profile demo up -d` AFTER filling .env.demo and swapping
   # in Caddyfile.demo (see README, "Try-it demo instance").
