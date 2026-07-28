@@ -34,8 +34,10 @@ service PassportService {
     @readonly
     entity RecycledMaterials as projection on passport.RecycledMaterials;
 
+    // The uploaded file bytes never travel through the public read surface;
+    // authority tier sees the metadata + anchor hash, download stays cockpit-side.
     @readonly
-    entity DiligenceDoc      as projection on passport.DiligenceDoc;
+    entity DiligenceDoc      as projection on passport.DiligenceDoc excluding { content };
 
     // Guide-format attributes (BatteryPass-Ready). Rows are filtered per
     // requester tier by their longlist accessClass in the after-READ handler.

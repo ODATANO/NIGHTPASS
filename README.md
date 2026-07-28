@@ -20,6 +20,10 @@ NIGHTPASS implements the EU Battery Passport. One dataset is exposed with a diff
 - **Fee sponsoring**: the `PASSPORT_FEE_SPONSOR_WALLET` pool pays every other wallet's dust fees; a new producer needs neither NIGHT nor dust. Every demo visitor runs on a zero-funded wallet.
 - **Single-transaction anchoring**: attest + bindPassport + anchorContentRoot ride in ONE batched transaction with deterministic apply order (NIGHTGATE >= 0.10.0), see the demo flow below.
 - **On-chain passport ownership**: the registrar pre-assigns a passportId to an offline-derived attester identity before its first bind; registered ids cannot be squatted or hijacked, see the demo flow below.
+- **BatteryPass-Ready conformant**: passports validate with **0 errors against all five official validation guides** (EV, LMT, stationary industrial, other industrial, industrial without BMS; guide picked by battery category) and pass **all 11 interop scenarios** of the official DPP Life Cycle API test suite.
+- **Due-diligence evidence**: upload the supply-chain due-diligence report in the cockpit; the file stays off-chain (authority tier), only its sha256 is anchored on-chain, so anyone can verify the document is authentic and untampered.
+- **EU DPP Registry**: the registration flow is proven against the official registry test environment (verified economic operator, UPI resolving to the public explorer); battery registrations complete once the registry's semantic validation for the product group goes live.
+- **Zero-infrastructure proving**: with NIGHTGATE >= 0.11.0, ZK proofs run in-process (wasm) whenever no proof server is configured; local dev and CI need no Docker container.
 - **Catena-X**: exports the CX-0143 aspect JSON plus a **Predicate Attestation Credential (PAC)** with `valueDisclosed: false`, the predicate capability Tractus-X currently lacks.
 
 ## Public demo and explorer (Midnight preprod)

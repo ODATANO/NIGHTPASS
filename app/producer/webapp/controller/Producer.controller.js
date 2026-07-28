@@ -101,8 +101,7 @@ sap.ui.define([
       weightKg: oEx.weightKg,
       performanceClass: oEx.performanceClass,
       battery: Object.assign({ serialNumber: "SN-AX-" + sStamp }, oEx.battery),
-      recycled: oEx.recycled.map(function (r) { return Object.assign({}, r); }),
-      diligenceDocType: "supply-chain-due-diligence-report"
+      recycled: oEx.recycled.map(function (r) { return Object.assign({}, r); })
     };
   }
 
@@ -272,8 +271,9 @@ sap.ui.define([
         }],
         recycledMaterials: (d.recycled || []).map(function (r) {
           return { material: r.material, recycledPercentage: Number(r.recycledPercentage), sourceSupplierName: r.sourceSupplierName };
-        }),
-        diligenceDocs: d.diligenceDocType ? [{ docType: d.diligenceDocType }] : []
+        })
+        // Due-diligence evidence is no longer a create-time placeholder: real
+        // files are uploaded + anchored in the detail cockpit's tab.
       });
 
       var that = this;

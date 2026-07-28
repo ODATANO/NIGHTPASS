@@ -38,7 +38,7 @@ type PassportStatus : String enum {
 
 /** On-chain step kinds tracked in PassportTransactions (transaction overview). */
 type TxKind : String enum {
-    attest; bindPassport; grantDisclosure; revokeDisclosure; commitValue; provePredicate; deploy;
+    attest; bindPassport; grantDisclosure; revokeDisclosure; commitValue; provePredicate; deploy; anchorDoc;
 }
 
 /** Status of a tracked on-chain step / log row. `offline` = no session, never submitted. */
@@ -194,9 +194,21 @@ entity RecycledMaterials : cuid {
  * tier (Points 2/3), supply-chain due-diligence evidence.
  */
 entity DiligenceDoc : cuid {
-    passport    : Association to Passports;
-    docType     : String(100);               // e.g. "supply-chain-due-diligence-report"
-    documentRef : Association to midnight.Documents;  // plugin-owned anchor
+    passport     : Association to Passports;
+    docType      : String(100);              // e.g. "supply-chain-due-diligence-report"
+    documentRef  : Association to midnight.Documents;  // plugin-owned anchor
+
+    // Uploaded evidence file. The bytes stay off-chain in this row; only the
+    // sha256 is anchored on-chain (own attest tx via anchorDocument), so the
+    // passport payloadHash is untouched by uploads. AUTHORITY tier throughout;
+    // the public read surface excludes `content` entirely.
+    fileName     : String(255);
+    mimeType     : String(100);
+    fileSize     : Integer64;                // bytes
+    sha256       : String(64);               // hex; the anchored value
+    content      : LargeBinary;
+    status       : TxStatus;                 // offline = stored without anchor
+    anchorTxHash : String(64);
 }
 
 /**

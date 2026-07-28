@@ -184,6 +184,34 @@ service ProducerService {
     };
 
     /**
+     * Upload a due-diligence evidence file for an existing passport and anchor
+     * its sha256 on-chain (an own attest tx via NIGHTGATE anchorDocument; the
+     * passport payloadHash stays untouched). The bytes stay off-chain in the
+     * DiligenceDoc row; without a signing session the file is stored with
+     * status 'offline' and can be anchored later by re-uploading.
+     */
+    action   uploadDiligenceDoc(passportId: String,
+                                docType: String,
+                                fileName: String,
+                                mimeType: String,
+                                contentBase64: LargeString,
+                                sessionId: UUID,   // optional: browser-wallet session
+                                walletId: String,  // optional: which SERVER wallet signs
+                                sponsorWalletId: String // optional: fee-sponsor pool member
+    )                                                                    returns {
+        docId  : UUID;
+        sha256 : String;
+        mode   : String; // 'anchoring' | 'offline'
+    };
+
+    /** Download an uploaded due-diligence file (cockpit-side, producer-gated). */
+    function diligenceFile(docId: UUID)                                  returns {
+        fileName      : String;
+        mimeType      : String;
+        contentBase64 : LargeString;
+    };
+
+    /**
      * Publish an anchored passport to the public explorer instance: POST its
      * public Point-1 fields to PASSPORT_PUBLISH_URL (secret PASSPORT_PUBLISH_SECRET).
      * Only anchored passports; verification stays live on the chain at the target.

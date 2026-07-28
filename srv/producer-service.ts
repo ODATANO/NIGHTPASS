@@ -10,6 +10,7 @@ import {
     effectiveNetwork, explorerTxUrl
 } from './lib/passport-anchor';
 import { defaultGuideAttributes, hashableAttributes } from './lib/guide-attribute-defaults';
+import { validateDiligenceUpload, decodeUpload, sha256Hex } from './lib/diligence-upload';
 import { listProducerWallets, producerWalletSecrets, feeSponsorWalletId, feeSponsorWalletIds } from './lib/producer-wallets';
 import { verifyContractTx, type ChainVerdict } from './lib/chain-verify';
 import { verifyAttestState, verifyGrantState, verifyPredicateState } from './lib/state-verify';
@@ -27,6 +28,21 @@ function txExplorerUrl(hash?: string | null): string | null {
 /** Map a chain verdict to the cockpit-facing row status. */
 function walletStatus(v: ChainVerdict): 'succeeded' | 'failed' | 'pending' {
     return v === 'confirmed' ? 'succeeded' : v === 'failed' ? 'failed' : 'pending';
+}
+
+/** LargeBinary reads differ per DB adapter: Buffer, base64 string, or stream. */
+async function toBuffer(value: unknown): Promise<Buffer | null> {
+    if (value == null) return null;
+    if (Buffer.isBuffer(value)) return value;
+    if (typeof value === 'string') return Buffer.from(value, 'base64');
+    if (typeof (value as any)[Symbol.asyncIterator] === 'function') {
+        const chunks: Buffer[] = [];
+        for await (const chunk of value as AsyncIterable<Buffer | string>) {
+            chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+        }
+        return Buffer.concat(chunks);
+    }
+    return null;
 }
 
 interface PassportInput {
@@ -83,6 +99,8 @@ export default class ProducerService extends cds.ApplicationService {
         this.on('grantPassportDisclosure', this.grantPassportDisclosure);
         this.on('revokePassportDisclosure', this.revokePassportDisclosure);
         this.on('provePassportValue', this.provePassportValue);
+        this.on('uploadDiligenceDoc', this.uploadDiligenceDoc);
+        this.on('diligenceFile', this.diligenceFile);
         return super.init();
     }
 
@@ -1235,6 +1253,119 @@ export default class ProducerService extends cds.ApplicationService {
             });
         }
     }
+
+    /**
+     * Upload a due-diligence evidence file and anchor its sha256 on-chain via
+     * NIGHTGATE anchorDocument (an own attest tx; the passport payloadHash is
+     * untouched, the document carries its own anchor). Bytes stay off-chain in
+     * the DiligenceDoc row. Without a session/contract the file is stored as
+     * 'offline'. The chain leg runs DETACHED after commit; clients poll the row.
+     */
+    private uploadDiligenceDoc = async (req: cds.Request) => {
+        const { passportId, docType, fileName, mimeType, contentBase64, sessionId, walletId, sponsorWalletId } =
+            req.data as {
+                passportId?: string; docType?: string; fileName?: string; mimeType?: string;
+                contentBase64?: string; sessionId?: string; walletId?: string; sponsorWalletId?: string;
+            };
+        if (!passportId) return req.reject(400, 'passportId is required');
+        const row: any = await SELECT.one.from(Passports)
+            .columns('ID', 'passportId', 'contractAddress').where({ passportId });
+        if (!row) return req.reject(404, `passport ${passportId} not found`);
+
+        const bytes = decodeUpload(String(contentBase64 ?? ''));
+        if (!bytes) return req.reject(400, 'contentBase64 is missing or not valid base64');
+        const check = validateDiligenceUpload(String(fileName ?? ''), String(mimeType ?? ''), bytes.length);
+        if (!check.ok) return req.reject(400, check.error as string);
+        const sha256 = sha256Hex(bytes);
+
+        const session = await this.effectiveSession(sessionId, walletId);
+        const contractAddress = this.contractAddress() ?? row.contractAddress;
+        const docId = cds.utils.uuid();
+        const mode = session && contractAddress ? 'anchoring' : 'offline';
+        await INSERT.into(DiligenceDoc).entries({
+            ID: docId, passport_ID: row.ID,
+            docType: docType || 'supply-chain-due-diligence-report',
+            fileName, mimeType, fileSize: bytes.length, sha256, content: bytes,
+            status: mode === 'anchoring' ? 'pending' : 'offline'
+        } as any);
+        if (mode === 'offline') return { docId, sha256, mode };
+
+        const sponsorSessionId = await this.sponsorSessionIdFor(String(session), sponsorWalletId);
+        const args = {
+            sha256, contentType: String(mimeType), size: bytes.length,
+            storageRef: `passport-diligence://${passportId}/${docId}`,
+            sessionId: String(session), contractAddress, compiledArtifactRef: CONTRACT_REF,
+            ...(sponsorSessionId ? { sponsorSessionId } : {})
+        };
+        const user = req.user;
+        (req as any).on('succeeded', () => {
+            void detachedFromRequest(() =>
+                this.runDiligenceAnchorDetached(docId, String(row.ID), args, user)
+            ).catch((e: unknown) =>
+                cds.log('producer').error(`detached diligence anchor crashed for ${passportId}:`, e));
+        });
+        return { docId, sha256, mode };
+    };
+
+    /** The long-running leg of uploadDiligenceDoc (single anchorDocument tx). */
+    private async runDiligenceAnchorDetached(
+        docId: string, passportRowId: string,
+        args: Record<string, unknown> & { sessionId: string; contractAddress: string },
+        user: unknown
+    ): Promise<void> {
+        const log = cds.log('producer');
+        try {
+            const nightgate = await cds.connect.to('NightgateService');
+            // First action on a fresh server session: await the facade prewarm
+            // once, same as the anchor and prove runners.
+            const prewarmJob = this.serverPrewarmJobs.get(args.sessionId);
+            if (prewarmJob) {
+                this.serverPrewarmJobs.delete(args.sessionId);
+                await waitForJobResult(nightgate, prewarmJob, args.sessionId, user);
+            }
+            const res: any = await sendDetached(nightgate, 'anchorDocument', args, user);
+            const jobResult: any = await waitForJobResult(
+                nightgate, res.jobId, args.sessionId, user, { requireChainSuccess: true }
+            );
+            const txHash = norm(String(jobResult?.txHash ?? ''));
+            await this.runDetached(async () => {
+                await UPDATE.entity(DiligenceDoc).set({
+                    status: 'succeeded', anchorTxHash: txHash,
+                    ...(res.documentId ? { documentRef_ID: String(res.documentId) } : {})
+                } as any).where({ ID: docId });
+                await INSERT.into(PassportTransactions).entries({
+                    passport_ID: passportRowId, kind: 'anchorDoc', jobId: String(res.jobId ?? ''),
+                    txHash, status: 'succeeded', explorerUrl: txExplorerUrl(txHash)
+                } as any);
+            });
+            log.info(`diligence doc ${docId} anchored: ${txHash}`);
+        } catch (e) {
+            const msg = String((e as Error)?.message ?? e).slice(0, 500);
+            log.warn(`diligence doc anchor failed for ${docId}:`, e);
+            await this.runDetached(async () => {
+                await UPDATE.entity(DiligenceDoc).set({ status: 'failed' } as any).where({ ID: docId });
+                await INSERT.into(PassportTransactions).entries({
+                    passport_ID: passportRowId, kind: 'anchorDoc', status: 'failed', errorMessage: msg
+                } as any);
+            });
+        }
+    }
+
+    /** Cockpit download of an uploaded due-diligence file (producer-gated). */
+    private diligenceFile = async (req: cds.Request) => {
+        const { docId } = req.data as { docId?: string };
+        if (!docId) return req.reject(400, 'docId is required');
+        const row: any = await SELECT.one.from(DiligenceDoc)
+            .columns('ID', 'fileName', 'mimeType', 'content').where({ ID: docId });
+        if (!row?.content) return req.reject(404, `no uploaded file for document ${docId}`);
+        const buf = await toBuffer(row.content);
+        if (!buf?.length) return req.reject(404, `no uploaded file for document ${docId}`);
+        return {
+            fileName: String(row.fileName ?? 'document'),
+            mimeType: String(row.mimeType ?? 'application/octet-stream'),
+            contentBase64: buf.toString('base64')
+        };
+    };
 
     /**
      * The content-root anchor tx of the proof job just completed: the newest

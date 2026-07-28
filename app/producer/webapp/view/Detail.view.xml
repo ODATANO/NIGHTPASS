@@ -45,11 +45,11 @@
                 <Label text="payloadHash"/><Text text="{payloadHash}"/>
                 <Label text="Contract"/>
                 <Link text="{= ${contractAddress} || '—' }"
-                      href="{= ${contractAddress} ? 'https://preview.midnightexplorer.com/contracts/0x' + ${contractAddress} : '' }"
+                      href="{parts: ['contractAddress', 'anchorNetwork'], formatter: '.explorerContract'}"
                       target="_blank" enabled="{= !!${contractAddress} }"/>
                 <Label text="Attestation tx"/>
                 <Link text="{= ${attestationTxHash} || 'not anchored' }"
-                      href="{= ${attestationTxHash} ? 'https://preview.midnightexplorer.com/transactions/0x' + ${attestationTxHash} : '' }"
+                      href="{parts: ['attestationTxHash', 'anchorNetwork'], formatter: '.explorerTx'}"
                       target="_blank" enabled="{= !!${attestationTxHash} }"/>
               </f:content>
             </f:SimpleForm>
@@ -103,6 +103,47 @@
             </VBox>
           </IconTabFilter>
 
+          <!-- Due diligence -->
+          <IconTabFilter text="Due diligence" icon="sap-icon://attachment" key="dd">
+            <VBox class="sapUiSmallMargin">
+              <MessageStrip
+                text="Upload supply-chain due-diligence evidence (e.g. the report PDF). The file stays off-chain in the passport database (authority tier); only its SHA-256 fingerprint is anchored on Midnight, so anyone can verify the document is authentic and untampered."
+                type="Information" showIcon="true" class="sapUiSmallMarginBottom"/>
+              <HBox alignItems="Center" wrap="Wrap">
+                <Label text="Document type" class="sapUiTinyMarginEnd"/>
+                <Input id="ddDocType" value="supply-chain-due-diligence-report" width="20rem" class="sapUiTinyMarginEnd"/>
+                <Button text="Upload and anchor" icon="sap-icon://upload" type="Emphasized"
+                        press="onUploadDiligence" busy="{dd>/busy}" busyIndicatorDelay="0"/>
+              </HBox>
+              <ObjectStatus class="sapUiSmallMarginTop" visible="{= !!${dd>/text} }" text="{dd>/text}" state="{dd>/state}"/>
+              <Table items="{path: 'diligenceDocs', parameters: {$select: 'ID,docType,fileName,fileSize,sha256,status,anchorTxHash'}}"
+                     headerText="Documents" class="sapUiSmallMarginTop">
+                <columns>
+                  <Column><Text text="Type"/></Column>
+                  <Column demandPopin="true" minScreenWidth="Tablet"><Text text="File"/></Column>
+                  <Column demandPopin="true" minScreenWidth="Desktop"><Text text="SHA-256"/></Column>
+                  <Column><Text text="Status"/></Column>
+                  <Column demandPopin="true" minScreenWidth="Desktop"><Text text="Anchor tx"/></Column>
+                  <Column hAlign="End"><Text text=""/></Column>
+                </columns>
+                <ColumnListItem>
+                  <cells>
+                    <Text text="{docType}"/>
+                    <Text text="{parts: ['fileName', 'fileSize'], formatter: '.fileLabel'}"/>
+                    <Text text="{path: 'sha256', formatter: '.shortHex'}"/>
+                    <ObjectStatus text="{= ${status} || 'placeholder' }"
+                      state="{= ${status} === 'succeeded' ? 'Success' : ${status} === 'failed' ? 'Error' : ${status} === 'pending' ? 'Warning' : 'None' }"/>
+                    <Link text="{path: 'anchorTxHash', formatter: '.shortHex'}"
+                          href="{path: 'anchorTxHash', formatter: '.explorerTx'}"
+                          target="_blank" enabled="{= !!${anchorTxHash} }"/>
+                    <Button icon="sap-icon://download" tooltip="Download file"
+                            press="onDownloadDiligence" enabled="{= !!${fileName} }"/>
+                  </cells>
+                </ColumnListItem>
+              </Table>
+            </VBox>
+          </IconTabFilter>
+
           <!-- Disclosure -->
           <IconTabFilter text="Disclosure" icon="sap-icon://locked" key="disc">
             <f:SimpleForm editable="true" layout="ResponsiveGridLayout" labelSpanXL="3" labelSpanL="3">
@@ -134,7 +175,7 @@
                     <Text text="{grantee}"/>
                     <Text text="{level}"/>
                     <ObjectStatus text="{status}" state="{= ${status} === 'succeeded' ? 'Success' : ${status} === 'failed' ? 'Error' : ${status} === 'pending' ? 'Warning' : 'None' }"/>
-                    <Link text="{= ${txHash} || '—' }" href="{= ${txHash} ? 'https://preview.midnightexplorer.com/transactions/0x' + ${txHash} : '' }" target="_blank" enabled="{= !!${txHash} }"/>
+                    <Link text="{= ${txHash} || '—' }" href="{path: 'txHash', formatter: '.explorerTx'}" target="_blank" enabled="{= !!${txHash} }"/>
                   </cells>
                 </ColumnListItem>
               </items>
@@ -184,7 +225,7 @@
                     <ObjectStatus text="{= ${status} === 'succeeded' ? 'proven' : ${status} === 'failed' ? 'false' : ${status} === 'offline' ? 'offline' : ${status} === 'pending' ? 'proving…' : '—' }"
                       state="{= ${status} === 'succeeded' ? 'Success' : ${status} === 'failed' ? 'Error' : ${status} === 'pending' ? 'Warning' : 'None' }"/>
                     <ObjectStatus text="{status}" state="{= ${status} === 'succeeded' ? 'Success' : ${status} === 'failed' ? 'Error' : ${status} === 'pending' ? 'Warning' : 'None' }"/>
-                    <Link text="{= ${txHash} || '—' }" href="{= ${txHash} ? 'https://preview.midnightexplorer.com/transactions/0x' + ${txHash} : '' }" target="_blank" enabled="{= !!${txHash} }"/>
+                    <Link text="{= ${txHash} || '—' }" href="{path: 'txHash', formatter: '.explorerTx'}" target="_blank" enabled="{= !!${txHash} }"/>
                   </cells>
                 </ColumnListItem>
               </items>

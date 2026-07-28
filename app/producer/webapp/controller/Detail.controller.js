@@ -20,6 +20,7 @@ sap.ui.define([
       this.getView().setModel(new JSONModel({ aspect: "", pac: "" }), "cx");
       // Conformance tab: BatteryPass-Ready validation result.
       this.getView().setModel(new JSONModel({ busy: false, text: "", state: "None", valid: false, issues: [] }), "conf");
+      this.getView().setModel(new JSONModel({ busy: false, text: "", state: "None" }), "dd");
     },
 
     // Publish the anchored passport to the public explorer instance.
@@ -51,6 +52,96 @@ sap.ui.define([
         .catch(function (e) {
           oConf.setData({ busy: false, text: String((e && e.message) || e), state: "Error", valid: false, issues: [] });
         });
+    },
+
+    // Due-diligence upload: native file picker (no extra UI5 lib), file goes
+    // base64 through the uploadDiligenceDoc action; the sha256 anchor runs
+    // detached on the server and the row poll below reports the outcome.
+    onUploadDiligence: function () {
+      var that = this;
+      var oInput = document.createElement("input");
+      oInput.type = "file";
+      oInput.accept = ".pdf,.json,.txt,.png,.jpg,.jpeg";
+      oInput.onchange = function () {
+        var oFile = oInput.files && oInput.files[0];
+        if (!oFile) { return; }
+        if (oFile.size > 8 * 1024 * 1024) { that.toast("file exceeds the 8 MB limit"); return; }
+        var oReader = new FileReader();
+        oReader.onload = function () {
+          var sBase64 = String(oReader.result).split(",")[1] || "";
+          that._uploadDiligence(oFile, sBase64);
+        };
+        oReader.readAsDataURL(oFile);
+      };
+      oInput.click();
+    },
+
+    _uploadDiligence: function (oFile, sBase64) {
+      var that = this;
+      var oDd = this.getView().getModel("dd");
+      oDd.setData({ busy: true, text: "Uploading and hashing " + oFile.name + "…", state: "Information" });
+      this.callAction("/uploadDiligenceDoc", {
+        passportId: this._pid(),
+        docType: this.byId("ddDocType").getValue() || "supply-chain-due-diligence-report",
+        fileName: oFile.name,
+        mimeType: oFile.type || "application/pdf",
+        contentBase64: sBase64,
+        walletId: this._walletId()
+      }).then(function (res) {
+        if (res.mode === "anchoring") {
+          oDd.setData({ busy: false, text: "sha256 " + res.sha256.substring(0, 16) + "… · anchoring in the background", state: "Information" });
+          that._pollDiligence(res.docId);
+        } else {
+          oDd.setData({ busy: false, text: "stored without anchor (no signing session) · sha256 " + res.sha256.substring(0, 16) + "…", state: "Warning" });
+        }
+        that._refreshAll();
+      }).catch(function (e) {
+        oDd.setData({ busy: false, text: String((e && e.message) || e), state: "Error" });
+      });
+    },
+
+    _pollDiligence: function (sDocId) {
+      var that = this;
+      var iTries = 0;
+      var poll = function () {
+        if (++iTries > 60) { return; } // ~5 min cap; the row keeps its state
+        fetch("/api/v1/producer/DiligenceDoc(" + sDocId + ")?$select=status,anchorTxHash", { headers: that._authHeaders() })
+          .then(function (r) { return r.json(); })
+          .then(function (row) {
+            if (row.status === "succeeded") {
+              that.getView().getModel("dd").setData({
+                busy: false, state: "Success",
+                text: "document anchored · tx " + String(row.anchorTxHash || "").substring(0, 12) + "…"
+              });
+              that.toast("due-diligence document anchored on-chain");
+              that._refreshAll();
+            } else if (row.status === "failed") {
+              that.getView().getModel("dd").setData({
+                busy: false, text: "anchoring failed (see Transactions tab)", state: "Error"
+              });
+              that._refreshAll();
+            } else { setTimeout(poll, 5000); }
+          })
+          .catch(function () { setTimeout(poll, 5000); });
+      };
+      setTimeout(poll, 5000);
+    },
+
+    onDownloadDiligence: function (oEvent) {
+      var that = this;
+      var oRow = oEvent.getSource().getBindingContext().getObject();
+      fetch("/api/v1/producer/diligenceFile(docId=" + oRow.ID + ")", { headers: this._authHeaders() })
+        .then(function (r) {
+          if (!r.ok) { throw new Error("download failed (HTTP " + r.status + ")"); }
+          return r.json();
+        })
+        .then(function (d) {
+          var a = document.createElement("a");
+          a.href = "data:" + (d.mimeType || "application/octet-stream") + ";base64," + d.contentBase64;
+          a.download = d.fileName || "document";
+          a.click();
+        })
+        .catch(function (e) { that.error(e); });
     },
 
     // The header buttons dispatch on the signing mode chosen at login:

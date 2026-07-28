@@ -62,17 +62,6 @@
         </f:SimpleForm>
       </Panel>
 
-      <Panel headerText="Due diligence" expandable="true" expanded="false">
-        <f:SimpleForm editable="true" layout="ResponsiveGridLayout"
-                      labelSpanXL="4" labelSpanL="4" labelSpanM="4"
-                      columnsXL="1" columnsL="1" columnsM="1">
-          <f:content>
-            <Label text="Document type"/>
-            <Input value="{create>/diligenceDocType}"/>
-          </f:content>
-        </f:SimpleForm>
-      </Panel>
-
       <Panel headerText="Recycled materials" expandable="true" expanded="false">
         <Table items="{create>/recycled}">
           <columns>

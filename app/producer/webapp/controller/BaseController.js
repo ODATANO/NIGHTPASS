@@ -60,11 +60,24 @@ sap.ui.define([
       return { Authorization: "Basic " + window.btoa("producer:producer") };
     },
 
-    explorerTx: function (sHash) {
-      return sHash ? "https://preview.midnightexplorer.com/transactions/0x" + String(sHash).replace(/^0x/, "") : "";
+    // Explorer links are network-aware: rows carry their network in
+    // anchorNetwork; rows without one (child logs, legacy) default to preprod.
+    explorerTx: function (sHash, sNet) {
+      return sHash ? "https://" + (sNet || "preprod") + ".midnightexplorer.com/transactions/0x" + String(sHash).replace(/^0x/, "") : "";
+    },
+
+    explorerContract: function (sAddr, sNet) {
+      return sAddr ? "https://" + (sNet || "preprod") + ".midnightexplorer.com/contracts/0x" + String(sAddr).replace(/^0x/, "") : "";
     },
 
     // Formatter: submit is enabled until the passport is anchored.
-    notAnchored: function (sStatus) { return sStatus !== "anchored"; }
+    notAnchored: function (sStatus) { return sStatus !== "anchored"; },
+
+    shortHex: function (s) { return s ? String(s).substring(0, 16) + "…" : ""; },
+
+    fileLabel: function (sName, iSize) {
+      if (!sName) { return "no file"; }
+      return iSize ? sName + " (" + Math.max(1, Math.round(iSize / 1024)) + " KB)" : sName;
+    }
   });
 });
