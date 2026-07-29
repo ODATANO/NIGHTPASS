@@ -97,3 +97,9 @@ deploy/passport-demo.db
 # internal planning docs stay local
 docs/try-it-demo-plan.md
 docs/roadmap-complete-solution.md
+docs/runbook-network-reset.md
+
+# local marketing/evidence assets (not for the public repo)
+docs/x-post-*.png
+docs/DPP Registration_*.csv
+image.png
