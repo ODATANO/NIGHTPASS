@@ -16,13 +16,13 @@
       <!-- Mode choice -->
       <HBox id="modeBox" justifyContent="Center" wrap="Wrap" visible="{= !${login>/mode} }">
 
-        <!-- Browser wallet (Lace): the user signs every transaction themselves -->
+        <!-- Browser wallet: the user signs every transaction themselves -->
         <VBox class="sapUiMediumMargin" width="20rem" alignItems="Center">
           <core:Icon src="sap-icon://wallet" size="2rem"/>
-          <Title text="Browser wallet (Lace)" level="H3" class="sapUiSmallMarginTop"/>
-          <Text text="You hold the keys. Every attest, grant and proof is signed in the Lace extension and submitted from your browser."
+          <Title text="Browser wallet" level="H3" class="sapUiSmallMarginTop"/>
+          <Text text="You hold the keys. Every attest, grant and proof is signed in your wallet extension and submitted from your browser."
                 textAlign="Center" class="sapUiSmallMarginTop sapUiSmallMarginBottom"/>
-          <Button id="laceBtn" text="Connect Lace" type="Emphasized" icon="sap-icon://wallet"
+          <Button id="laceBtn" text="Connect wallet" type="Emphasized" icon="sap-icon://wallet"
                   press="onChooseLace" width="12rem"/>
         </VBox>
 

@@ -4,8 +4,9 @@ sap.ui.define([
   "sap/ui/model/FilterOperator",
   "sap/ui/model/Sorter",
   "sap/ui/core/Fragment",
-  "sap/ui/model/json/JSONModel"
-], function (BaseController, Filter, FilterOperator, Sorter, Fragment, JSONModel) {
+  "sap/ui/model/json/JSONModel",
+  "producer/util/WalletPicker"
+], function (BaseController, Filter, FilterOperator, Sorter, Fragment, JSONModel, WalletPicker) {
   "use strict";
 
   return BaseController.extend("producer.controller.Detail", {
@@ -438,7 +439,7 @@ sap.ui.define([
     onProveWithLace: function () {
       var oCtx = this.getView().getBindingContext();
       var ph = oCtx.getProperty("payloadHash") || "";
-      if (!ph) { return this.toast("attest the passport with Lace first"); }
+      if (!ph) { return this.toast("attest the passport with your wallet first"); }
       var field = this.byId("proofField").getSelectedKey() || "carbonFootprintKgCO2";
       var predicate = this.byId("proofPredicate").getSelectedKey();
       var thr = Number(this.byId("proofThreshold").getValue());
@@ -457,11 +458,11 @@ sap.ui.define([
         var siblings, dirs;
         try { siblings = JSON.parse(res.siblingsJson); dirs = JSON.parse(res.dirsJson); }
         catch (e) { return that.toast("invalid inclusion proof"); }
-        that._lace("Prove field predicate with Lace", async function (mod, api, append) {
+        that._lace("Prove field predicate with your wallet", async function (mod, api, append, vault) {
           append("proving the passport's own " + field + " (" + rawVal + ") " + (op === 0 ? "≤ " : "≥ ") + thr + ", bound to the anchored content root, value hidden…");
           try {
             await mod.proveFieldPredicate(api, {
-              contractAddress: that._VAULT, payloadHash: ph, fieldKey: res.fieldKey,
+              contractAddress: vault, payloadHash: ph, fieldKey: res.fieldKey,
               threshold: thresholdScaled, op: op, fieldValue: res.scaledValue, siblings: siblings, dirs: dirs
             }, append);
           } catch (e) {
@@ -480,21 +481,39 @@ sap.ui.define([
           var r = await that._resolveHash(mod, append);
           append("saving proof in cockpit…");
           await that.callAction("/recordWalletPredicate", { passportId: that._pid(), sourceField: field, predicate: predicate, threshold: thresholdScaled, unit: unit, txHash: r.hash, result: true });
-          that._refreshAll(); append("done."); that.toast("field-bound predicate proven via Lace");
+          that._refreshAll(); append("done."); that.toast("field-bound predicate proven via wallet");
         });
       }).catch(function (e) { that.error(e); });
     },
 
-    // ---- wallet on-chain path: run the Lace flow IN-APP (no redirect) --------
+    // ---- wallet on-chain path: run the wallet flow IN-APP (no redirect) ------
     // Dynamic-imports the connector building blocks (Vite lib bundle at
-    // /connector/lib) and runs attest right here; Lace pops up over the cockpit.
-    // The passport payloadHash is attested on the demo AttestationVault.
+    // /connector/lib) and runs attest right here; the wallet pops up over the
+    // cockpit. The passport payloadHash is attested on the SAME AttestationVault
+    // the server anchors against, resolved from /runtime-config (a stale
+    // UI-baked address would sign into a vault verifyOnChain never reads).
 
-    _VAULT: "93f0c359aaaaedcf213f0945003e985f0045c12b8c46cba6d620ec6f9f6109b1",
+    _vault: function () {
+      if (!this._pVault) {
+        this._pVault = fetch("/api/v1/passport/runtime-config")
+          .then(function (r) { return r.json(); })
+          .then(function (cfg) {
+            if (!cfg || !cfg.contractAddress) {
+              throw new Error("server has no attestation vault configured (PASSPORT_CONTRACT_ADDRESS)");
+            }
+            return cfg.contractAddress;
+          });
+        // A failed fetch must not poison every later attempt.
+        var that = this;
+        this._pVault.catch(function () { that._pVault = null; });
+      }
+      return this._pVault;
+    },
 
     // Run a wallet flow in-app: open the log dialog, load the connector lib,
-    // connect Lace, then invoke fnRun(mod, api, append). Shared by attest / grant /
-    // revoke so Lace pops over the cockpit for each.
+    // connect the chosen wallet, then invoke fnRun(mod, api, append, vault).
+    // Shared by attest / grant / revoke so the wallet pops over the cockpit
+    // for each.
     _lace: async function (sTitle, fnRun) {
       var oWallet = new JSONModel({ title: sTitle, log: "", busy: false });
       this.getView().setModel(oWallet, "wallet");
@@ -511,11 +530,21 @@ sap.ui.define([
         append("loading connector library (first run downloads ~10MB WASM)…");
         var mod = await import("/connector/lib/nightpass-connector.js");
         var w = mod.listWallets();
-        if (!w.length) { append("No Midnight wallet found. Install and unlock Lace on Preview."); return; }
-        append("connecting " + w[0].name + ", approve the Lace popup…");
-        var api = await mod.connect(w[0].key);
-        await fnRun(mod, api, append);
-      } catch (e) { append("ERROR: " + ((e && (e.stack || e.message)) || e)); }
+        if (!w.length) {
+          append("No Midnight wallet found. Install a Midnight wallet, unlock it, and check its network.");
+          return;
+        }
+        var sVault = await this._vault();
+        // The picker always asks, even with a single wallet (see util/WalletPicker.js).
+        var sKey = await WalletPicker.choose(w);
+        var oChosen = w.filter(function (x) { return x.key === sKey; })[0] || { name: sKey };
+        append("connecting " + oChosen.name + ", approve the request in your wallet…");
+        var api = await mod.connect(sKey);
+        await fnRun(mod, api, append, sVault);
+      } catch (e) {
+        if (e && e.cancelled) { append("cancelled."); }
+        else { append("ERROR: " + ((e && (e.stack || e.message)) || e)); }
+      }
       finally { oWallet.setProperty("/busy", false); }
     },
 
@@ -536,18 +565,18 @@ sap.ui.define([
       // attest also anchors it; later field-bound proofs bind to this root.
       this.callAction("/passportFieldValue", { passportId: this._pid(), sourceField: "carbonFootprintKgCO2" }).then(function (res) {
         var contentRoot = (res && res.contentRoot) || "";
-        that._lace("Attest with Lace", async function (mod, api, append) {
+        that._lace("Attest with your wallet", async function (mod, api, append, vault) {
           append("attesting the passport hash on-chain (prove -> balance -> submit)…");
-          await mod.attest(api, { contractAddress: that._VAULT, payloadHash: ph, metadataHash: ph }, append);
+          await mod.attest(api, { contractAddress: vault, payloadHash: ph, metadataHash: ph }, append);
           var r = await that._resolveHash(mod, append);
           append("saving tx in cockpit…");
-          await that.callAction("/recordWalletAttest", { passportId: that._pid(), txHash: r.hash, identifier: r.id, contractAddress: that._VAULT });
+          await that.callAction("/recordWalletAttest", { passportId: that._pid(), txHash: r.hash, identifier: r.id, contractAddress: vault });
           if (contentRoot) {
             append("anchoring content root (binds passport fields for field-bound proofs)…");
-            await mod.anchorContentRoot(api, { contractAddress: that._VAULT, payloadHash: ph, contentRoot: contentRoot }, append);
+            await mod.anchorContentRoot(api, { contractAddress: vault, payloadHash: ph, contentRoot: contentRoot }, append);
             await that._resolveHash(mod, append);
           }
-          that._refreshAll(); append("done."); that.toast("attest via Lace saved");
+          that._refreshAll(); append("done."); that.toast("attest via wallet saved");
         });
       }).catch(function (e) { that.error(e); });
     },
@@ -557,15 +586,15 @@ sap.ui.define([
       if (!g) { return this.toast("select a partner"); }
       var lvl = parseInt(this.byId("grantLevel").getSelectedKey(), 10);
       var ph = this.getView().getBindingContext().getProperty("payloadHash") || "";
-      if (!ph) { return this.toast("attest the passport with Lace first"); }
+      if (!ph) { return this.toast("attest the passport with your wallet first"); }
       var that = this;
-      this._lace("Grant with Lace", async function (mod, api, append) {
+      this._lace("Grant with your wallet", async function (mod, api, append, vault) {
         append("granting disclosure level " + lvl + " on-chain…");
-        await mod.grantDisclosure(api, { contractAddress: that._VAULT, payloadHash: ph, grantee: g, level: lvl }, append);
+        await mod.grantDisclosure(api, { contractAddress: vault, payloadHash: ph, grantee: g, level: lvl }, append);
         var r = await that._resolveHash(mod, append);
         append("saving grant in cockpit…");
         await that.callAction("/recordWalletDisclosure", { passportId: that._pid(), grantee: g, level: lvl, op: "grant", txHash: r.hash });
-        that._refreshAll(); append("done."); that.toast("grant via Lace saved");
+        that._refreshAll(); append("done."); that.toast("grant via wallet saved");
       });
     },
 
@@ -573,15 +602,15 @@ sap.ui.define([
       var g = this.byId("granteePartner").getSelectedKey();
       if (!g) { return this.toast("select a partner"); }
       var ph = this.getView().getBindingContext().getProperty("payloadHash") || "";
-      if (!ph) { return this.toast("attest the passport with Lace first"); }
+      if (!ph) { return this.toast("attest the passport with your wallet first"); }
       var that = this;
-      this._lace("Revoke with Lace", async function (mod, api, append) {
+      this._lace("Revoke with your wallet", async function (mod, api, append, vault) {
         append("revoking disclosure on-chain…");
-        await mod.revokeDisclosure(api, { contractAddress: that._VAULT, payloadHash: ph, grantee: g }, append);
+        await mod.revokeDisclosure(api, { contractAddress: vault, payloadHash: ph, grantee: g }, append);
         var r = await that._resolveHash(mod, append);
         append("saving revoke in cockpit…");
         await that.callAction("/recordWalletDisclosure", { passportId: that._pid(), grantee: g, level: 0, op: "revoke", txHash: r.hash });
-        that._refreshAll(); append("done."); that.toast("revoke via Lace saved");
+        that._refreshAll(); append("done."); that.toast("revoke via wallet saved");
       });
     },
 
@@ -621,15 +650,15 @@ sap.ui.define([
       if (!sGrantee) { return this.toast("select the supplier partner"); }
       var lvl = parseInt(oShare.getProperty("/level"), 10);
       var ph = oShare.getProperty("/payloadHash") || "";
-      if (!ph) { return this.toast("attest the passport with Lace first"); }
+      if (!ph) { return this.toast("attest the passport with your wallet first"); }
       var that = this;
-      this._lace("Grant supplier with Lace", async function (mod, api, append) {
+      this._lace("Grant supplier with your wallet", async function (mod, api, append, vault) {
         append("granting disclosure level " + lvl + " on-chain…");
-        await mod.grantDisclosure(api, { contractAddress: that._VAULT, payloadHash: ph, grantee: sGrantee, level: lvl }, append);
+        await mod.grantDisclosure(api, { contractAddress: vault, payloadHash: ph, grantee: sGrantee, level: lvl }, append);
         var r = await that._resolveHash(mod, append);
         append("saving grant in cockpit…");
         await that.callAction("/recordWalletDisclosure", { passportId: that._pid(), grantee: sGrantee, level: lvl, op: "grant", txHash: r.hash });
-        that._refreshAll(); append("done."); that.toast("supplier granted via Lace");
+        that._refreshAll(); append("done."); that.toast("supplier granted via wallet");
       });
     },
 

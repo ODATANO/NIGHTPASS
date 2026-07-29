@@ -216,7 +216,11 @@ cds.on('bootstrap', (app: any) => {
             // network switch links.
             explorerLinks: explorerLinks(),
             surface,
-            viewerBase
+            viewerBase,
+            // The attestation vault the server anchors against. The cockpit's
+            // browser-wallet flow signs against the SAME vault, so it must come
+            // from here rather than a constant baked into the UI.
+            contractAddress: process.env.PASSPORT_CONTRACT_ADDRESS?.trim() || null
         });
     });
 

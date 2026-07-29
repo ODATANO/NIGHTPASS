@@ -13,7 +13,7 @@
         visible="{= ${session>/mode} === 'server' &amp;&amp; !!${session>/warmth/state} }"
         class="sapUiTinyMarginEnd"/>
       <ObjectStatus
-        text="{= (${session>/mode} === 'server' ? 'server wallet: ' : 'Lace: ') + ${session>/signerLabel} + ' · ' + ${session>/ownerShort} }"
+        text="{= (${session>/mode} === 'server' ? 'server wallet: ' : 'wallet: ') + ${session>/signerLabel} + ' · ' + ${session>/ownerShort} }"
         state="Success" visible="{session>/connected}"
         icon="{= ${session>/mode} === 'server' ? 'sap-icon://it-host' : 'sap-icon://wallet' }"/>
       <Button text="Switch wallet" icon="sap-icon://journey-change" press="onSwitchWallet" visible="{session>/connected}"/>

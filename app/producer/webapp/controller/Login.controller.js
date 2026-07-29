@@ -1,7 +1,8 @@
 sap.ui.define([
   "producer/controller/BaseController",
-  "sap/ui/model/json/JSONModel"
-], function (BaseController, JSONModel) {
+  "sap/ui/model/json/JSONModel",
+  "producer/util/WalletPicker"
+], function (BaseController, JSONModel, WalletPicker) {
   "use strict";
 
   /**
@@ -52,14 +53,24 @@ sap.ui.define([
         var mod = await import("/connector/lib/nightpass-connector.js");
         var aWallets = mod.listWallets();
         if (!aWallets.length) {
-          return this.error("No Midnight wallet found. Install and unlock Lace on this network.");
+          return this.error(
+            "No Midnight wallet found. Install a Midnight wallet (e.g. Lace), "
+            + "unlock it, and make sure it is on this network."
+          );
         }
-        var api = await mod.connect(aWallets[0].key);
+        // The picker always asks, even with a single wallet. Taking aWallets[0] made whichever
+        // extension registered first the only reachable one (see util/WalletPicker.js).
+        var sKey = await WalletPicker.choose(aWallets);
+        var oChosen = aWallets.filter(function (w) { return w.key === sKey; })[0] || { name: sKey };
+        var api = await mod.connect(sKey);
         var addrs = await api.getShieldedAddresses();
         var sOwner = (addrs && (addrs.shieldedAddress || addrs.shieldedCoinPublicKey)) || "";
         if (!sOwner) { return this.error("wallet returned no address"); }
-        this._enter("wallet", "", sOwner, "Lace");
+        // The signer label is the wallet that actually signed, not a hard-coded "Lace". The cockpit
+        // shows it in the header, and naming the wrong wallet there is worse than naming none.
+        this._enter("wallet", "", sOwner, oChosen.name || "wallet");
       } catch (e) {
+        if (e && e.cancelled) { return; } // user closed the picker; not an error
         this.error(e);
       } finally {
         this.setBusy(false);

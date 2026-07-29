@@ -37,7 +37,20 @@ sap.ui.define([
     setBusy: function (b) { this._session().setProperty("/busy", !!b); },
 
     toast: function (s) { MessageToast.show(s); },
-    error: function (e) { MessageBox.error(String((e && (e.message || e.error && e.error.message)) || e)); },
+    /**
+     * Show a failure to the user.
+     *
+     * The `info` branch is not decoration: DApp-Connector errors are specified as a plain
+     * `{ code, info }` object (CIP-30 lineage), so a wallet that rejects with the literal wire shape
+     * has no `message` at all and this used to render the useless "[object Object]". A wallet that
+     * rejects with a real Error is nicer to consume, but the cockpit cannot rely on every wallet
+     * doing so. Reading `info` costs one clause and covers both.
+     */
+    error: function (e) {
+      var sText = (e && (e.message || e.info || (e.error && e.error.message))) || "";
+      if (!sText && e && typeof e.code === "number") sText = "connector error " + e.code;
+      MessageBox.error(String(sText || e));
+    },
 
     /**
      * Invoke an unbound OData v4 action (e.g. "/createPassport") with parameters,
