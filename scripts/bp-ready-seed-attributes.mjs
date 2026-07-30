@@ -4,6 +4,11 @@
 // demo data consistent with the passport's typed fields; access classes come
 // from the official Battery Passport Data Attribute Longlist v1.2 (DIN DKE
 // SPEC 99100).
+// CAUTION: the upsert overwrites CURRENT attribute values without writing
+// PassportAttributeHistory rows. Re-running it on a passport that received
+// telemetry updates (updateDynamicAttributes) clobbers the live values while
+// the history keeps the telemetry trail; prefer the telemetry path for
+// passports that already have history.
 // Usage: node scripts/bp-ready-seed-attributes.mjs <passportId>
 import Database from 'better-sqlite3';
 import { randomUUID } from 'node:crypto';

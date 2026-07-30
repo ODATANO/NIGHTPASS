@@ -285,10 +285,64 @@ cds.on('bootstrap', (app: any) => {
             }
         });
 
+    // --- BMS telemetry ingest: POST /api/v1/passport/telemetry ---------------
+    // Inbound webhook for a battery management system (or any telemetry source)
+    // pushing dynamic SoH attribute updates. Same machine-auth pattern as the
+    // ERP webhook: HMAC over the raw body via TELEMETRY_WEBHOOK_SECRET, then
+    // the batch runs updateDynamicAttributes under the technical 'producer'
+    // principal. Body: { passportId, source?, updates: [{ attribute, value }] }
+    // with RAW values; the action encodes guide shapes and appends history.
+    // Deliberately NOT on the public-surface allowlists: telemetry ingest is a
+    // work-instance concern, public hosts 404 it by design. Concurrent batches
+    // for one passport can lose the history-version race and 4xx cleanly on
+    // the unique constraint; senders simply retry.
+    app.post('/api/v1/passport/telemetry',
+        express.raw({ type: 'application/json', limit: '256kb' }),
+        async (req: any, res: any) => {
+            const secret = process.env.TELEMETRY_WEBHOOK_SECRET;
+            if (!secret) return res.status(503).json({ error: 'telemetry ingest not configured (TELEMETRY_WEBHOOK_SECRET unset)' });
+
+            const raw: Buffer = Buffer.isBuffer(req.body) ? req.body : Buffer.from('');
+            const given = String(req.headers['x-bms-signature'] ?? '');
+            const expected = 'sha256=' + crypto.createHmac('sha256', secret).update(raw).digest('hex');
+            const a = Buffer.from(given), b = Buffer.from(expected);
+            if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+                return res.status(401).json({ error: 'invalid or missing x-bms-signature' });
+            }
+
+            let body: any;
+            try { body = JSON.parse(raw.toString('utf8')); }
+            catch { return res.status(400).json({ error: 'body is not JSON' }); }
+            const passportId = String(body?.passportId ?? '').trim();
+            if (!passportId) return res.status(400).json({ error: 'passportId is required' });
+            if (!Array.isArray(body?.updates) || !body.updates.length) {
+                return res.status(400).json({ error: 'updates must be a non-empty array of { attribute, value }' });
+            }
+
+            try {
+                const producer: any = await cds.connect.to('ProducerService');
+                // Same technical principal and managed-tx form as the ERP path
+                // (see the comment there); keeps session semantics identical.
+                const bmsUser = new (cds.User as any)({ id: 'producer', roles: ['producer'] });
+                const result = await (producer as any).tx({ user: bmsUser }, (tx: any) => tx.send('updateDynamicAttributes', {
+                    passportId,
+                    updatesJson: JSON.stringify(body.updates),
+                    source: typeof body.source === 'string' ? body.source : 'bms'
+                }));
+                cds.log('telemetry-ingest').info(`passport ${passportId}: ${result?.updated ?? 0} attribute(s) updated`);
+                return res.status(200).json(result);
+            } catch (e: any) {
+                const code = Number(e?.code);
+                const status = code >= 400 && code < 500 ? code : 500;
+                if (status === 500) cds.log('telemetry-ingest').error('ingest failed:', e?.message ?? e);
+                return res.status(status).json({ error: String(e?.message ?? e) });
+            }
+        });
+
     // --- Passport publish ingest: POST /api/v1/passport/ingest ---------------
     // A work instance PUSHES an anchored passport's public Point-1 fields here
     // after it is anchored (and validated). Bearer-secret gated (the payload is
-    // already public, so a shared secret is enough — no HMAC needed). Upsert by
+    // already public, so a shared secret is enough; no HMAC needed). Upsert by
     // passportId. Verification never trusts this: verifyOnChain re-reads the
     // chain. Runs on the public read surface so producers can publish to it.
     const INGEST_FIELDS = [
@@ -353,7 +407,16 @@ cds.on('bootstrap', (app: any) => {
         const payloadHash = String(req.params.payloadHash || '').replace(/^0x/, '').toLowerCase();
         if (!/^[0-9a-f]{64}$/.test(payloadHash)) return res.status(400).end('invalid payloadHash');
         try {
-            const row: any = await SELECT.one.from('passport.Passports').columns('passportId').where({ payloadHash });
+            let row: any = await SELECT.one.from('passport.Passports').columns('passportId').where({ payloadHash });
+            if (!row) {
+                // Superseded anchor version (re-anchoring): the old hash still
+                // resolves to its passport; the viewer shows the current state.
+                const version: any = await SELECT.one.from('passport.PassportAnchorVersions')
+                    .columns('passport_ID').where({ payloadHash });
+                if (version?.passport_ID) {
+                    row = await SELECT.one.from('passport.Passports').columns('passportId').where({ ID: version.passport_ID });
+                }
+            }
             if (!row) return res.status(404).end('no battery for that payloadHash');
             const tier = tierFromAuth(req.headers.authorization);
             const hash = tier === 'consumer' ? '' : `#/${tier}`;

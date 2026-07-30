@@ -200,7 +200,9 @@ export default class PassportService extends cds.ApplicationService {
         this.on('passportCredential', this.passportCredential);
         this.on('registerPartner', this.registerPartner);
         this.on('verifyOnChain', this.verifyOnChain);
+        this.on('verifyAnchorVersion', this.verifyAnchorVersion);
         this.on('verifyClaimOnChain', this.verifyClaimOnChain);
+        this.on('anchorHistory', this.anchorHistory);
         this.on('anchorExplorer', this.anchorExplorer);
 
         // Disclosure-tier gating: redact restricted fields per requester
@@ -353,9 +355,24 @@ export default class PassportService extends cds.ApplicationService {
     private resolveByHash = async (req: cds.Request) => {
         const raw = String((req.data as { payloadHash?: string }).payloadHash ?? '').replace(/^0x/, '').toLowerCase();
         if (!/^[0-9a-f]{64}$/.test(raw)) return req.reject(400, 'payloadHash must be 32-byte hex');
-        const row = await SELECT.one.from(Passports)
+        let row = await SELECT.one.from(Passports)
             .columns('passportId', 'manufacturerId', 'model', 'batteryCategory', 'contractAddress', 'attestationTxHash', 'status', 'payloadHash')
             .where({ payloadHash: raw });
+        // A superseded anchor version (re-anchoring) still resolves: the hash
+        // identifies the passport, `version` tells the caller it is historical.
+        let resolvedVersion: number | null = null;
+        if (!row) {
+            const v: any = await SELECT.one.from('passport.PassportAnchorVersions')
+                .columns('passport_ID', 'version', 'attestationTxHash')
+                .where({ payloadHash: raw });
+            if (v?.passport_ID) {
+                resolvedVersion = Number(v.version);
+                row = await SELECT.one.from(Passports)
+                    .columns('passportId', 'manufacturerId', 'model', 'batteryCategory', 'contractAddress', 'status', 'payloadHash')
+                    .where({ ID: v.passport_ID });
+                if (row) (row as any).attestationTxHash = v.attestationTxHash;
+            }
+        }
         if (!row) return req.reject(404, 'no battery for that payloadHash');
         const demoHost = process.env.PASSPORT_DEMO_HOST ?? 'https://passport.example';
         return {
@@ -370,7 +387,8 @@ export default class PassportService extends cds.ApplicationService {
             // DB-state assertion only (anchored + tx present); NOT a live on-chain
             // re-verification. A verifier resolves attestationTxHash to confirm.
             locallyAnchored: row.status === 'anchored' && !!row.attestationTxHash,
-            viewerUrl: `${demoHost}/resolve/${raw}`
+            viewerUrl: `${demoHost}/resolve/${raw}`,
+            version: resolvedVersion
         };
     };
 
@@ -461,6 +479,107 @@ export default class PassportService extends cds.ApplicationService {
     };
 
     /**
+     * Live verification of a superseded anchor version: same vault read as
+     * verifyOnChain, but against the archived version's payload hash. No peer
+     * delegation here; a cross-network row without the plugin network override
+     * honestly reports checkedNetwork:null.
+     */
+    private verifyAnchorVersion = async (req: cds.Request) => {
+        const { passportId: pidRaw, version } = req.data as { passportId?: string; version?: number };
+        const passportId = String(pidRaw ?? '').trim();
+        if (!passportId) return req.reject(400, 'passportId is required');
+        if (version == null || !Number.isInteger(Number(version))) return req.reject(400, 'version is required');
+        const row: any = await SELECT.one.from(Passports).columns('ID', 'passportId').where({ passportId });
+        if (!row) return req.reject(404, `passport '${passportId}' not found`);
+        const v: any = await SELECT.one.from('passport.PassportAnchorVersions')
+            .columns('version', 'payloadHash', 'contractAddress', 'anchorNetwork', 'attestationTxHash')
+            .where({ passport_ID: row.ID, version: Number(version) });
+        if (!v) return req.reject(404, `passport '${passportId}' has no anchor version ${version}`);
+
+        const norm = (h: unknown) => String(h ?? '').replace(/^0x/, '').toLowerCase();
+        const payloadHash = norm(v.payloadHash);
+        const contractAddress = norm(v.contractAddress);
+        const serverNetwork = effectiveNetwork();
+        const anchorNetwork = (v.anchorNetwork as string | null) ?? null;
+        const crossNetwork = !!anchorNetwork && anchorNetwork !== serverNetwork;
+        const canOverride = !!(cds.model?.definitions?.['NightgateService.verifyAttestationState'] as any)?.params?.network;
+
+        let verified = false;
+        let checkedNetwork: string | null = null;
+        if (payloadHash && contractAddress && (!crossNetwork || canOverride)) {
+            checkedNetwork = crossNetwork ? anchorNetwork : serverNetwork;
+            try {
+                const nightgate = await cds.connect.to('NightgateService');
+                const verifier = new (cds.User as any)({ id: 'passport-verifier' });
+                const res: any = await (nightgate as any).tx({ user: verifier }, (tx: any) =>
+                    tx.send('verifyAttestationState', {
+                        contractAddress,
+                        payloadHash,
+                        compiledArtifactRef: 'attestation-vault',
+                        ...(crossNetwork ? { network: anchorNetwork } : {})
+                    }));
+                verified = res?.verified === true;
+            } catch { /* indexer unreachable or contract unknown: stay unverified */ }
+        }
+        return {
+            passportId: row.passportId,
+            version: Number(v.version),
+            verified,
+            payloadHash: payloadHash || null,
+            contractAddress: contractAddress || null,
+            anchorNetwork,
+            serverNetwork,
+            checkedNetwork,
+            attestationTxHash: v.attestationTxHash ?? null,
+            explorerUrl: explorerTxUrl(v.attestationTxHash, anchorNetwork),
+            checkedAt: new Date().toISOString()
+        };
+    };
+
+    /**
+     * Anchor version history (anonymous; only anchor metadata that already
+     * lives on-chain, never the ciphers). Superseded versions first, then the
+     * current anchor as the last entry.
+     */
+    private anchorHistory = async (req: cds.Request) => {
+        const passportId = String((req.data as { passportId?: string }).passportId ?? '').trim();
+        if (!passportId) return req.reject(400, 'passportId is required');
+        const row: any = await SELECT.one.from(Passports)
+            .columns('ID', 'payloadHash', 'contractAddress', 'anchorNetwork', 'attestationTxHash', 'status')
+            .where({ passportId });
+        if (!row) return req.reject(404, `passport '${passportId}' not found`);
+        const versions: any[] = await SELECT.from('passport.PassportAnchorVersions')
+            .columns('version', 'payloadHash', 'contractAddress', 'anchorNetwork', 'attestationTxHash', 'anchoredAt', 'reason')
+            .where({ passport_ID: row.ID })
+            .orderBy('version' as any);
+        const out = (versions ?? []).map((v) => ({
+            version: Number(v.version),
+            current: false,
+            payloadHash: v.payloadHash ?? null,
+            contractAddress: v.contractAddress ?? null,
+            anchorNetwork: v.anchorNetwork ?? null,
+            attestationTxHash: v.attestationTxHash ?? null,
+            explorerUrl: explorerTxUrl(v.attestationTxHash, v.anchorNetwork ?? null),
+            anchoredAt: v.anchoredAt ? new Date(v.anchoredAt).toISOString() : null,
+            reason: v.reason ?? null
+        }));
+        if (row.status === 'anchored' || row.status === 'anchoring') {
+            out.push({
+                version: out.length ? out[out.length - 1].version + 1 : 1,
+                current: true,
+                payloadHash: row.payloadHash ?? null,
+                contractAddress: row.contractAddress ?? null,
+                anchorNetwork: row.anchorNetwork ?? null,
+                attestationTxHash: row.attestationTxHash ?? null,
+                explorerUrl: explorerTxUrl(row.attestationTxHash, row.anchorNetwork ?? null),
+                anchoredAt: null,
+                reason: null
+            });
+        }
+        return out;
+    };
+
+    /**
      * Public anchor explorer: all passports with their anchoring state, anchored
      * first, newest first within a status. DB-only (no ledger reads here); the
      * UI verifies rows live via verifyOnChain on demand.
@@ -483,36 +602,57 @@ export default class PassportService extends cds.ApplicationService {
         if (!sourceField) return req.reject(400, 'sourceField is required');
         const pred = predicate === 'greaterOrEqual' ? 'greaterOrEqual' : 'lessOrEqual';
         const row = await SELECT.one.from(Passports)
-            .columns('passportId', 'payloadHash', 'contractAddress', 'anchorNetwork', 'status')
+            .columns('ID', 'passportId', 'payloadHash', 'contractAddress', 'anchorNetwork', 'status')
             .where({ passportId: pid });
         if (!row) return req.reject(404, `passport '${pid}' not found`);
 
         const norm = (h: unknown) => String(h ?? '').replace(/^0x/, '').toLowerCase();
-        const payloadHash = norm(row.payloadHash);
         const contractAddress = norm(row.contractAddress);
         const serverNetwork = effectiveNetwork();
         const anchorNetwork = (row as Record<string, unknown>).anchorNetwork as string | null ?? null;
         const crossNetwork = !!anchorNetwork && anchorNetwork !== serverNetwork;
         const canOverride = !!(cds.model?.definitions?.['NightgateService.verifyPredicateState'] as any)?.params?.network;
 
+        // On-chain claim keys embed the payload hash of the version the claim
+        // was proven under. Prefer the stamped hash from the proof log row;
+        // pre-feature rows (no stamp) probe the current hash and then the
+        // superseded versions (newest first, capped) so old claims still
+        // verify after a re-anchor.
+        const thresholdScaled = Math.round(Number(threshold ?? 0) * 1000);
+        const proofRow: any = await SELECT.one.from(PredicateProofLog)
+            .columns('payloadHash')
+            .where({ passport_ID: (row as any).ID, sourceField: String(sourceField), predicate: pred, threshold: thresholdScaled, status: 'succeeded', result: true })
+            .orderBy('createdAt desc' as any);
+        let candidates: string[];
+        if (proofRow?.payloadHash) {
+            candidates = [norm(proofRow.payloadHash)];
+        } else {
+            const versions: any[] = await SELECT.from('passport.PassportAnchorVersions')
+                .columns('payloadHash').where({ passport_ID: (row as any).ID }).orderBy('version desc' as any);
+            candidates = [...new Set([norm(row.payloadHash), ...(versions ?? []).map((v) => norm(v.payloadHash))])]
+                .filter(Boolean).slice(0, 5);
+        }
+
         let verified = false;
         let checkedNetwork: string | null = null;
-        if (payloadHash && contractAddress && (!crossNetwork || canOverride)) {
+        if (candidates.length && contractAddress && (!crossNetwork || canOverride)) {
             checkedNetwork = crossNetwork ? anchorNetwork : serverNetwork;
             try {
                 const nightgate = await cds.connect.to('NightgateService');
                 const verifier = new (cds.User as any)({ id: 'passport-verifier' });
-                const res: any = await (nightgate as any).tx({ user: verifier }, (tx: any) =>
-                    tx.send('verifyPredicateState', {
-                        contractAddress,
-                        payloadHash,
-                        fieldKey: fieldKeyHex(String(sourceField)),
-                        predicate: pred,
-                        threshold: Math.round(Number(threshold ?? 0) * 1000),
-                        compiledArtifactRef: 'attestation-vault',
-                        ...(crossNetwork ? { network: anchorNetwork } : {})
-                    }));
-                verified = res?.verified === true;
+                for (const candidateHash of candidates) {
+                    const res: any = await (nightgate as any).tx({ user: verifier }, (tx: any) =>
+                        tx.send('verifyPredicateState', {
+                            contractAddress,
+                            payloadHash: candidateHash,
+                            fieldKey: fieldKeyHex(String(sourceField)),
+                            predicate: pred,
+                            threshold: thresholdScaled,
+                            compiledArtifactRef: 'attestation-vault',
+                            ...(crossNetwork ? { network: anchorNetwork } : {})
+                        }));
+                    if (res?.verified === true) { verified = true; break; }
+                }
             } catch { /* indexer unreachable or contract unknown: stay unverified */ }
         }
         return {

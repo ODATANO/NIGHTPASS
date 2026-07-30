@@ -54,9 +54,17 @@ const pct = (v) => ({ percentageValue: Number(v), percent: '%' });
 const shareByMaterial = {};
 for (const r of recycled) shareByMaterial[r.material] = r.recycledPercentage;
 
+// DPP status follows the battery lifecycle (sync with srv/lib/guide-document.ts
+// + srv/lib/battery-lifecycle.ts): waste -> Archived, everything else Active.
+function batteryStatusOf(rows) {
+  const row = rows.find((r) => r.attribute === 'BatteryStatus');
+  try { return JSON.parse(row?.valueJson ?? '')?.batteryStatusValues ?? 'original'; }
+  catch { return 'original'; }
+}
+
 const identifiers = {
   DPPSchemaVersion: '1.0.0',
-  DPPStatus: { dppStatusValue: 'Active' },
+  DPPStatus: { dppStatusValue: batteryStatusOf(kvAttrs) === 'waste' ? 'Archived' : 'Active' },
   DPPGranularity: 'BatteryUnit',
   'Date-timeOfLatestUpdateOfDPP': new Date(p.modifiedAt).toISOString().replace(/\.\d{3}Z$/, 'Z'),
   BatteryModelIdentifier: p.model,

@@ -38,7 +38,7 @@ type PassportStatus : String enum {
 
 /** On-chain step kinds tracked in PassportTransactions (transaction overview). */
 type TxKind : String enum {
-    attest; bindPassport; grantDisclosure; revokeDisclosure; commitValue; provePredicate; deploy; anchorDoc;
+    attest; bindPassport; grantDisclosure; revokeDisclosure; commitValue; provePredicate; deploy; anchorDoc; registerPassport;
 }
 
 /** Status of a tracked on-chain step / log row. `offline` = no session, never submitted. */
@@ -133,6 +133,27 @@ entity PassportAttributes : cuid {
 }
 
 /**
+ * Append-only version history of dynamic (telemetry / SoH) attribute values.
+ * One row per value version of a (passport, attribute); version 0 is the
+ * creation-time baseline snapshot written lazily on the first update. The
+ * current value stays in PassportAttributes (updated in place); this table
+ * answers "what was the value at date X". Telemetry updates do NOT change
+ * payloadHash or re-anchor: the anchor covers the creation-time snapshot
+ * (re-anchoring policy is a separate concern, roadmap task 1.2).
+ */
+@assert.unique: { rev: [ passport, attribute, version ] }
+entity PassportAttributeHistory : cuid, managed {
+    passport    : Association to Passports;
+    section     : String(80);
+    attribute   : String(200);
+    valueJson   : LargeString;
+    accessClass : AttributeAccessClass;
+    version     : Integer;      // 0 = baseline (value at passport creation)
+    validFrom   : Timestamp;    // server receipt time this value became current
+    source      : String(40);   // 'baseline' | 'bms' | 'api' | 'lifecycle'
+}
+
+/**
  * Versioned DPP documents held by the BatteryPass-Ready conformance surface
  * (DPP Life Cycle API, srv/lib/dpp-api.ts; mounted only with
  * DPP_API_ENABLED=true). One row per document VERSION; the highest version of
@@ -212,6 +233,30 @@ entity DiligenceDoc : cuid {
 }
 
 /**
+ * Superseded on-chain anchor versions of a passport (re-anchoring policy).
+ * One row per PREVIOUS anchor: when reanchorPassport commits a new
+ * payloadHash, the current anchor (hash, cipher, content root, tx) is
+ * snapshotted here before the row moves on. The vault keeps every attested
+ * hash forever, so each version stays independently verifiable via
+ * verifyAttestationState(payloadHash). The old payloadCipher moves into the
+ * version row, so the exact canonical payload of that version remains
+ * decryptable by a key holder.
+ */
+@assert.unique: { rev: [ passport, version ] }
+entity PassportAnchorVersions : cuid, managed {
+    passport          : Association to Passports;
+    version           : Integer;             // 1 = first anchor; the live row is always version max+1
+    payloadHash       : String(64);
+    payloadCipher     : LargeBinary;         // canonical payload of THIS version, AES-encrypted
+    contentRoot       : String(64);
+    contractAddress   : String(120);
+    anchorNetwork     : String(20);
+    attestationTxHash : String(120);
+    anchoredAt        : Timestamp;           // when THIS version was anchored (best effort)
+    reason            : String(40);          // why this version was SUPERSEDED: status-change | batch-telemetry | data-correction
+}
+
+/**
  * Per-passport on-chain transaction overview (producer cockpit). One row per
  * submitted step (attest, bindPassport, grant/revoke, commit/prove). `offline`
  * status = created without a signing session (no tx). Feeds the Transactions tab.
@@ -257,4 +302,9 @@ entity PredicateProofLog : cuid, managed {
     txHash                 : String(120);
     status                 : TxStatus default #offline;
     result                 : Boolean;        // proven true (tx SUCCESS); value stays hidden
+    // The payloadHash the claim was proven under. On-chain claim keys embed the
+    // payload hash, so after a re-anchor an old claim only verifies against ITS
+    // version's hash, not the row's current one. Null on rows from before the
+    // re-anchoring feature; verification then falls back to probing versions.
+    payloadHash            : String(64);
 }

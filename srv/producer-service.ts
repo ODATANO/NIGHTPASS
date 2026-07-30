@@ -1,7 +1,8 @@
 import cds from '@sap/cds';
 import {
     Passports, Batteries, RecycledMaterials, DiligenceDoc,
-    PassportTransactions, DisclosureGrantLog, PredicateProofLog
+    PassportTransactions, DisclosureGrantLog, PredicateProofLog,
+    PassportAttributes, PassportAttributeHistory, PassportAnchorVersions
 } from '#cds-models/passport';
 import {
     hashPayload, blake2b256Hex, encryptPayload, anchorPassport, waitForJob, waitForJobResult,
@@ -10,6 +11,9 @@ import {
     effectiveNetwork, explorerTxUrl
 } from './lib/passport-anchor';
 import { defaultGuideAttributes, hashableAttributes } from './lib/guide-attribute-defaults';
+import { DYNAMIC_ATTRIBUTES, encodeDynamicValue, dedupeUpdates, type DynamicUpdate } from './lib/attribute-update';
+import { payloadFromDb, readPayloadInputs } from './lib/passport-payload';
+import { validateTransition, parseBatteryStatus, encodeBatteryStatus, type BatteryStatus } from './lib/battery-lifecycle';
 import { validateDiligenceUpload, decodeUpload, sha256Hex } from './lib/diligence-upload';
 import { listProducerWallets, producerWalletSecrets, feeSponsorWalletId, feeSponsorWalletIds } from './lib/producer-wallets';
 import { verifyContractTx, type ChainVerdict } from './lib/chain-verify';
@@ -101,6 +105,11 @@ export default class ProducerService extends cds.ApplicationService {
         this.on('provePassportValue', this.provePassportValue);
         this.on('uploadDiligenceDoc', this.uploadDiligenceDoc);
         this.on('diligenceFile', this.diligenceFile);
+        this.on('updateDynamicAttributes', this.updateDynamicAttributes);
+        this.on('reanchorPassport', this.reanchorPassport);
+        this.on('passportDrift', this.passportDrift);
+        this.on('changeBatteryStatus', this.changeBatteryStatus);
+        this.on('transferPassportOperator', this.transferPassportOperator);
         return super.init();
     }
 
@@ -807,7 +816,7 @@ export default class ProducerService extends cds.ApplicationService {
         if (result === false) {
             await INSERT.into(PredicateProofLog).entries({
                 ID: proofLogId, passport_ID: row.ID, sourceField, predicate: pred, threshold: Number(threshold ?? 0),
-                unit, txHash: hash || null, status: 'failed', result: false
+                unit, txHash: hash || null, status: 'failed', result: false, payloadHash: row.payloadHash ?? null
             } as any);
             await INSERT.into(PassportTransactions).entries({
                 ID: txRowId, passport_ID: row.ID, kind: 'provePredicate', txHash: hash || null,
@@ -818,7 +827,7 @@ export default class ProducerService extends cds.ApplicationService {
 
         await INSERT.into(PredicateProofLog).entries({
             ID: proofLogId, passport_ID: row.ID, sourceField, predicate: pred, threshold: Number(threshold ?? 0),
-            unit, txHash: hash || null, status: 'pending', result: true
+            unit, txHash: hash || null, status: 'pending', result: true, payloadHash: row.payloadHash ?? null
         } as any);
         await INSERT.into(PassportTransactions).entries({
             ID: txRowId, passport_ID: row.ID, kind: 'provePredicate', txHash: hash || null,
@@ -1143,7 +1152,7 @@ export default class ProducerService extends cds.ApplicationService {
         if (!session || !contractAddress) {
             await INSERT.into(PredicateProofLog).entries({
                 passport_ID: row.ID, sourceField: field, predicate: pred,
-                threshold: thresholdScaled, unit: useUnit, status: 'offline'
+                threshold: thresholdScaled, unit: useUnit, status: 'offline', payloadHash: row.payloadHash ?? null
             } as any);
             return { mode: 'offline', txHash: '', predicateAttestationId: '', result: null };
         }
@@ -1162,7 +1171,7 @@ export default class ProducerService extends cds.ApplicationService {
         const proofLogId = cds.utils.uuid();
         await INSERT.into(PredicateProofLog).entries({
             ID: proofLogId, passport_ID: row.ID, sourceField: field, predicate: pred,
-            threshold: thresholdScaled, unit: useUnit, status: 'pending'
+            threshold: thresholdScaled, unit: useUnit, status: 'pending', payloadHash: row.payloadHash ?? null
         } as any);
         // The proof circuit binds against the root in the LEDGER; the worker
         // only (idempotently) re-anchors when `contentRoot` is supplied. Our
@@ -1366,6 +1375,455 @@ export default class ProducerService extends cds.ApplicationService {
             contentBase64: buf.toString('base64')
         };
     };
+
+    /**
+     * Re-anchor a passport onto a freshly computed payload hash (re-anchoring
+     * policy). The current anchor is archived as a PassportAnchorVersions row
+     * (including its cipher, so the old canonical payload stays decryptable),
+     * the row moves to the new hash + cipher, and the standard anchorRow flow
+     * runs the on-chain leg (attest of the new hash + bindPassport RE-BIND of
+     * the same passportIdHash + fresh content root, one batched tx, detached).
+     * The vault allows the re-bind only for the attester holding the current
+     * binding, so this MUST run with the same wallet that anchored before; a
+     * foreign wallet fails on-chain with a clean 'failed' status.
+     */
+    private reanchorPassport = async (req: cds.Request) => {
+        const { passportId, reason, sessionId, walletId, sponsorWalletId } = req.data as {
+            passportId?: string; reason?: string; sessionId?: string; walletId?: string; sponsorWalletId?: string;
+        };
+        const pid = String(passportId ?? '').trim();
+        if (!pid) return req.reject(400, 'passportId is required');
+        const REASONS = ['status-change', 'batch-telemetry', 'data-correction'];
+        const why = REASONS.includes(String(reason)) ? String(reason) : 'data-correction';
+
+        const row: any = await SELECT.one.from(Passports)
+            .columns('ID', 'passportId', 'owner', 'payloadHash', 'payloadCipher', 'passportIdHash',
+                'contractAddress', 'anchorNetwork', 'attestationTxHash', 'status')
+            .where({ passportId: pid });
+        if (!row) return req.reject(404, `passport '${pid}' not found`);
+
+        const versionRows: any[] = await SELECT.from(PassportAnchorVersions)
+            .columns('version').where({ passport_ID: row.ID });
+        let maxVersion = 0;
+        for (const v of versionRows ?? []) maxVersion = Math.max(maxVersion, Number(v.version ?? 0));
+
+        if (row.status !== 'anchored' && !(row.status === 'failed' && maxVersion > 0)) {
+            return req.reject(400,
+                `passport '${pid}' is '${row.status}'; re-anchoring needs an anchored passport ` +
+                `(drafts and first-anchor failures go through submitPassport)`);
+        }
+        const contractAddress = this.contractAddress() ?? row.contractAddress;
+        const session = await this.effectiveSession(sessionId, walletId);
+        if (!session || !contractAddress) {
+            return req.reject(400, 're-anchoring is an on-chain operation; no signing session / PASSPORT_CONTRACT_ADDRESS available');
+        }
+        this.assertWalletOwnsPassport(req, row, walletId);
+
+        const core = await this.reanchorCore(req, row, why, session, contractAddress, sponsorWalletId);
+        return { passportId: pid, ...core };
+    };
+
+    /**
+     * Best-effort authorization for content-changing on-chain operations: when
+     * the passport carries an owner (shielded address) and a SERVER wallet is
+     * chosen, that wallet's registry owner must match. Catches wrong-wallet
+     * mistakes early with a clean 403; the hard enforcement stays on-chain
+     * (only the attester holding the current binding can re-bind).
+     */
+    private assertWalletOwnsPassport(req: cds.Request, row: { owner?: string | null; passportId?: string }, walletId?: string): void {
+        const owner = String(row.owner ?? '').trim();
+        if (!owner) return;
+        const wallet = listProducerWallets().find((w) => w.id === (walletId?.trim() || 'default'));
+        if (!wallet?.owner) return;
+        if (wallet.owner !== owner) {
+            req.reject(403, `wallet '${wallet.id}' does not own passport '${row.passportId}' (owner scope mismatch)`);
+        }
+    }
+
+    /**
+     * Shared re-anchor core (used by reanchorPassport and changeBatteryStatus):
+     * recompute the v2 payload from the CURRENT database state, archive the
+     * live anchor as a version row, move the row onto the new hash + cipher,
+     * and run the standard anchorRow flow. Caller has already validated row
+     * eligibility, session, contract, and ownership.
+     */
+    private async reanchorCore(
+        req: cds.Request, row: any, why: string,
+        session: string, contractAddress: string, sponsorWalletId?: string
+    ) {
+        const pid = String(row.passportId);
+        const versionRows: any[] = await SELECT.from(PassportAnchorVersions)
+            .columns('version').where({ passport_ID: row.ID });
+        let maxVersion = 0;
+        for (const v of versionRows ?? []) maxVersion = Math.max(maxVersion, Number(v.version ?? 0));
+
+        const inputs = await readPayloadInputs(String(row.ID));
+        const { canonicalPayload, payloadHash: newHash } = hashPayload(payloadFromDb(inputs));
+
+        let archivedVersion = 0;
+        if (row.status === 'anchored') {
+            if (newHash === row.payloadHash) return req.reject(400, `content of '${pid}' is unchanged since its last anchor`);
+            // Archive the live anchor before the row moves on. anchoredAt is
+            // best effort from the newest succeeded attest step.
+            const lastAttest: any = await SELECT.one.from(PassportTransactions)
+                .columns('createdAt').where({ passport_ID: row.ID, kind: 'attest', status: 'succeeded' })
+                .orderBy('createdAt desc' as any);
+            archivedVersion = maxVersion + 1;
+            await INSERT.into(PassportAnchorVersions).entries({
+                passport_ID: row.ID, version: archivedVersion,
+                payloadHash: row.payloadHash, payloadCipher: row.payloadCipher,
+                contractAddress: row.contractAddress, anchorNetwork: row.anchorNetwork,
+                attestationTxHash: row.attestationTxHash,
+                anchoredAt: lastAttest?.createdAt ?? null, reason: why
+            } as any);
+        }
+        // Failed re-anchor retry: the row already carries the (never-anchored)
+        // new hash; recompute may match it, which is fine, we just anchor again.
+        if (newHash !== row.payloadHash) {
+            const payloadCipher = encryptPayload(canonicalPayload, pid);
+            await UPDATE.entity(Passports).set({ payloadHash: newHash, payloadCipher: payloadCipher as any }).where({ ID: row.ID });
+        }
+
+        // Active local grants: on-chain disclosure grants are keyed by payload
+        // hash, so they do NOT carry over to the new version. The operator
+        // decides which to re-issue (no silent chain spend here).
+        const grantRows: any[] = await SELECT.from(DisclosureGrantLog)
+            .columns('grantee', 'level', 'op', 'createdAt')
+            .where({ passport_ID: row.ID, status: { in: ['succeeded', 'pending'] } })
+            .orderBy('createdAt' as any);
+        const latestByGrantee = new Map<string, { grantee: string; level: number; op: string }>();
+        for (const g of grantRows ?? []) latestByGrantee.set(String(g.grantee), { grantee: String(g.grantee), level: Number(g.level ?? 0), op: String(g.op) });
+        const grantsToRegrant = [...latestByGrantee.values()]
+            .filter((g) => g.op === 'grant')
+            .map(({ grantee, level }) => ({ grantee, level }));
+
+        const r = await this.anchorRow(req, String(row.ID), pid, newHash, String(row.passportIdHash), contractAddress, session, true, sponsorWalletId);
+        return {
+            archivedVersion,
+            payloadHash: newHash, previousPayloadHash: String(row.payloadHash ?? ''),
+            contentRoot: (r as any).contentRoot ?? '', mode: (r as any).mode ?? 'anchoring',
+            grantsToRegrant
+        };
+    }
+
+    /**
+     * Battery status lifecycle transition. The ONLY write path for the
+     * BatteryStatus attribute row (excluded from the telemetry allowlist).
+     * Always writes locally first (row + lifecycle history + modifiedAt);
+     * anchored passports with a signing session re-anchor immediately with
+     * reason 'status-change' (policy). Without a session the change lands as
+     * drift and the next re-anchor (manual or batch) commits it on-chain.
+     */
+    private changeBatteryStatus = async (req: cds.Request) => {
+        const { passportId, newStatus, sessionId, walletId, sponsorWalletId } = req.data as {
+            passportId?: string; newStatus?: string; sessionId?: string; walletId?: string; sponsorWalletId?: string;
+        };
+        const pid = String(passportId ?? '').trim();
+        if (!pid) return req.reject(400, 'passportId is required');
+
+        const row: any = await SELECT.one.from(Passports)
+            .columns('ID', 'passportId', 'owner', 'payloadHash', 'payloadCipher', 'passportIdHash',
+                'contractAddress', 'anchorNetwork', 'attestationTxHash', 'status', 'createdAt')
+            .where({ passportId: pid });
+        if (!row) return req.reject(404, `passport '${pid}' not found`);
+
+        const statusRow: any = await SELECT.one.from(PassportAttributes)
+            .columns('ID', 'section', 'attribute', 'valueJson', 'accessClass')
+            .where({ passport_ID: row.ID, attribute: 'BatteryStatus' });
+        if (!statusRow) return req.reject(404, `passport '${pid}' has no BatteryStatus attribute row`);
+
+        const previousStatus = parseBatteryStatus(statusRow.valueJson);
+        const check = validateTransition(previousStatus, newStatus);
+        if (!check.ok) return req.reject(400, check.error);
+        this.assertWalletOwnsPassport(req, row, walletId);
+
+        await this.writeAttributeVersions(row, [
+            { row: statusRow, valueJson: encodeBatteryStatus(newStatus as BatteryStatus) }
+        ], 'lifecycle');
+
+        // Draft passports just carry the new status into their eventual first
+        // anchor; anchored ones re-anchor now (or drift until the next one).
+        if (row.status !== 'anchored') {
+            return { passportId: pid, previousStatus, newStatus, mode: 'draft', archivedVersion: 0, payloadHash: '', grantsToRegrant: [] };
+        }
+        const contractAddress = this.contractAddress() ?? row.contractAddress;
+        const session = await this.effectiveSession(sessionId, walletId);
+        if (!session || !contractAddress) {
+            cds.log('producer').warn(`status change of '${pid}' recorded WITHOUT re-anchor (no session/contract); content is now drifted`);
+            return { passportId: pid, previousStatus, newStatus, mode: 'offline', archivedVersion: 0, payloadHash: '', grantsToRegrant: [] };
+        }
+        const core = await this.reanchorCore(req, row, 'status-change', session, contractAddress, sponsorWalletId);
+        return {
+            passportId: pid, previousStatus, newStatus,
+            mode: (core as any).mode, archivedVersion: (core as any).archivedVersion,
+            payloadHash: (core as any).payloadHash, grantsToRegrant: (core as any).grantsToRegrant
+        };
+    };
+
+    /** walletId -> derived attesterId; deriveWalletInfo shares the rate-limited
+     *  secret path with session opening, so each id is derived at most once. */
+    private attesterIdCache = new Map<string, string>();
+
+    /**
+     * The attester identity of a registry wallet (registerPassport's ownerId):
+     * env cache (PRODUCER_<ID>_ATTESTER_ID) first, then a one-time
+     * deriveWalletInfo call memoized for the process lifetime.
+     */
+    private async attesterIdFor(req: cds.Request, walletId: string): Promise<string> {
+        const secrets = producerWalletSecrets(walletId);
+        if (!secrets) { req.reject(400, `unknown or secret-less target wallet '${walletId}'`); return ''; }
+        if (secrets.attesterId) return secrets.attesterId;
+        const cached = this.attesterIdCache.get(secrets.id);
+        if (cached) return cached;
+        const nightgate = await cds.connect.to('NightgateService');
+        const info: any = await (nightgate as any).send('deriveWalletInfo', { mnemonic: secrets.mnemonic });
+        const attesterId = String(info?.attesterId ?? '');
+        if (!/^[0-9a-f]{64}$/i.test(attesterId)) {
+            req.reject(502, `deriveWalletInfo returned no attesterId for wallet '${secrets.id}' (NIGHTGATE >= 0.10.1 required)`);
+            return '';
+        }
+        this.attesterIdCache.set(secrets.id, attesterId);
+        return attesterId;
+    }
+
+    /**
+     * Operator handover: on-chain registrar re-registration of the passport id
+     * to the new operator's attester identity, then the local owner flip. See
+     * producer-service.cds for the contract; the old operator loses the
+     * in-circuit bind right the moment the registration lands, and the server
+     * side owner guard the moment the owner flips.
+     */
+    private transferPassportOperator = async (req: cds.Request) => {
+        const { passportId, newWalletId, sponsorWalletId } = req.data as {
+            passportId?: string; newWalletId?: string; sponsorWalletId?: string;
+        };
+        const pid = String(passportId ?? '').trim();
+        if (!pid) return req.reject(400, 'passportId is required');
+        const targetId = String(newWalletId ?? '').trim();
+        if (!targetId) return req.reject(400, 'newWalletId is required');
+
+        const row: any = await SELECT.one.from(Passports)
+            .columns('ID', 'passportId', 'passportIdHash', 'owner', 'status', 'contractAddress')
+            .where({ passportId: pid });
+        if (!row) return req.reject(404, `passport '${pid}' not found`);
+
+        const target = producerWalletSecrets(targetId);
+        if (!target) return req.reject(400, `unknown or secret-less target wallet '${targetId}'`);
+        if (!target.owner) return req.reject(400, `target wallet '${targetId}' has no shielded address configured (PRODUCER_${targetId.toUpperCase()}_SHIELDED_ADDRESS)`);
+        if (row.owner && row.owner === target.owner) return req.reject(400, `passport '${pid}' already belongs to wallet '${targetId}'`);
+
+        // Active local grants: per-version on-chain, so the new operator
+        // re-issues them after their first re-anchor (existing flow).
+        const grantRows: any[] = await SELECT.from(DisclosureGrantLog)
+            .columns('grantee', 'level', 'op', 'createdAt')
+            .where({ passport_ID: row.ID, status: { in: ['succeeded', 'pending'] } })
+            .orderBy('createdAt' as any);
+        const latestByGrantee = new Map<string, { grantee: string; level: number; op: string }>();
+        for (const g of grantRows ?? []) latestByGrantee.set(String(g.grantee), { grantee: String(g.grantee), level: Number(g.level ?? 0), op: String(g.op) });
+        const activeGrants = [...latestByGrantee.values()].filter((g) => g.op === 'grant').map(({ grantee, level }) => ({ grantee, level }));
+
+        // Drafts never touched the chain: the owner flip alone is the handover.
+        if (row.status !== 'anchored') {
+            await UPDATE.entity(Passports).set({ owner: target.owner }).where({ ID: row.ID });
+            return {
+                passportId: pid, previousOwner: String(row.owner ?? ''), newOwner: target.owner,
+                newOwnerAttesterId: '', mode: 'local', activeGrants
+            };
+        }
+
+        // Anchored: the handover IS an on-chain operation (registrar-only).
+        const contractAddress = this.contractAddress() ?? row.contractAddress;
+        if (!contractAddress) return req.reject(400, 'no PASSPORT_CONTRACT_ADDRESS available');
+        const registrarId = process.env.PASSPORT_REGISTRAR_WALLET?.trim() || 'default';
+        const regSession = await this.serverSigningSession(registrarId);
+        if (!regSession) {
+            return req.reject(400, `operator handover needs the registrar wallet's signing session ('${registrarId}', PASSPORT_REGISTRAR_WALLET); none available`);
+        }
+        const attesterId = await this.attesterIdFor(req, targetId);
+        const sponsorSessionId = await this.sponsorSessionIdFor(regSession, sponsorWalletId);
+
+        const txRowId = cds.utils.uuid();
+        await INSERT.into(PassportTransactions).entries({
+            ID: txRowId, passport_ID: row.ID, kind: 'registerPassport',
+            identifier: attesterId, status: 'pending'
+        } as any);
+
+        const args = {
+            passportId: String(row.passportIdHash), ownerId: attesterId,
+            sessionId: regSession, contractAddress,
+            ...(sponsorSessionId ? { sponsorSessionId } : {})
+        };
+        const previousOwner = String(row.owner ?? '');
+        const newOwner = target.owner;
+        const user = req.user;
+        (req as any).on('succeeded', () => {
+            void detachedFromRequest(() =>
+                this.runTransferDetached(txRowId, String(row.ID), pid, newOwner, args, user)
+            ).catch((e: unknown) =>
+                cds.log('producer').error(`detached operator transfer crashed for ${pid}:`, e));
+        });
+        return { passportId: pid, previousOwner, newOwner, newOwnerAttesterId: attesterId, mode: 'transferring', activeGrants };
+    };
+
+    /** The long-running leg of transferPassportOperator (one registerPassport tx). */
+    private async runTransferDetached(
+        txRowId: string, passportRowId: string, passportId: string, newOwner: string,
+        args: Record<string, unknown> & { sessionId: string },
+        user: unknown
+    ): Promise<void> {
+        const log = cds.log('producer');
+        try {
+            const nightgate = await cds.connect.to('NightgateService');
+            const prewarmJob = this.serverPrewarmJobs.get(args.sessionId);
+            if (prewarmJob) {
+                this.serverPrewarmJobs.delete(args.sessionId);
+                await waitForJobResult(nightgate, prewarmJob, args.sessionId, user);
+            }
+            const res: any = await sendDetached(nightgate, 'registerPassport', args, user);
+            const jobResult: any = await waitForJobResult(
+                nightgate, String(res.jobId), args.sessionId, user, { requireChainSuccess: true }
+            );
+            const txHash = norm(String(jobResult?.txHash ?? ''));
+            await this.runDetached(async () => {
+                // Owner flips ONLY on chain success: until then the previous
+                // operator remains the owner in every server-side check.
+                await UPDATE.entity(Passports).set({ owner: newOwner }).where({ ID: passportRowId });
+                await UPDATE.entity(PassportTransactions).set({
+                    status: 'succeeded', txHash, explorerUrl: txExplorerUrl(txHash)
+                } as any).where({ ID: txRowId });
+            });
+            log.info(`passport ${passportId} operator transferred (register tx ${txHash})`);
+        } catch (e) {
+            const msg = String((e as Error)?.message ?? e).slice(0, 500);
+            log.warn(`operator transfer failed for ${passportId}:`, e);
+            await this.runDetached(async () => {
+                await UPDATE.entity(PassportTransactions).set({ status: 'failed', errorMessage: msg } as any).where({ ID: txRowId });
+            }).catch(() => { /* best effort */ });
+        }
+    }
+
+    /** Drift check: current DB content vs the anchored hash (projection v2). */
+    private passportDrift = async (req: cds.Request) => {
+        const { passportId } = req.data as { passportId?: string };
+        const pid = String(passportId ?? '').trim();
+        if (!pid) return req.reject(400, 'passportId is required');
+        const row: any = await SELECT.one.from(Passports)
+            .columns('ID', 'passportId', 'payloadHash', 'status').where({ passportId: pid });
+        if (!row) return req.reject(404, `passport '${pid}' not found`);
+        const inputs = await readPayloadInputs(String(row.ID));
+        const recomputedHash = hashPayload(payloadFromDb(inputs)).payloadHash;
+        return {
+            passportId: pid, status: String(row.status ?? ''),
+            drifted: row.status === 'anchored' && recomputedHash !== row.payloadHash,
+            currentHash: String(row.payloadHash ?? ''), recomputedHash
+        };
+    };
+
+    /**
+     * Dynamic (telemetry / SoH) attribute update: validates the batch against
+     * the allowlist, appends version history (with a lazy version-0 baseline of
+     * the creation-time value), updates the current rows in place and bumps the
+     * passport's modifiedAt (which feeds Date-timeOfLatestUpdateOfDPP). All in
+     * the ambient request tx, so the batch is atomic. Never touches payloadHash
+     * or the anchor; the chain keeps the creation-time snapshot.
+     */
+    private updateDynamicAttributes = async (req: cds.Request) => {
+        const { passportId, updatesJson, source } = req.data as
+            { passportId?: string; updatesJson?: string; source?: string };
+        const pid = String(passportId ?? '').trim();
+        if (!pid) return req.reject(400, 'passportId is required');
+        const src = source === 'bms' ? 'bms' : 'api';
+
+        let parsed: unknown;
+        try { parsed = JSON.parse(String(updatesJson ?? '')); }
+        catch { return req.reject(400, 'updatesJson must be valid JSON'); }
+        if (!Array.isArray(parsed) || !parsed.length) {
+            return req.reject(400, 'updatesJson must be a non-empty array of { attribute, value }');
+        }
+        if (parsed.length > 100) return req.reject(400, 'too many updates in one batch (max 100)');
+        const shaped = parsed.filter((u): u is DynamicUpdate =>
+            !!u && typeof u === 'object' && typeof (u as any).attribute === 'string');
+        if (shaped.length !== parsed.length) {
+            return req.reject(400, 'every update must be an object with a string `attribute`');
+        }
+        const updates = dedupeUpdates(shaped);
+
+        const passport: any = await SELECT.one.from(Passports).columns('ID', 'createdAt').where({ passportId: pid });
+        if (!passport) return req.reject(404, `passport '${pid}' not found`);
+
+        const names = updates.map((u) => u.attribute);
+        const currentRows: any[] = await SELECT.from(PassportAttributes)
+            .columns('ID', 'section', 'attribute', 'valueJson', 'accessClass')
+            .where({ passport_ID: passport.ID, attribute: { in: names } });
+        const currentByName = new Map(currentRows.map((r) => [r.attribute, r]));
+
+        // Validate everything before writing anything (atomic all-or-nothing).
+        const encoded: Array<{ row: any; valueJson: string }> = [];
+        for (const u of updates) {
+            if (!DYNAMIC_ATTRIBUTES[u.attribute]) return req.reject(400, `attribute is not updatable: ${u.attribute}`);
+            const row = currentByName.get(u.attribute);
+            if (!row) return req.reject(400, `attribute not present on passport '${pid}': ${u.attribute}`);
+            const enc = encodeDynamicValue(u.attribute, u.value);
+            if (!enc.ok) return req.reject(400, enc.error);
+            encoded.push({ row, valueJson: enc.valueJson });
+        }
+
+        const results = await this.writeAttributeVersions(passport, encoded, src);
+        return { passportId: pid, updated: encoded.length, results };
+    };
+
+    /**
+     * Append version history for a batch of attribute updates and apply them to
+     * the current rows (shared by the telemetry and lifecycle write paths):
+     * lazy version-0 baseline on an attribute's first update, ONE receipt time
+     * per batch (ordering within it is carried by `version`; no caller-supplied
+     * backdating, audit integrity), in-place current-row update, and a
+     * modifiedAt bump so Date-timeOfLatestUpdateOfDPP moves with the data.
+     * Runs in the caller's ambient tx, so the batch stays atomic.
+     */
+    private async writeAttributeVersions(
+        passport: { ID: string; createdAt?: string },
+        encoded: Array<{ row: any; valueJson: string }>,
+        source: string
+    ): Promise<Array<{ attribute: string; version: number; validFrom: string }>> {
+        const names = encoded.map((e) => String(e.row.attribute));
+        const histRows: any[] = await SELECT.from(PassportAttributeHistory)
+            .columns('attribute', 'version')
+            .where({ passport_ID: passport.ID, attribute: { in: names } });
+        const maxVersion = new Map<string, number>();
+        for (const h of histRows) {
+            maxVersion.set(h.attribute, Math.max(maxVersion.get(h.attribute) ?? -1, Number(h.version)));
+        }
+
+        const now = new Date().toISOString();
+        const historyEntries: any[] = [];
+        const results: Array<{ attribute: string; version: number; validFrom: string }> = [];
+        for (const { row, valueJson } of encoded) {
+            const prev = maxVersion.get(row.attribute);
+            if (prev == null) {
+                historyEntries.push({
+                    passport_ID: passport.ID, section: row.section, attribute: row.attribute,
+                    valueJson: row.valueJson, accessClass: row.accessClass,
+                    version: 0, validFrom: passport.createdAt, source: 'baseline'
+                });
+            }
+            const version = (prev ?? 0) + 1;
+            historyEntries.push({
+                passport_ID: passport.ID, section: row.section, attribute: row.attribute,
+                valueJson, accessClass: row.accessClass,
+                version, validFrom: now, source
+            });
+            results.push({ attribute: row.attribute, version, validFrom: now });
+        }
+
+        await INSERT.into(PassportAttributeHistory).entries(historyEntries);
+        for (const { row, valueJson } of encoded) {
+            await UPDATE.entity(PassportAttributes).set({ valueJson }).where({ ID: row.ID });
+        }
+        // Bump the aggregate so Date-timeOfLatestUpdateOfDPP moves with the data.
+        await UPDATE.entity(Passports).set({ modifiedAt: now } as any).where({ ID: passport.ID });
+        return results;
+    }
 
     /**
      * The content-root anchor tx of the proof job just completed: the newest

@@ -109,6 +109,7 @@ service PassportService {
         status            : String;
         locallyAnchored   : Boolean;
         viewerUrl         : String;
+        version           : Integer; // set when the hash is a SUPERSEDED anchor version (null = current)
     };
 
     /**
@@ -138,6 +139,46 @@ service PassportService {
         attestationTxHash : String;
         explorerUrl       : String; // attestation tx on the anchor network's explorer
         checkedAt         : String; // ISO timestamp of this live check
+    };
+
+    /**
+     * LIVE verification of a SUPERSEDED anchor version (re-anchoring): reads
+     * the vault for the archived version's payload hash. The vault keeps every
+     * attested hash forever, so old versions verify indefinitely. Anonymous,
+     * same degradation rules as verifyOnChain (a failed ledger read yields
+     * verified:false, never a 5xx). Separate function on purpose: existing
+     * verifyOnChain callers (UIs, peers, scripts) stay untouched.
+     */
+    function verifyAnchorVersion(passportId: String, version: Integer) returns {
+        passportId        : String;
+        version           : Integer;
+        verified          : Boolean;
+        payloadHash       : String;
+        contractAddress   : String;
+        anchorNetwork     : String;
+        serverNetwork     : String;
+        checkedNetwork    : String;
+        attestationTxHash : String;
+        explorerUrl       : String;
+        checkedAt         : String;
+    };
+
+    /**
+     * Anchor version history of a passport (anonymous, public by design: only
+     * anchor metadata that already lives on-chain). The current anchor is the
+     * last entry (`current: true`); earlier entries are superseded versions
+     * that remain independently verifiable via `verifyOnChain(version)`.
+     */
+    function anchorHistory(passportId: String)       returns array of {
+        version           : Integer;
+        current           : Boolean;
+        payloadHash       : String;
+        contractAddress   : String;
+        anchorNetwork     : String;
+        attestationTxHash : String;
+        explorerUrl       : String;
+        anchoredAt        : String;
+        reason            : String;  // why this version was superseded (null on the current one)
     };
 
     /**

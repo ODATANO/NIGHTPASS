@@ -31,6 +31,20 @@ service ProducerService {
     entity DiligenceDoc         as projection on passport.DiligenceDoc;
     entity PassportAttributes   as projection on passport.PassportAttributes;
 
+    // Version history of dynamic attribute values (append-only; written by
+    // updateDynamicAttributes, read by the cockpit and the DPP as-of queries).
+    @readonly
+    entity PassportAttributeHistory as projection on passport.PassportAttributeHistory;
+
+    // Superseded on-chain anchor versions (re-anchoring). The old payloadCipher
+    // stays in the base table only; it is never served.
+    @readonly
+    entity PassportAnchorVersions   as
+        projection on passport.PassportAnchorVersions
+        excluding {
+            payloadCipher
+        };
+
     // Registered dataspace partners (recyclers / authorities) for the grant picker.
     @readonly
     entity Partners             as
@@ -209,6 +223,122 @@ service ProducerService {
         fileName      : String;
         mimeType      : String;
         contentBase64 : LargeString;
+    };
+
+    /**
+     * Re-anchor a passport after substantive content changes (re-anchoring
+     * policy): recompute the payload hash from the CURRENT database state
+     * (projection v2), archive the current anchor as a PassportAnchorVersions
+     * row, and anchor the new hash on-chain (attest + bindPassport re-bind +
+     * content root, one batched tx, detached like submitPassport; poll the
+     * Passports row). The vault keeps every attested hash forever, so the
+     * archived version stays verifiable. On-chain disclosure grants are per
+     * version: `grantsToRegrant` lists the active grants the operator should
+     * re-issue for the new version. MUST run with the SAME wallet that holds
+     * the current binding (the vault rejects a foreign re-bind).
+     */
+    action   reanchorPassport(passportId: String,
+                              reason: String, // status-change | batch-telemetry | data-correction
+                              sessionId: UUID,
+                              walletId: String,
+                              sponsorWalletId: String
+    )                                                                    returns {
+        passportId          : String;
+        archivedVersion     : Integer; // version number the previous anchor was stored as (0 = retry, nothing archived)
+        payloadHash         : String;  // the NEW hash being anchored
+        previousPayloadHash : String;
+        contentRoot         : String;
+        mode                : String;  // 'anchoring'
+        grantsToRegrant     : array of { grantee : String; level : Integer; };
+    };
+
+    /**
+     * Battery status lifecycle transition (Annex XIII 4(c)): original ->
+     * repurposed | reused | remanufactured -> waste (waste is terminal). The
+     * status lives in the BatteryStatus attribute row (legitimate-interest
+     * tier) and is versioned in PassportAttributeHistory (source 'lifecycle').
+     * Authorized actors only: producer role, plus the owner-scope check when
+     * the passport has an owner and a server wallet is chosen; on-chain, only
+     * the attester holding the current binding can re-anchor. Anchored
+     * passports with a signing session re-anchor immediately (policy: a status
+     * change is a substantive change; reason 'status-change', detached, poll
+     * the row); without a session the change lands locally as drift (`mode`
+     * 'offline') and the next re-anchor commits it.
+     */
+    action   changeBatteryStatus(passportId: String,
+                                 newStatus: String, // repurposed | reused | remanufactured | waste
+                                 sessionId: UUID,
+                                 walletId: String,
+                                 sponsorWalletId: String
+    )                                                                    returns {
+        passportId      : String;
+        previousStatus  : String;
+        newStatus       : String;
+        mode            : String;  // 'anchoring' | 'offline' | 'draft'
+        archivedVersion : Integer; // set in mode 'anchoring'
+        payloadHash     : String;  // new hash in mode 'anchoring'
+        grantsToRegrant : array of { grantee : String; level : Integer; };
+    };
+
+    /**
+     * Operator handover (Second Life): transfer the passport's responsible
+     * economic operator to another server wallet. On-chain the REGISTRAR (the
+     * vault deployer's wallet, PASSPORT_REGISTRAR_WALLET, default 'default')
+     * re-registers the passportIdHash to the new operator's attester identity;
+     * from then on ONLY the new operator can (re-)bind the id, the previous
+     * operator is locked out in-circuit. Off-chain the Passports.owner scope
+     * flips to the new wallet on chain success, so the cockpit scoping and the
+     * owner guard follow. Anchored passports run DETACHED (mode
+     * 'transferring'; poll the registerPassport PassportTransactions row);
+     * drafts flip the owner locally (mode 'local'). Grants stay per payload
+     * version: `activeGrants` lists what the new operator should re-grant
+     * after their first re-anchor.
+     */
+    action   transferPassportOperator(passportId: String,
+                                      newWalletId: String,
+                                      sponsorWalletId: String
+    )                                                                    returns {
+        passportId         : String;
+        previousOwner      : String;
+        newOwner           : String; // shielded address of the new operator wallet
+        newOwnerAttesterId : String;
+        mode               : String; // 'transferring' | 'local'
+        activeGrants       : array of { grantee : String; level : Integer; };
+    };
+
+    /**
+     * Drift check: does the passport's current database content still hash to
+     * the anchored payloadHash? `drifted` is only meaningful for anchored
+     * rows. Note the projection asymmetry: rows anchored under the v1
+     * (creation-input) projection always report drift once compared against
+     * the v2 (database) projection; the first re-anchor moves them onto v2.
+     */
+    function passportDrift(passportId: String)                           returns {
+        passportId     : String;
+        status         : String;
+        drifted        : Boolean;
+        currentHash    : String;
+        recomputedHash : String;
+    };
+
+    /**
+     * Update dynamic (telemetry / SoH) attribute values in place and append
+     * version history. `updatesJson` is a JSON array of { attribute, value }
+     * with RAW values (numbers / strings / { at80, at20 }); the server encodes
+     * them into the exact guide shapes. Atomic: any invalid entry rejects the
+     * whole batch. Only attributes from the dynamic allowlist that exist on the
+     * passport are accepted; accessClass and section never change through this
+     * path. Deliberately NEVER touches payloadHash or the on-chain anchor: the
+     * anchor covers the creation-time snapshot (re-anchoring policy is a
+     * separate concern).
+     */
+    action   updateDynamicAttributes(passportId: String,
+                                     updatesJson: LargeString,
+                                     source: String // 'bms' | 'api' (default 'api')
+    )                                                                    returns {
+        passportId : String;
+        updated    : Integer;
+        results    : array of { attribute : String; version : Integer; validFrom : String; };
     };
 
     /**

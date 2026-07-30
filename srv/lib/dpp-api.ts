@@ -23,6 +23,7 @@ import {
     getElement, patchElement, operatorIdOf, touchLastUpdate,
 } from './dpp-store';
 import { buildGuideDocument, guideDppId } from './guide-document';
+import { attributesAsOf } from './attribute-update';
 
 const { SELECT, INSERT, DELETE } = cds.ql;
 
@@ -98,9 +99,12 @@ export function createDppApiRouter(): express.Router {
     /**
      * Resolve a dppId/productId to a REAL anchored NIGHTPASS passport and
      * render it as a guide document. Accepts the urn:odatano wrappers or the
-     * bare passportId. Draft/failed passports stay invisible here.
+     * bare passportId. Draft/failed passports stay invisible here. With `asOf`
+     * the dynamic attribute values are reconstructed from the version history
+     * (PassportAttributeHistory) as of that date, and the rendered document's
+     * Date-timeOfLatestUpdateOfDPP reflects the last change applied by then.
      */
-    async function resolveReal(id: string): Promise<{ passportId: string; document: unknown; createdAt?: string } | undefined> {
+    async function resolveReal(id: string, asOf?: string): Promise<{ passportId: string; document: unknown; createdAt?: string } | undefined> {
         const pid = id.replace(/^urn:odatano:(passport|battery):/, '');
         try {
             const p = await cds.run(SELECT.one.from('passport.Passports').where({ passportId: pid, status: 'anchored' })) as any;
@@ -110,6 +114,16 @@ export function createDppApiRouter(): express.Router {
                 cds.run(SELECT.from('passport.RecycledMaterials').where({ passport_ID: p.ID })),
                 cds.run(SELECT.from('passport.PassportAttributes').where({ passport_ID: p.ID })),
             ]) as any[][];
+            if (asOf && Number.isFinite(Date.parse(asOf))) {
+                const history = await cds.run(
+                    SELECT.from('passport.PassportAttributeHistory')
+                        .columns('attribute', 'valueJson', 'version', 'validFrom')
+                        .where({ passport_ID: p.ID })
+                ) as any[];
+                const { rows, lastChangeAt } = attributesAsOf(attrs as any, history, asOf);
+                const pAsOf = { ...p, modifiedAt: lastChangeAt ?? p.createdAt };
+                return { passportId: pid, document: buildGuideDocument(pAsOf, batteries, recycled, rows as any), createdAt: p.createdAt };
+            }
             return { passportId: pid, document: buildGuideDocument(p, batteries, recycled, attrs), createdAt: p.createdAt };
         } catch {
             return undefined;
@@ -411,8 +425,9 @@ export function createDppApiRouter(): express.Router {
         if (!date) return fail(res, 400, 'Query parameter `date` is required');
         const row = store.byProductAndDate(req.params.productId, date);
         if (row) return res.status(200).json(view(req, row.document));
-        // Anchored passports have a single served version, current since creation.
-        const real = await resolveReal(req.params.productId);
+        // Anchored passports: dynamic attribute values are reconstructed from
+        // the version history as of the requested date.
+        const real = await resolveReal(req.params.productId, date);
         if (real?.createdAt && Date.parse(real.createdAt) <= Date.parse(date)) {
             return res.status(200).json(view(req, real.document));
         }

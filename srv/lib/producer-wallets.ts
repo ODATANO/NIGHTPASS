@@ -32,6 +32,13 @@ export interface ProducerWallet {
     owner: string;
     /** True when both signing secrets are present (i.e. this wallet can anchor). */
     signingReady: boolean;
+    /**
+     * Optional cached attester id (64-hex, deriveWalletInfo.attesterId): the
+     * on-chain identity registerPassport assigns ownership to. Env-cached
+     * (PRODUCER_<ID>_ATTESTER_ID) because deriving it shares the rate-limited
+     * secret path with session opening; unset = derived lazily on first use.
+     */
+    attesterId?: string;
 }
 
 interface ProducerWalletSecrets extends ProducerWallet {
@@ -56,6 +63,7 @@ function registry(): ProducerWalletSecrets[] {
             label: process.env[`PRODUCER_${key}_LABEL`]?.trim() || `Producer ${id}`,
             owner: process.env[`PRODUCER_${key}_SHIELDED_ADDRESS`]?.trim() || '',
             signingReady: !!(mnemonic && viewingKey),
+            attesterId: process.env[`PRODUCER_${key}_ATTESTER_ID`]?.trim() || undefined,
             mnemonic,
             viewingKey
         });
@@ -70,6 +78,7 @@ function registry(): ProducerWalletSecrets[] {
             label: process.env.PRODUCER_LABEL?.trim() || 'Server wallet',
             owner: process.env.PRODUCER_SHIELDED_ADDRESS?.trim() || '',
             signingReady: true,
+            attesterId: process.env.PRODUCER_ATTESTER_ID?.trim() || undefined,
             mnemonic: legacyMnemonic,
             viewingKey: legacyViewingKey
         });
@@ -104,7 +113,7 @@ export function feeSponsorWalletId(): string | null {
 
 /** Secrets for one wallet id, or undefined. Never leaves the server. */
 export function producerWalletSecrets(walletId?: string | null):
-    { id: string; mnemonic: string; viewingKey: string; owner: string } | undefined {
+    { id: string; mnemonic: string; viewingKey: string; owner: string; attesterId?: string } | undefined {
     const all = registry();
     const wanted = String(walletId ?? '').trim();
     // No id given: the legacy/default wallet, else the only configured one.
@@ -112,5 +121,5 @@ export function producerWalletSecrets(walletId?: string | null):
         ? all.find((x) => x.id === wanted)
         : (all.find((x) => x.id === LEGACY_ID) ?? (all.length === 1 ? all[0] : undefined));
     if (!w?.mnemonic || !w.viewingKey) return undefined;
-    return { id: w.id, mnemonic: w.mnemonic, viewingKey: w.viewingKey, owner: w.owner };
+    return { id: w.id, mnemonic: w.mnemonic, viewingKey: w.viewingKey, owner: w.owner, attesterId: w.attesterId };
 }

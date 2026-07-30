@@ -6,6 +6,8 @@
  * the mapping rules must stay in sync with that script.
  */
 
+import { parseBatteryStatus, dppStatusFor } from './battery-lifecycle';
+
 export interface PassportRow {
     passportId: string;
     model?: string | null;
@@ -60,9 +62,14 @@ export function buildGuideDocument(
     const shareByMaterial: Record<string, number> = {};
     for (const r of recycled) if (r.material && r.recycledPercentage != null) shareByMaterial[r.material] = Number(r.recycledPercentage);
 
+    // DPP status follows the battery lifecycle: a waste battery's passport
+    // reads as Archived, everything else as Active. The BatteryStatus row is
+    // the (possibly as-of reconstructed) attribute row, so historical
+    // documents carry the status that was current at their date.
+    const statusRow = attrs.find((a) => a.attribute === 'BatteryStatus');
     const identifiers: Record<string, unknown> = {
         DPPSchemaVersion: '1.0.0',
-        DPPStatus: { dppStatusValue: 'Active' },
+        DPPStatus: { dppStatusValue: dppStatusFor(parseBatteryStatus(statusRow?.valueJson)) },
         DPPGranularity: 'BatteryUnit',
         'Date-timeOfLatestUpdateOfDPP': new Date(p.modifiedAt ?? Date.now()).toISOString().replace(/\.\d{3}Z$/, 'Z'),
         BatteryModelIdentifier: p.model ?? undefined,

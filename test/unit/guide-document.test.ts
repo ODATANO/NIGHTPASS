@@ -54,6 +54,22 @@ describe('buildGuideDocument', () => {
         assert.equal(bp.BatteryCarbonFootprint.AbsoluteBatteryCarbonFootprint['kgCO2-equivalentValue'], 3413);
         assert.equal(bp.BatteryCarbonFootprint.BatteryCarbonFootprintPerFunctionalUnit['kgCO2-equivalentPerKilowattHourValue'], 45.5);
     });
+    it('derives DPPStatus from the battery lifecycle', () => {
+        // No BatteryStatus row and status original both read Active.
+        assert.equal(bp.IdentifiersAndProductData.DPPStatus.dppStatusValue, 'Active');
+        const withOriginal = buildGuideDocument(PASSPORT, [BATTERY], RECYCLED, [
+            ...ATTRS, { section: 'IdentifiersAndProductData', attribute: 'BatteryStatus', valueJson: '{"batteryStatusValues":"original"}' },
+        ]) as any;
+        assert.equal(withOriginal.Battery_Passport.IdentifiersAndProductData.DPPStatus.dppStatusValue, 'Active');
+        const withRepurposed = buildGuideDocument(PASSPORT, [BATTERY], RECYCLED, [
+            ...ATTRS, { section: 'IdentifiersAndProductData', attribute: 'BatteryStatus', valueJson: '{"batteryStatusValues":"repurposed"}' },
+        ]) as any;
+        assert.equal(withRepurposed.Battery_Passport.IdentifiersAndProductData.DPPStatus.dppStatusValue, 'Active');
+        const withWaste = buildGuideDocument(PASSPORT, [BATTERY], RECYCLED, [
+            ...ATTRS, { section: 'IdentifiersAndProductData', attribute: 'BatteryStatus', valueJson: '{"batteryStatusValues":"waste"}' },
+        ]) as any;
+        assert.equal(withWaste.Battery_Passport.IdentifiersAndProductData.DPPStatus.dppStatusValue, 'Archived');
+    });
     it('merges KV attribute rows into their sections', () => {
         assert.equal(bp.PerformanceAndDurability.RatedCapacity.amperehourMiliamperehourValue, 200);
         assert.equal(bp.SupplyChainDueDiligence.SupplyChainIndices, 'Cobalt origin: Australia (60%)');
