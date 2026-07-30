@@ -129,6 +129,11 @@
             <input id="fThreshold" required type="number" min="1" max="200000" step="1" value="4000" />
             <span class="hint">The claim everyone can verify, without learning the real value.</span>
           </label>
+          <label class="second-life">
+            <input id="fSecondLife" type="checkbox" />
+            Give it a second life
+            <span class="hint">Bonus act: your battery ages (telemetry) and gets repurposed, which anchors a second on-chain version. Adds one transaction and a minute or two; the explorer then shows its anchor history.</span>
+          </label>
         </div>
         <div class="cta-row">
           <button type="submit" class="btn-primary" id="btnCreate">Anchor it on Midnight</button>

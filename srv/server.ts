@@ -388,6 +388,7 @@ cds.on('bootstrap', (app: any) => {
                         txHash: String(c.txHash ?? '').slice(0, 120),
                         status: 'succeeded', result: true,
                         ...(c.provenAt ? { createdAt: c.provenAt } : {}),
+                        ...(/^[0-9a-f]{64}$/i.test(String(c.payloadHash ?? '')) ? { payloadHash: String(c.payloadHash).toLowerCase() } : {}),
                     }));
                 if (rows.length) await INSERT.into('passport.PredicateProofLog').entries(rows);
             }

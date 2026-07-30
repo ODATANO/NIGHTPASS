@@ -252,7 +252,8 @@
         weightKg: Number($('fWeight').value),
         performanceClass: $('fPerf').value,
         co2Kg: co2,
-        proveThreshold: thr
+        proveThreshold: thr,
+        secondLife: $('fSecondLife').checked
       });
       store.set('runId', r.runId);
       store.set('passportId', r.passportId);
@@ -481,6 +482,10 @@
     const proof = steps.find((s) => s.kind === 'provePredicate' && s.txHash);
     if (proof) {
       links.push(`<a href="${proof.explorerUrl}" target="_blank" rel="noopener">View the proof predicate transaction on the Midnight explorer</a>`);
+    }
+    const secondLife = steps.find((s) => s.kind === 'secondLife' && s.status === 'succeeded');
+    if (secondLife) {
+      links.push('<span class="hint">Your battery lived a second life: it aged, was repurposed and re-anchored as version 2. The explorer page shows its full anchor history; version 1 stays verifiable forever.</span>');
     }
     $('doneLinks').innerHTML = links.join('') || '';
     show('viewDone');

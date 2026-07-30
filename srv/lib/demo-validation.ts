@@ -16,6 +16,12 @@ export interface DemoInput {
     performanceClass: string;
     co2Kg: number;
     proveThreshold: number;
+    /**
+     * Optional second act: age the battery (telemetry) and repurpose it,
+     * which re-anchors the passport as a second on-chain version. One more
+     * sponsored transaction and one or two extra minutes.
+     */
+    secondLife: boolean;
 }
 
 export interface DemoValidation {
@@ -51,8 +57,10 @@ export function validateDemoInput(raw: Record<string, unknown>): DemoValidation 
         errors.push('proveThreshold must be >= co2Kg (the demo proves a TRUE claim)');
     }
 
+    const secondLife = raw.secondLife === true || raw.secondLife === 'true';
+
     if (errors.length) return { ok: false, errors };
-    return { ok: true, errors, value: { model, manufacturer, weightKg, performanceClass, co2Kg, proveThreshold } };
+    return { ok: true, errors, value: { model, manufacturer, weightKg, performanceClass, co2Kg, proveThreshold, secondLife } };
 }
 
 export function validNickname(raw: unknown): string | null {

@@ -42,6 +42,8 @@ Every Demo run produces exactly three on-chain transactions. [BAT-TRY-2026072420
 | attest + bindPassport + anchorContentRoot, ONE batched transaction | [`9246872d...e74517f6`](https://preprod.midnightexplorer.com/transactions/0x9246872d5158a497ac72860bdddac5999be8a0ee10b5e6a3c043d65de74517f6) |
 | prove: carbon footprint <= 4000 kg CO2e (value hidden) | [`a30968d6...3ba0647e`](https://preprod.midnightexplorer.com/transactions/0xa30968d63339a92240fd818de2fa56562412d9477dacb242c84bd40a3ba0647e) |
 
+**See a full battery life:** [BAT-REANCHOR-20260730060519](https://zkpassport.eu/p/BAT-REANCHOR-20260730060519) lived the whole story on preprod: born and anchored with a ZK carbon claim (v1), aged through telemetry and re-anchored (v2), repurposed (v3), handed over to a new operator on-chain ([registerPassport](https://preprod.midnightexplorer.com/transactions/0x18bed73bd3b4f31047ac182c7a4af0ee789c177ce69eb7001f4602df628fe13f)) who ended it as waste (v4). All four anchor versions and the claim verify live on the explorer's anchor history.
+
 ## Documentation
 
 | Doc | Contents |

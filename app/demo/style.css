@@ -144,6 +144,12 @@ a:hover { text-decoration: underline; }
 .hint { display: block; color: var(--ink-3); font-size: 12px; margin-top: 4px; }
 
 label.confidential { position: relative; }
+/* The second-life opt-in is a checkbox row, not a full-width field. */
+label.second-life input[type="checkbox"] {
+  display: inline-block; width: auto; margin: 0 8px 0 0; vertical-align: -2px;
+  accent-color: var(--accent);
+}
+label.second-life .hint { display: block; margin-top: 4px; }
 .chip-conf {
   display: inline-block; margin-left: 6px; padding: 1px 8px;
   border: 1px solid var(--warning); color: var(--warning);

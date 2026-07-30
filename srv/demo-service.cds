@@ -29,7 +29,8 @@ service DemoService @(path: '/api/v1/demo', requires: 'any') {
         weightKg         : Decimal,
         performanceClass : String,    // A to E, public on the explorer
         co2Kg            : Decimal,   // confidential, never published
-        proveThreshold   : Decimal    // public claim bound (kg CO2)
+        proveThreshold   : Decimal,   // public claim bound (kg CO2)
+        secondLife       : Boolean    // optional bonus act: age + repurpose = second anchor version
     ) returns {
         runId         : UUID;
         passportId    : String;

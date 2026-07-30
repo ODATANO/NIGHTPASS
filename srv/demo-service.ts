@@ -283,7 +283,7 @@ export default class DemoService extends cds.ApplicationService {
                     tester_ID: tester.ID,
                     passportId,
                     state: 'queued',
-                    stepsJson: JSON.stringify(this.initialSteps()),
+                    stepsJson: JSON.stringify(this.initialSteps(input.secondLife)),
                     threshold: thresholdScaled,
                     clientKey
                 } as any);
@@ -398,7 +398,7 @@ export default class DemoService extends cds.ApplicationService {
         return /^(true|1|yes|on)$/i.test(String(process.env.DEMO_REGISTER_OWNERSHIP ?? ''));
     }
 
-    private initialSteps() {
+    private initialSteps(secondLife = false) {
         return [
             { kind: 'sync', label: 'Create passport & sync wallet', status: 'pending' },
             ...(this.registerOwnershipEnabled()
@@ -408,6 +408,9 @@ export default class DemoService extends cds.ApplicationService {
             { kind: 'bindPassport', label: 'Bind passport id on-chain', status: 'pending' },
             { kind: 'anchorContentRoot', label: 'Anchor field Merkle root', status: 'pending' },
             { kind: 'provePredicate', label: 'ZK-prove CO2 claim (value hidden)', status: 'pending' },
+            ...(secondLife
+                ? [{ kind: 'secondLife', label: 'Second life: age & repurpose (version 2)', status: 'pending' }]
+                : []),
             { kind: 'publish', label: 'Publish to the public explorer', status: 'pending' }
         ];
     }
@@ -463,7 +466,7 @@ export default class DemoService extends cds.ApplicationService {
         const user = this.techUser();
         const nightgate: any = await cds.connect.to('NightgateService');
         const producer: any = await cds.connect.to('ProducerService');
-        const steps = this.initialSteps();
+        const steps = this.initialSteps(input.secondLife);
         // BEST-EFFORT: the timeline is cosmetic. A stepsJson UPDATE that hits
         // write-lock contention (facade saves) must never fail a run whose
         // on-chain work succeeded; the next setStep re-writes the full array
@@ -617,6 +620,36 @@ export default class DemoService extends cds.ApplicationService {
                 status: 'succeeded', txHash: proof.txHash, explorerUrl: explorerTxUrl(proof.txHash)
             });
 
+            // 3b. Optional second act: age the battery and repurpose it. Two
+            //     simulated telemetry ticks (DB-only, deliberately no tx) and
+            //     a status change, which re-anchors the passport as a SECOND
+            //     on-chain version through the tester's own session (the
+            //     tester is the attester; fees sponsored like everything
+            //     else). NEVER fatal: the passport is anchored and proven, a
+            //     failed bonus act must not fail the run.
+            if (input.secondLife) {
+                await this.patchRun(runId, { state: 'aging' });
+                await setStep('secondLife', { status: 'running' });
+                try {
+                    const mocksap: any = await cds.connect.to('MockSapService');
+                    await mocksap.tx({ user }, (tx: any) => tx.send('triggerBmsTelemetry', { passportId, ticks: 2 }));
+                    const st: any = await producer.tx({ user }, (tx: any) => tx.send('changeBatteryStatus', {
+                        passportId, newStatus: 'repurposed', sessionId,
+                        ...(sponsorWalletId ? { sponsorWalletId } : {})
+                    }));
+                    if (st?.mode !== 'anchoring') throw new Error(`changeBatteryStatus returned mode '${st?.mode}'`);
+                    const aged = await this.pollReanchor(passportId);
+                    if (aged.status !== 'anchored') throw new Error(`re-anchor ended '${aged.status}'`);
+                    await setStep('secondLife', {
+                        status: 'succeeded', txHash: aged.attestationTxHash,
+                        explorerUrl: explorerTxUrl(aged.attestationTxHash)
+                    });
+                } catch (e) {
+                    log.warn(`run ${runId}: second-life act failed (continuing):`, (e as Error)?.message);
+                    await setStep('secondLife', { status: 'failed' });
+                }
+            }
+
             // 4. Publish into the public explorer. NEVER fatal: the passport
             //    is anchored and proven at this point, and publishPassport can
             //    also REJECT (e.g. 503 when PASSPORT_PUBLISH_SECRET is
@@ -699,6 +732,22 @@ export default class DemoService extends cds.ApplicationService {
             }
             if (row?.status === 'anchored' || row?.status === 'failed') return row;
             if (Date.now() > deadline) throw new Error('anchor timed out');
+        }
+    }
+
+    /**
+     * Poll a re-anchoring passport row back to 'anchored'/'failed' (10 min
+     * cap). Status only; unlike pollAnchor it mirrors no per-circuit steps,
+     * the whole re-anchor is one timeline entry.
+     */
+    private async pollReanchor(passportId: string): Promise<{ status: string; attestationTxHash?: string }> {
+        const deadline = Date.now() + 10 * 60_000;
+        for (;;) {
+            await new Promise(r => setTimeout(r, 5000));
+            const row: any = await SELECT.one.from(Passports)
+                .columns('status', 'attestationTxHash').where({ passportId });
+            if (row?.status === 'anchored' || row?.status === 'failed') return row;
+            if (Date.now() > deadline) throw new Error('re-anchor timed out');
         }
     }
 

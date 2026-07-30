@@ -674,13 +674,17 @@ export default class ProducerService extends cds.ApplicationService {
         // proof tx are public by design; the underlying value never leaves).
         const rowId: any = await SELECT.one.from(Passports).columns('ID').where({ passportId });
         const proofs: any[] = await SELECT.from(PredicateProofLog)
-            .columns('sourceField', 'predicate', 'threshold', 'unit', 'txHash', 'createdAt')
+            .columns('sourceField', 'predicate', 'threshold', 'unit', 'txHash', 'createdAt', 'payloadHash')
             .where({ passport_ID: rowId.ID, status: 'succeeded', result: true })
             .orderBy('createdAt');
         const claims = proofs.map((c) => ({
             sourceField: c.sourceField, predicate: c.predicate,
             threshold: Number(c.threshold) / 1000, unit: c.unit ?? '',
             txHash: c.txHash ?? '', provenAt: c.createdAt ?? null,
+            // The version hash the claim was proven under, so the public
+            // instance verifies against the right version directly instead of
+            // probing the anchor history.
+            payloadHash: c.payloadHash ?? null,
         }));
         // Superseded anchor versions travel too (public anchor metadata only,
         // never the archived payloadCipher), so the public explorer can show
@@ -1430,7 +1434,10 @@ export default class ProducerService extends cds.ApplicationService {
         if (!session || !contractAddress) {
             return req.reject(400, 're-anchoring is an on-chain operation; no signing session / PASSPORT_CONTRACT_ADDRESS available');
         }
-        this.assertWalletOwnsPassport(req, row, walletId);
+        // Owner scope applies to the registry-wallet path only: an explicit
+        // sessionId means an external signer (browser wallet, demo tester),
+        // and there the vault's attester check IS the enforcement.
+        if (!sessionId) this.assertWalletOwnsPassport(req, row, walletId);
 
         const core = await this.reanchorCore(req, row, why, session, contractAddress, sponsorWalletId);
         return { passportId: pid, ...core };
@@ -1548,7 +1555,9 @@ export default class ProducerService extends cds.ApplicationService {
         const previousStatus = parseBatteryStatus(statusRow.valueJson);
         const check = validateTransition(previousStatus, newStatus);
         if (!check.ok) return req.reject(400, check.error);
-        this.assertWalletOwnsPassport(req, row, walletId);
+        // Registry-wallet path only; explicit sessions are enforced on-chain
+        // (same rule as reanchorPassport).
+        if (!sessionId) this.assertWalletOwnsPassport(req, row, walletId);
 
         await this.writeAttributeVersions(row, [
             { row: statusRow, valueJson: encodeBatteryStatus(newStatus as BatteryStatus) }
