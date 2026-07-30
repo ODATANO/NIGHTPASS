@@ -181,10 +181,166 @@ sap.ui.define([
     _syncAnchored: function () {
       var oCtx = this.getView().getBindingContext();
       var oUi = this.getView().getModel("ui");
-      if (!oCtx) { oUi.setProperty("/anchored", false); return; }
+      var that = this;
+      if (!oCtx) { oUi.setProperty("/anchored", false); oUi.setProperty("/drifted", false); return; }
       oCtx.requestProperty("status").then(function (s) {
         oUi.setProperty("/anchored", s === "anchored");
-      }).catch(function () { oUi.setProperty("/anchored", false); });
+        if (s === "anchored") { that._syncDrift(); } else { oUi.setProperty("/drifted", false); }
+      }).catch(function () { oUi.setProperty("/anchored", false); oUi.setProperty("/drifted", false); });
+      this._syncBatteryStatus();
+    },
+
+    // Client copy of the lifecycle transition matrix (server enforces it too;
+    // this only drives menu enablement). Sync with srv/lib/battery-lifecycle.ts.
+    STATUS_TARGETS: {
+      original: ["repurposed", "reused", "remanufactured", "waste"],
+      repurposed: ["waste"], reused: ["waste"], remanufactured: ["waste"],
+      waste: []
+    },
+
+    _syncBatteryStatus: function () {
+      var oUi = this.getView().getModel("ui");
+      var that = this;
+      if (!this._id) { oUi.setProperty("/batteryStatus", ""); oUi.setProperty("/statusTargets", ""); return; }
+      fetch("/api/v1/producer/PassportAttributes?$filter=passport_ID eq " + this._id +
+        " and attribute eq 'BatteryStatus'&$select=valueJson", { headers: this._authHeaders() })
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (b) {
+          var sJson = (((b || {}).value || [])[0] || {}).valueJson;
+          var sStatus = "original";
+          try { sStatus = JSON.parse(sJson).batteryStatusValues || "original"; } catch (e) { /* default */ }
+          oUi.setProperty("/batteryStatus", sStatus);
+          oUi.setProperty("/statusTargets", (that.STATUS_TARGETS[sStatus] || []).join(","));
+        })
+        .catch(function () { oUi.setProperty("/batteryStatus", ""); oUi.setProperty("/statusTargets", ""); });
+    },
+
+    // Operator handover (Second Life): pick a target server wallet, then the
+    // registrar re-registers the passport id on-chain and the owner scope
+    // flips. Poll the registerPassport transaction row until it settles.
+    onTransferOperator: function () {
+      if (!this._isServer()) { return this.toast("operator handover runs through server wallets; log in with a server wallet"); }
+      var that = this;
+      fetch("/api/v1/producer/listServerWallets()", { headers: this._authHeaders() })
+        .then(function (r) { return r.ok ? r.json() : Promise.reject(new Error("wallet list failed (" + r.status + ")")); })
+        .then(function (b) {
+          var aWallets = (b.value || []).filter(function (w) { return w.id !== that._walletId(); });
+          if (!aWallets.length) { return that.toast("no other server wallet configured to transfer to"); }
+          var oSelect = new sap.m.Select({ width: "100%" });
+          aWallets.forEach(function (w) {
+            oSelect.addItem(new sap.ui.core.Item({ key: w.id, text: w.label + " (" + w.id + ")" }));
+          });
+          var oDialog = new sap.m.Dialog({
+            title: "Transfer operator",
+            contentWidth: "22rem",
+            content: [
+              new sap.m.Text({ text: "Hand this passport over to another operator wallet. The registrar re-registers the id on-chain; afterwards only the new operator can update or re-anchor it." }).addStyleClass("sapUiSmallMargin"),
+              new sap.m.Label({ text: "New operator wallet", labelFor: oSelect }).addStyleClass("sapUiSmallMarginBegin"),
+              oSelect
+            ],
+            beginButton: new sap.m.Button({
+              text: "Transfer", type: "Emphasized",
+              press: function () {
+                var sTarget = oSelect.getSelectedKey();
+                oDialog.close();
+                that.callAction("/transferPassportOperator", { passportId: that._pid(), newWalletId: sTarget })
+                  .then(function (res) {
+                    that.toast("handover to '" + sTarget + "' " +
+                      (res.mode === "transferring" ? "started (registrar tx pending)" : "done (" + res.mode + ")") +
+                      ((res.activeGrants || []).length ? "; " + res.activeGrants.length + " grant(s) to re-issue" : ""));
+                    if (res.mode === "transferring") { that._pollTransfer(that._pid()); }
+                    that._refreshAll();
+                  })
+                  .catch(function (e) { that.error(e); });
+              }
+            }),
+            endButton: new sap.m.Button({ text: "Cancel", press: function () { oDialog.close(); } }),
+            afterClose: function () { oDialog.destroy(); }
+          });
+          that.getView().addDependent(oDialog);
+          oDialog.open();
+        })
+        .catch(function (e) { that.error(e); });
+    },
+
+    // Poll the newest registerPassport transaction row until it settles.
+    _pollTransfer: function (sPid) {
+      var that = this;
+      var nToken = (this._transferToken = (this._transferToken || 0) + 1);
+      var iLeft = 60;
+      var tick = function () {
+        if (nToken !== that._transferToken || iLeft-- <= 0) { return; }
+        fetch("/api/v1/producer/Passports?$select=ID&$filter=passportId eq '" + encodeURIComponent(sPid) + "'", { headers: that._authHeaders() })
+          .then(function (r) { return r.json(); })
+          .then(function (b) {
+            var sId = ((b.value || [])[0] || {}).ID;
+            if (!sId) { return; }
+            return fetch("/api/v1/producer/PassportTransactions?$filter=passport_ID eq " + sId +
+              " and kind eq 'registerPassport'&$orderby=createdAt desc&$top=1&$select=status,txHash,errorMessage",
+              { headers: that._authHeaders() })
+              .then(function (r) { return r.json(); })
+              .then(function (t) {
+                var oRow = (t.value || [])[0] || {};
+                if (oRow.status === "succeeded") { that._refreshAll(); return that.toast("operator handover of '" + sPid + "' registered on-chain"); }
+                if (oRow.status === "failed") { that._refreshAll(); return that.error("operator handover failed: " + (oRow.errorMessage || "see Transactions tab")); }
+                setTimeout(tick, 5000);
+              });
+          })
+          .catch(function () { if (nToken === that._transferToken) { setTimeout(tick, 8000); } });
+      };
+      setTimeout(tick, 5000);
+    },
+
+    // Lifecycle transition from the status menu: runs changeBatteryStatus and,
+    // for anchored passports, follows the detached re-anchor with the same
+    // poll as submit/re-anchor.
+    onStatusMenu: function (oEvent) {
+      var sTarget = oEvent.getParameter("item").getText();
+      var that = this;
+      this.callAction("/changeBatteryStatus", { passportId: this._pid(), newStatus: sTarget, walletId: this._walletId() })
+        .then(function (res) {
+          var n = (res.grantsToRegrant || []).length;
+          that.toast("battery status: " + res.previousStatus + " > " + res.newStatus +
+            (res.mode === "anchoring" ? "; re-anchoring as a new version" : " (" + res.mode + ")") +
+            (n ? "; " + n + " grant(s) need re-granting" : ""));
+          that._syncBatteryStatus();
+          if (res.mode === "anchoring") { that._pollAnchor(that._pid()); }
+          that._refreshAll();
+        })
+        .catch(function (e) { that.error(e); });
+    },
+
+    // Drift check: does the current DB content (telemetry updates included)
+    // still hash to the anchored payload? Feeds the header warning and the
+    // Re-anchor button. Best effort; a failed read just hides the hint.
+    _syncDrift: function () {
+      var that = this;
+      var oUi = this.getView().getModel("ui");
+      var sPid = this._pid();
+      if (!sPid) { oUi.setProperty("/drifted", false); return; }
+      fetch("/api/v1/producer/passportDrift(passportId='" + encodeURIComponent(sPid.replace(/'/g, "''")) + "')",
+        { headers: this._authHeaders() })
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (b) { oUi.setProperty("/drifted", !!(b && b.drifted)); })
+        .catch(function () { oUi.setProperty("/drifted", false); });
+    },
+
+    // Re-anchor the passport onto a freshly computed payload hash (new on-chain
+    // version; the previous anchor is archived and stays verifiable). Server
+    // mode only; runs detached like submit, same poll.
+    onReanchor: function () {
+      if (!this._isServer()) { return this.toast("re-anchoring runs through a server wallet; log in with a server wallet"); }
+      var that = this;
+      this.callAction("/reanchorPassport", { passportId: this._pid(), reason: "data-correction", walletId: this._walletId() })
+        .then(function (res) {
+          var n = (res.grantsToRegrant || []).length;
+          that.toast("re-anchoring started" +
+            (res.archivedVersion ? " (v" + res.archivedVersion + " archived)" : "") +
+            (n ? "; " + n + " grant(s) need re-granting for the new version" : ""));
+          that._pollAnchor(that._pid());
+          that._refreshAll();
+        })
+        .catch(function (e) { that.error(e); });
     },
 
     _filterLogs: function (sKey) {

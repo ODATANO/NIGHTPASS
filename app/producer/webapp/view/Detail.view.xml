@@ -19,13 +19,39 @@
         text="{session>/signerLabel}"
         icon="{= ${session>/mode} === 'server' ? 'sap-icon://it-host' : 'sap-icon://wallet' }"
         state="Information" class="sapUiTinyMarginEnd"/>
+      <ObjectStatus
+        text="content drifted since anchor"
+        icon="sap-icon://alert"
+        state="Warning"
+        visible="{ui>/drifted}" class="sapUiTinyMarginEnd"
+        tooltip="The database content (e.g. accumulated telemetry) no longer hashes to the anchored payload hash. Re-anchor to commit a new on-chain version; the old version stays verifiable."/>
       <Button text="Attest" icon="{= ${session>/mode} === 'server' ? 'sap-icon://it-host' : 'sap-icon://wallet' }" press="onAttest"/>
+      <Button text="Re-anchor" visible="{ui>/drifted}" enabled="{= ${session>/mode} === 'server' }"
+              icon="sap-icon://synchronize"
+              tooltip="Anchor the current content as a new on-chain version (server wallet). Superseded versions remain verifiable; on-chain grants apply per version."
+              press="onReanchor"/>
+      <MenuButton
+        text="{= 'Status: ' + (${ui>/batteryStatus} || '...') }"
+        enabled="{= ${session>/mode} === 'server' &amp;&amp; (${ui>/statusTargets} || '') !== '' }"
+        tooltip="Battery lifecycle status (Annex XIII 4(c)). Changing it versions the attribute and re-anchors anchored passports as a new on-chain version.">
+        <menu>
+          <Menu itemSelected="onStatusMenu">
+            <MenuItem text="repurposed" enabled="{= (${ui>/statusTargets} || '').indexOf('repurposed') >= 0 }"/>
+            <MenuItem text="reused" enabled="{= (${ui>/statusTargets} || '').indexOf('reused') >= 0 }"/>
+            <MenuItem text="remanufactured" enabled="{= (${ui>/statusTargets} || '').indexOf('remanufactured') >= 0 }"/>
+            <MenuItem text="waste" enabled="{= (${ui>/statusTargets} || '').indexOf('waste') >= 0 }"/>
+          </Menu>
+        </menu>
+      </MenuButton>
       <Button text="Grant" enabled="{ui>/anchored}" icon="{= ${session>/mode} === 'server' ? 'sap-icon://it-host' : 'sap-icon://wallet' }" press="onGrantAction"/>
       <Button text="Revoke" enabled="{ui>/anchored}" icon="sap-icon://delete" press="onRevokeAction"/>
       <Button text="Prove" enabled="{ui>/anchored}" icon="{= ${session>/mode} === 'server' ? 'sap-icon://it-host' : 'sap-icon://wallet' }" press="onProveAction"/>
       <Button text="Share" enabled="{ui>/anchored}" icon="sap-icon://share-2" press="onShare"/>
       <Button text="Publish" enabled="{ui>/anchored}" type="Emphasized" icon="sap-icon://upload-to-cloud"
               tooltip="Publish this anchored passport to the public explorer" press="onPublish"/>
+      <Button text="Transfer" enabled="{= ${session>/mode} === 'server' }" icon="sap-icon://journey-change"
+              tooltip="Hand the passport over to another operator wallet (Second Life). The registrar re-registers the id on-chain; only the new operator can update afterwards."
+              press="onTransferOperator"/>
       <Button icon="sap-icon://refresh" tooltip="Refresh transactions" press="onRefresh"/>
     </headerContent>
     <content>

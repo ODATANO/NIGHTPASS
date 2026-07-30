@@ -564,6 +564,77 @@ var API = "/api/v1/passport";
       ",threshold=" + encodeURIComponent(String(c.threshold)) + ")";
   }
 
+  function anchorHistoryUrl(pid) {
+    return API + "/anchorHistory(passportId=" +
+      encodeURIComponent("'" + String(pid).replace(/'/g, "''") + "'") + ")";
+  }
+  function verifyVersionUrl(pid, v) {
+    return API + "/verifyAnchorVersion(passportId=" +
+      encodeURIComponent("'" + String(pid).replace(/'/g, "''") + "'") +
+      ",version=" + encodeURIComponent(String(v)) + ")";
+  }
+
+  /** "Anchor history" panel: superseded anchor versions (re-anchoring). Every
+   * attested hash stays in the vault forever, so each version has its own
+   * live-verify button. Loaded lazily; hidden when there is only one anchor. */
+  function loadAnchorHistory(row, canVerify) {
+    var host = document.getElementById("anchorHistoryPanel");
+    if (!host) return;
+    fetch(anchorHistoryUrl(row.passportId))
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (b) {
+        var entries = (b && (b.value || b)) || [];
+        if (!Array.isArray(entries) || entries.length < 2) return;
+        host.innerHTML = '<section class="panel">' +
+          '<div class="panel-head"><h2>Anchor history</h2>' +
+            '<span class="net" title="Superseded anchors stay attested in the vault forever">' + entries.length + " versions</span></div>" +
+          '<p class="claims-note">Each re-anchor commits a new payload hash on-chain; superseded versions remain ' +
+            "independently verifiable against the vault.</p>" +
+          '<div class="claims">' + entries.map(function (v) {
+            var tx = !v.attestationTxHash ? "" :
+              v.explorerUrl
+                ? '<a href="' + esc(v.explorerUrl) + '" target="_blank" rel="noopener" class="mono" title="' + esc(v.attestationTxHash) + '">' + esc(shortHash(v.attestationTxHash)) + "</a>"
+                : '<span class="mono" title="' + esc(v.attestationTxHash) + '">' + esc(shortHash(v.attestationTxHash)) + "</span>";
+            var when = v.anchoredAt ? " &middot; " + esc(relTime(v.anchoredAt)) : "";
+            var label = v.current ? "current" : "superseded" + (v.reason ? " (" + esc(v.reason) + ")" : "");
+            return '<div class="claim">' +
+              '<span class="claim-field">v' + esc(String(v.version)) + ' <span class="sub">' + label + "</span></span>" +
+              '<span class="claim-bound mono" title="' + esc(v.payloadHash || "") + '">' + esc(shortHash(v.payloadHash || "")) + "</span>" +
+              '<span class="claim-proof">' + (tx ? "tx " + tx : "no tx") + when + "</span>" +
+              '<span class="claim-verify">' +
+                (v.current
+                  ? '<span class="sub">verify above</span>'
+                  : '<button class="btn verify-version" data-v="' + esc(String(v.version)) + '"' + (canVerify ? "" : " disabled") + ">Verify</button> " +
+                    '<span class="vstate" id="avs-' + esc(String(v.version)) + '"></span>') +
+              "</span></div>";
+          }).join("") + "</div></section>";
+        Array.prototype.forEach.call(host.querySelectorAll(".verify-version"), function (btn) {
+          btn.addEventListener("click", function () {
+            var ver = btn.getAttribute("data-v");
+            var slot = document.getElementById("avs-" + ver);
+            slot.className = "vstate info";
+            slot.textContent = "checking…";
+            fetch(verifyVersionUrl(row.passportId, ver))
+              .then(function (r) { return r.json(); })
+              .then(function (res) {
+                if (res.verified === true) {
+                  slot.className = "vstate ok";
+                  slot.textContent = "attested on " + (res.checkedNetwork || "chain");
+                } else if (!res.checkedNetwork) {
+                  slot.className = "vstate info";
+                  slot.textContent = "cannot check here";
+                } else {
+                  slot.className = "vstate warn";
+                  slot.textContent = "not confirmed";
+                }
+              })
+              .catch(function () { slot.className = "vstate err"; slot.textContent = "check failed"; });
+          });
+        });
+      })
+      .catch(function () { /* history is optional; the detail page works without it */ });
+  }
+
   function renderDetail(pid) {
     var row = state.rows.find(function (r) { return r.passportId === pid; });
     if (!row) {
@@ -611,6 +682,7 @@ var API = "/api/v1/passport";
             kv("Created", row.createdAt ? esc(new Date(row.createdAt).toLocaleString()) + ' <span class="sub">(' + esc(relTime(row.createdAt)) + ")</span>" : "") +
           "</div>" +
         "</section>" +
+        '<div id="anchorHistoryPanel"></div>' +
         claimsPanelHtml(row, canVerify) +
         "</div>" +
         '<section class="panel qr-card">' +
@@ -657,6 +729,8 @@ var API = "/api/v1/passport";
 
     var vBtn = document.getElementById("verifyBtn");
     vBtn.addEventListener("click", runVerify);
+
+    loadAnchorHistory(row, canVerify);
 
     // Per-claim live verification: read the vault's ledger state for exactly
     // this claim key. Same capability rules as the anchor verify.
