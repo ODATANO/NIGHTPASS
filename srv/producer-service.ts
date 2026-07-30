@@ -682,11 +682,24 @@ export default class ProducerService extends cds.ApplicationService {
             threshold: Number(c.threshold) / 1000, unit: c.unit ?? '',
             txHash: c.txHash ?? '', provenAt: c.createdAt ?? null,
         }));
+        // Superseded anchor versions travel too (public anchor metadata only,
+        // never the archived payloadCipher), so the public explorer can show
+        // the anchor history and live-verify each version.
+        const versionRows: any[] = await SELECT.from(PassportAnchorVersions)
+            .columns('version', 'payloadHash', 'contractAddress', 'anchorNetwork', 'attestationTxHash', 'anchoredAt', 'reason')
+            .where({ passport_ID: rowId.ID })
+            .orderBy('version' as any);
+        const anchorVersions = (versionRows ?? []).map((v) => ({
+            version: Number(v.version), payloadHash: v.payloadHash ?? null,
+            contractAddress: v.contractAddress ?? null, anchorNetwork: v.anchorNetwork ?? null,
+            attestationTxHash: v.attestationTxHash ?? null,
+            anchoredAt: v.anchoredAt ?? null, reason: v.reason ?? null,
+        }));
         try {
             const res = await fetch(`${url.replace(/\/+$/, '')}/api/v1/passport/ingest`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${secret}` },
-                body: JSON.stringify({ ...p, claims }),
+                body: JSON.stringify({ ...p, claims, anchorVersions }),
                 signal: AbortSignal.timeout(30000),
             });
             const body: any = await res.json().catch(() => ({}));

@@ -391,6 +391,26 @@ cds.on('bootstrap', (app: any) => {
                     }));
                 if (rows.length) await INSERT.into('passport.PredicateProofLog').entries(rows);
             }
+            // Superseded anchor versions (public anchor metadata, no ciphers):
+            // replace this passport's rows so re-publishes stay idempotent. An
+            // ingest WITHOUT the field leaves existing rows untouched. The
+            // explorer's anchor history and verifyAnchorVersion read these.
+            if (Array.isArray(req.body.anchorVersions)) {
+                await DELETE.from('passport.PassportAnchorVersions').where({ passport_ID: ID });
+                const vrows = req.body.anchorVersions
+                    .filter((v: any) => v && Number.isInteger(Number(v.version)) && /^[0-9a-f]{64}$/i.test(String(v.payloadHash ?? '')))
+                    .map((v: any) => ({
+                        ID: cds.utils.uuid(), passport_ID: ID,
+                        version: Number(v.version),
+                        payloadHash: String(v.payloadHash).toLowerCase(),
+                        contractAddress: v.contractAddress ? String(v.contractAddress).slice(0, 120) : null,
+                        anchorNetwork: v.anchorNetwork ? String(v.anchorNetwork).slice(0, 20) : null,
+                        attestationTxHash: v.attestationTxHash ? String(v.attestationTxHash).slice(0, 120) : null,
+                        anchoredAt: v.anchoredAt ?? null,
+                        reason: v.reason ? String(v.reason).slice(0, 40) : null,
+                    }));
+                if (vrows.length) await INSERT.into('passport.PassportAnchorVersions').entries(vrows);
+            }
             cds.log('publish-ingest').info(`ingested passport ${passportId} (${data.status ?? '?'}, ${req.body.claims?.length ?? 0} claims)`);
             return res.status(existing ? 200 : 201).json({ status: existing ? 'updated' : 'created', passportId });
         } catch (e: any) {
