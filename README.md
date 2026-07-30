@@ -13,18 +13,18 @@ NIGHTPASS implements the EU Battery Passport. One dataset is exposed with a diff
 
 ## How it works
 
-- **Disclosure tiers** (Annex XIII): one dataset, three server-enforced views (consumer / recycler / authority); an on-chain disclosure grant elevates a partner's tier per passport.
-- **Field-bound ZK predicates**: prove `carbon footprint <= threshold` without revealing the value, bound to the passport's anchored Merkle root, so the proven value comes from *this* passport.
-- **One contract**, `attestation-vault` (shipped by the plugin): attest, passport binding, ownership registry, disclosure ACL, content root, predicates.
-- **Two submit paths**: server-signed (async NIGHTGATE jobs) or the user's own Lace wallet; offline-first fallback without either.
-- **Fee sponsoring**: the `PASSPORT_FEE_SPONSOR_WALLET` pool pays every other wallet's dust fees; a new producer needs neither NIGHT nor dust. Every demo visitor runs on a zero-funded wallet.
-- **Single-transaction anchoring**: attest + bindPassport + anchorContentRoot ride in ONE batched transaction with deterministic apply order (NIGHTGATE >= 0.10.0), see the demo flow below.
-- **On-chain passport ownership**: the registrar pre-assigns a passportId to an offline-derived attester identity before its first bind; registered ids cannot be squatted or hijacked, see the demo flow below.
-- **BatteryPass-Ready conformant**: passports validate with **0 errors against all five official validation guides** (EV, LMT, stationary industrial, other industrial, industrial without BMS; guide picked by battery category) and pass **all 11 interop scenarios** of the official DPP Life Cycle API test suite.
-- **Due-diligence evidence**: upload the supply-chain due-diligence report in the cockpit; the file stays off-chain (authority tier), only its sha256 is anchored on-chain, so anyone can verify the document is authentic and untampered.
-- **EU DPP Registry**: the registration flow is proven against the official registry test environment (verified economic operator, UPI resolving to the public explorer); battery registrations complete once the registry's semantic validation for the product group goes live.
-- **Zero-infrastructure proving**: with NIGHTGATE >= 0.11.0, ZK proofs run in-process (wasm) whenever no proof server is configured; local dev and CI need no Docker container.
-- **Catena-X**: exports the CX-0143 aspect JSON plus a **Predicate Attestation Credential (PAC)** with `valueDisclosed: false`, the predicate capability Tractus-X currently lacks.
+- **Three disclosure tiers** (Annex XIII): one dataset, server-enforced views for consumer, recycler and authority. An on-chain grant raises a partner's tier per passport.
+- **Zero-knowledge proofs**: prove `carbon footprint <= threshold` without revealing the value, cryptographically bound to *this* passport's anchored fields.
+- **Only hashes on-chain**: the `attestation-vault` contract holds hashes, ownership, disclosure grants and proofs. The passport data itself never leaves your infrastructure.
+- **One transaction per anchor**: attest, id binding and content root land in a single batched tx.
+- **No crypto needed**: a fee-sponsor pool pays all fees, producers hold zero tokens, and passport ids are pre-registered on-chain so nobody can squat them.
+- **The passport lives**: telemetry streams into versioned attributes (the DPP API answers "state at date X"); substantive changes re-anchor as a new version, and every old version stays verifiable forever.
+- **Second Life**: hand the passport to a new operator on-chain; the old one is locked out, the new one updates from day one.
+- **Sign your way**: server wallets or the user's own Lace wallet; offline-first without either.
+- **Independently conformant**: 0 errors against all five official BatteryPass validation guides, 11/11 official DPP API interop scenarios, and a proven registration flow against the EU registry test environment.
+- **Evidence on file**: due-diligence documents stay off-chain; only their sha256 is anchored, so anyone can verify they are untampered.
+- **Zero-infrastructure proving**: ZK proofs run in-process; local dev and CI need no proof server.
+- **Catena-X**: CX-0143 aspect export plus a **Predicate Attestation Credential (PAC)** with `valueDisclosed: false`, the predicate capability Tractus-X currently lacks.
 
 ## Public demo and explorer (Midnight preprod)
 
@@ -46,7 +46,7 @@ Every Demo run produces exactly three on-chain transactions. [BAT-TRY-2026072420
 
 | Doc | Contents |
 |---|---|
-| [docs/producer-flow.md](docs/producer-flow.md) | Step-by-step lifecycle: which steps produce transactions and why, how to read them in the explorer, live transactions, glossary |
+| [docs/producer-flow.md](docs/producer-flow.md) | Step-by-step lifecycle from creation to Second Life: which steps produce transactions and why, re-anchoring and handover, how to read transactions in the explorer, glossary |
 | [docs/producer-walkthrough.md](docs/producer-walkthrough.md) | Producer cockpit with screenshots, tab by tab |
 | [docs/architecture.md](docs/architecture.md) | Layers, data flow, security model, field-bound proof construction, plugin build & deploy |
 

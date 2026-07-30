@@ -66,6 +66,72 @@ redirects into the right route.
 Only the payload hash, the `passportId` binding, the content root, disclosure
 commitments and predicate results ever reach the chain. The payload never does.
 
+**Dynamic data ingest (post-market updates).** After the battery is placed on the
+market, its dynamic SoH attributes (capacity fade, remaining capacity, cycle
+counts, and the other Performance-and-Durability telemetry rows) keep changing.
+A BMS or telemetry source pushes updates to `POST /api/v1/passport/telemetry`
+(HMAC over the raw body via `TELEMETRY_WEBHOOK_SECRET`, same machine-auth
+pattern as the ERP webhook), which runs `ProducerService.updateDynamicAttributes`.
+The action accepts RAW values, encodes them into the exact guide shapes
+(`srv/lib/attribute-update.ts`; note the validator requires integer values for
+the ampere-hour and Celsius attributes), updates the current
+`PassportAttributes` rows in place and appends to the append-only
+`PassportAttributeHistory` (version 0 is a lazy baseline of the creation-time
+value). Only an allowlist of dynamic attributes is updatable; access classes
+never change through this path, so the tier gate applies unchanged and the
+recycler view reflects updates immediately. The DPP Life Cycle API's
+`dppsByProductIdAndDate` reconstructs the document as of any date from that
+history. A deterministic BMS simulator stands in for a real feed
+(`srv/lib/bms-simulator.ts`, `MockSapService.triggerBmsTelemetry`,
+`scripts/zz-bms-simulate.mts`).
+
+![NIGHTPASS passport lifecycle](lifecycle.png)
+
+**Re-anchoring policy (anchor versions).** Which changes force a new on-chain
+anchor:
+
+| Change | Anchor consequence |
+|---|---|
+| Telemetry tick (updateDynamicAttributes) | none; accumulates as drift |
+| Accumulated telemetry | periodic batch re-anchor (`scripts/zz-reanchor-batch.mts`, operator or cron; no built-in timer, so no unattended chain spend) |
+| Lifecycle / status change, data corrections to batteries or recycled materials | re-anchor required (same action) |
+| Point-1 fields (model, weight, ...) | never in the hash; no re-anchor |
+| Diligence upload | own anchorDocument tx as before; from projection v2 on, the next re-anchor also binds the file sha256 into the payload hash |
+
+`ProducerService.reanchorPassport` recomputes the payload from the CURRENT
+database state (projection v2, `srv/lib/passport-payload.ts`: versioned
+`payloadVersion: 2` marker, normalized numerics, stable ordering), archives the
+current anchor as a `PassportAnchorVersions` row (including its cipher), and
+runs the standard anchor flow: attest of the new hash, `bindPassport` RE-BIND
+of the same passportIdHash (the vault explicitly allows same-owner rebinding),
+and a fresh content root, batched in one transaction. The re-anchor must run
+with the same wallet that holds the current binding.
+
+Old versions stay verifiable forever: the vault never forgets an attested
+hash. `PassportService.anchorHistory` lists all versions,
+`verifyAnchorVersion(passportId, version)` live-verifies a superseded one, and
+the explorer detail page shows the version list with per-version verify.
+On-chain artifacts are per version: disclosure grants do not carry over to a
+new version (reanchorPassport returns `grantsToRegrant`; local grant-log
+elevation keeps working), and ZK claims verify against the payload hash they
+were proven under (stamped on `PredicateProofLog.payloadHash`).
+
+**Battery lifecycle and operator handover.** The battery status (Annex XIII
+4(c): original, repurposed, reused, remanufactured, waste) lives in the
+BatteryStatus attribute row; `changeBatteryStatus` is its only write path
+(transition matrix in `srv/lib/battery-lifecycle.ts`), versions it in the
+attribute history and re-anchors anchored passports immediately (a status
+change is a substantive change). The DPP document's `DPPStatus` derives from
+it: waste reads as Archived, everything else as Active. For Second Life,
+`transferPassportOperator` hands the passport to another operator wallet: the
+registrar (the vault deployer's wallet, `PASSPORT_REGISTRAR_WALLET`)
+re-registers the passportIdHash to the new operator's attester identity, and
+on chain success the `Passports.owner` scope flips. From then on only the new
+operator can re-bind the id (in-circuit `not passport owner` for everyone
+else, including the registrar) and only the new operator passes the
+server-side owner guard; disclosure grants are re-issued by the new operator
+after their first re-anchor, since grants are per payload version anyway.
+
 ## 3. Security model
 
 Four mechanisms, each guarding a different boundary.

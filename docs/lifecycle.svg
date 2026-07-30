@@ -1,0 +1,65 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1320 760" font-family="'Segoe UI', -apple-system, Roboto, Helvetica, Arial, sans-serif">
+  <!--
+    NIGHTPASS lifecycle, pitch version. ONE line, four moments: born, lives
+    (telemetry, no tx), changes hands, ends. Word budget ~30, nothing below
+    18px. Palette validated on #0A0F1E (see pitch-deck.html).
+    Render: node docs/render-diagram.mjs
+  -->
+  <rect x="0" y="0" width="1320" height="760" fill="#0A0F1E"/>
+
+  <!-- timeline -->
+  <line x1="90" y1="400" x2="1230" y2="400" stroke="#243052" stroke-width="4" stroke-linecap="round"/>
+
+  <!-- telemetry rain between Born and Changes -->
+  <g fill="#22A97B">
+    <circle cx="330" cy="356" r="5" opacity=".45"/>
+    <circle cx="366" cy="338" r="5" opacity=".7"/>
+    <circle cx="402" cy="352" r="5" opacity=".5"/>
+    <circle cx="438" cy="332" r="5" opacity=".85"/>
+    <circle cx="474" cy="348" r="5" opacity=".6"/>
+    <circle cx="510" cy="336" r="5" opacity=".75"/>
+  </g>
+  <text x="420" y="296" font-size="20" fill="#45D9A3" text-anchor="middle">telemetry streams in</text>
+  <text x="420" y="322" font-size="18" fill="#93A1C0" text-anchor="middle">versioned &#183; no tx per tick</text>
+
+  <!-- ── node 1: born ── -->
+  <circle cx="180" cy="400" r="20" fill="#22A97B"/>
+  <circle cx="180" cy="400" r="30" fill="none" stroke="#22A97B" stroke-width="2" opacity=".35"/>
+  <text x="180" y="480" font-size="32" font-weight="700" fill="#EAEFFA" text-anchor="middle">Born</text>
+  <text x="180" y="512" font-size="19" fill="#93A1C0" text-anchor="middle">anchored in one tx</text>
+  <text x="180" y="542" font-size="20" fill="#45D9A3" text-anchor="middle" font-family="Consolas, monospace">v1</text>
+
+  <!-- ── node 2: changes ── -->
+  <circle cx="620" cy="400" r="20" fill="#6E86F7"/>
+  <circle cx="620" cy="400" r="30" fill="none" stroke="#6E86F7" stroke-width="2" opacity=".35"/>
+  <text x="620" y="480" font-size="32" font-weight="700" fill="#EAEFFA" text-anchor="middle">Repurposed</text>
+  <text x="620" y="512" font-size="19" fill="#93A1C0" text-anchor="middle">status change re-anchors</text>
+  <text x="620" y="542" font-size="20" fill="#8FA1E8" text-anchor="middle" font-family="Consolas, monospace">v2</text>
+
+  <!-- ── node 3: handover ── -->
+  <circle cx="920" cy="400" r="20" fill="#D2618F"/>
+  <circle cx="920" cy="400" r="30" fill="none" stroke="#D2618F" stroke-width="2" opacity=".35"/>
+  <text x="920" y="480" font-size="32" font-weight="700" fill="#EAEFFA" text-anchor="middle">New operator</text>
+  <text x="920" y="512" font-size="19" fill="#93A1C0" text-anchor="middle">old OEM locked out on-chain</text>
+  <text x="920" y="542" font-size="20" fill="#D2618F" text-anchor="middle" font-family="Consolas, monospace">v3</text>
+
+  <!-- ── node 4: end ── -->
+  <circle cx="1180" cy="400" r="20" fill="#0A0F1E" stroke="#B4882F" stroke-width="6"/>
+  <text x="1180" y="480" font-size="32" font-weight="700" fill="#EAEFFA" text-anchor="middle">Waste</text>
+  <text x="1180" y="512" font-size="19" fill="#E5C061" text-anchor="middle">archived</text>
+
+  <!-- status band above -->
+  <g font-size="20" font-weight="600">
+    <text x="180" y="180" fill="#93A1C0" text-anchor="middle">original</text>
+    <text x="770" y="180" fill="#8FA1E8" text-anchor="middle">second life</text>
+    <text x="1180" y="180" fill="#E5C061" text-anchor="middle">end of life</text>
+  </g>
+  <line x1="240" y1="174" x2="640" y2="174" stroke="#243052" stroke-width="2"/>
+  <line x1="900" y1="174" x2="1100" y2="174" stroke="#243052" stroke-width="2"/>
+
+  <!-- forever strip -->
+  <g font-size="24" font-weight="600" fill="#45D9A3">
+    <text x="500" y="660" text-anchor="end">&#10003; v1&#8195;&#10003; v2&#8195;&#10003; v3</text>
+    <text x="540" y="660" fill="#EAEFFA" font-weight="400" font-size="22">every version verifiable, forever</text>
+  </g>
+</svg>
