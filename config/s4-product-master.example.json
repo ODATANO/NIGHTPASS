@@ -1,0 +1,40 @@
+{
+  "EV-BATTERY-75": {
+    "manufacturerId": "DE-CELLCO-001",
+    "batteryCategory": "EV",
+    "model": "PowerCell EV-75",
+    "performanceClass": "B",
+    "weightKg": 432.5,
+    "battery": {
+      "cellChemistry": "NMC-811",
+      "capacityKwh": 75.0,
+      "carbonFootprintKgCO2": 3412.75,
+      "supplierName": "CathodeWorks GmbH"
+    },
+    "recycledMaterials": [
+      { "material": "Co", "recycledPercentage": 16.5, "sourceSupplierName": "ReCobalt Recyclers SA" },
+      { "material": "Li", "recycledPercentage": 8.25, "sourceSupplierName": "LiLoop Recycling BV" },
+      { "material": "Ni", "recycledPercentage": 12.0, "sourceSupplierName": "NickelBack Materials Oy" }
+    ],
+    "diligenceDocs": [{ "docType": "supply-chain-due-diligence-report" }]
+  },
+  "IND-BATTERY-120": {
+    "manufacturerId": "SE-NORDCELL-004",
+    "batteryCategory": "INDUSTRIAL",
+    "model": "BetaVolt IND-120",
+    "performanceClass": "C",
+    "weightKg": 810.0,
+    "battery": {
+      "cellChemistry": "LFP",
+      "capacityKwh": 120.0,
+      "carbonFootprintKgCO2": 5120.5,
+      "supplierName": "ElectroChem SA"
+    },
+    "recycledMaterials": [
+      { "material": "Co", "recycledPercentage": 14.0, "sourceSupplierName": "CobaltLoop AG" },
+      { "material": "Li", "recycledPercentage": 7.5, "sourceSupplierName": "Lithion Materials Oy" },
+      { "material": "Ni", "recycledPercentage": 10.25, "sourceSupplierName": "NiCycle GmbH" }
+    ],
+    "diligenceDocs": [{ "docType": "supply-chain-due-diligence-report" }]
+  }
+}

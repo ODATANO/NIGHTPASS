@@ -46,6 +46,8 @@ coverage/
 secrets/
 # wallet sync-state dumps (zz-export-syncstates.mjs; as sensitive as the DB)
 syncstates.json
+# local S/4 bridge product master (the .example.json IS checked in)
+config/s4-product-master.json
 
 # agent / editor local state
 .claude/

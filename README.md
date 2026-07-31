@@ -20,6 +20,7 @@ NIGHTPASS implements the EU Battery Passport. One dataset is exposed with a diff
 - **No crypto needed**: a fee-sponsor pool pays all fees, producers hold zero tokens, and passport ids are pre-registered on-chain so nobody can squat them.
 - **The passport lives**: telemetry streams into versioned attributes (the DPP API answers "state at date X"); substantive changes re-anchor as a new version, and every old version stays verifiable forever.
 - **Second Life**: hand the passport to a new operator on-chain; the old one is locked out, the new one updates from day one.
+- **Straight out of SAP**: a goods receipt posted in S/4HANA mints the passport with no manual step; a small bridge polls the standard Material Documents API, pulls weight and description from the live product master and anchors automatically. Proven against SAP's public API sandbox ([example passport](https://zkpassport.eu/p/BAT-MZRMC90001-50001739511)); see [docs/s4-mapping.md](docs/s4-mapping.md).
 - **Sign your way**: server wallets or the user's own Lace wallet; offline-first without either.
 - **Independently conformant**: 0 errors against all five official BatteryPass validation guides, 11/11 official DPP API interop scenarios, and a proven registration flow against the EU registry test environment.
 - **Evidence on file**: due-diligence documents stay off-chain; only their sha256 is anchored, so anyone can verify they are untampered.
@@ -51,6 +52,7 @@ Every Demo run produces exactly three on-chain transactions. [BAT-TRY-2026072420
 | [docs/producer-flow.md](docs/producer-flow.md) | Step-by-step lifecycle from creation to Second Life: which steps produce transactions and why, re-anchoring and handover, how to read transactions in the explorer, glossary |
 | [docs/producer-walkthrough.md](docs/producer-walkthrough.md) | Producer cockpit with screenshots, tab by tab |
 | [docs/architecture.md](docs/architecture.md) | Layers, data flow, security model, field-bound proof construction, plugin build & deploy |
+| [docs/s4-mapping.md](docs/s4-mapping.md) | S/4HANA integration: the goods-receipt bridge, field-by-field Annex XIII mapping, and the sandbox / S/4 Cloud / Event Mesh lanes |
 
 ## Quick start full local dev environment
 

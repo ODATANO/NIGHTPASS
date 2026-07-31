@@ -51,7 +51,8 @@
     "pac:demo": "node --experimental-strip-types tractusx/pac/build-pac.mts",
     "producer:smoke": "node test/integration/producer-smoke.mjs",
     "test:ui": "node test/ui-smoke.mjs",
-    "start:wallets": "node scripts/start-with-wallets.mjs"
+    "start:wallets": "node scripts/start-with-wallets.mjs",
+    "s4:bridge": "node --import tsx scripts/s4-bridge.mts"
   },
   "cds": {
     "requires": {
