@@ -489,4 +489,31 @@ service ProducerService {
         result                 : Boolean;
         proofLogId             : String; // PredicateProofLog row to poll (mode 'proving')
     };
+
+    /**
+     * Proof cart, server lane: prove N field-bound predicates on ONE passport
+     * in ONE transaction (NIGHTGATE issueFieldPredicateAttestationBatch,
+     * plugin >= 0.12.0). `claimsJson` is a JSON array of
+     * `{ sourceField, predicate, threshold, unit? }` with the RAW human
+     * threshold (scaled x1000 server-side, same as provePassportValue).
+     * Exact duplicates are dropped (claim keys are idempotent on-chain, the
+     * drop only saves proving time). Max 8 claims per cart (7 when the
+     * content root still has to be anchored in-batch).
+     *
+     * One pending PredicateProofLog row per claim; on success ALL rows share
+     * one txHash. A false predicate rejects during LOCAL proving: nothing is
+     * submitted, all rows flip to failed. After submission the ledger can
+     * finalize PARTIAL_SUCCESS; the runner then settles each row from
+     * verifyPredicateAttestation instead of assuming all-or-nothing.
+     */
+    action   provePassportValuesBatch(passportId: String,
+                                      claimsJson: LargeString,
+                                      sessionId: UUID,
+                                      walletId: String, // optional: which SERVER wallet signs
+                                      sponsorWalletId: String // optional: pool member of PASSPORT_FEE_SPONSOR_WALLET
+    )                                                                    returns {
+        mode        : String; // 'proving' | 'offline'
+        proofLogIds : LargeString; // JSON array of PredicateProofLog row ids to poll
+        dropped     : Integer; // duplicate claims removed from the cart
+    };
 }

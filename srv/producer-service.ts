@@ -15,6 +15,7 @@ import { DYNAMIC_ATTRIBUTES, encodeDynamicValue, dedupeUpdates, type DynamicUpda
 import { payloadFromDb, readPayloadInputs } from './lib/passport-payload';
 import { validateTransition, parseBatteryStatus, encodeBatteryStatus, type BatteryStatus } from './lib/battery-lifecycle';
 import { validateDiligenceUpload, decodeUpload, sha256Hex } from './lib/diligence-upload';
+import { proofCartPlan, type ProofClaim } from './lib/proof-plan';
 import { listProducerWallets, producerWalletSecrets, feeSponsorWalletId, feeSponsorWalletIds } from './lib/producer-wallets';
 import { s4ConfigFromEnv, fetchMaterialDocuments, enrichMaster, loadProductMaster } from './lib/s4-client';
 import { buildReceiptRows } from './lib/s4-material-document';
@@ -106,6 +107,7 @@ export default class ProducerService extends cds.ApplicationService {
         this.on('grantPassportDisclosure', this.grantPassportDisclosure);
         this.on('revokePassportDisclosure', this.revokePassportDisclosure);
         this.on('provePassportValue', this.provePassportValue);
+        this.on('provePassportValuesBatch', this.provePassportValuesBatch);
         this.on('uploadDiligenceDoc', this.uploadDiligenceDoc);
         this.on('diligenceFile', this.diligenceFile);
         this.on('updateDynamicAttributes', this.updateDynamicAttributes);
@@ -413,14 +415,18 @@ export default class ProducerService extends cds.ApplicationService {
                 // SUPERSEDED prewarm just means a fresh one took over.
                 if (/WALLET_SYNCING|SUPERSEDED/i.test(msg)) {
                     out.push(cold(secrets.id, label, 'warming', ''));
-                } else if (/No facade/i.test(msg)) {
-                    // SELF-HEAL: NIGHTGATE's session-expiry sweep evicts facades
-                    // by accountId, so an expiring STALE session of this wallet
-                    // (from an earlier boot) takes the live facade down with it.
-                    // Drop the cached session and reconnect; the fresh
-                    // connectWalletForSigning restores the facade and prewarm.
+                } else if (/No facade|Session not found|Session expired/i.test(msg)) {
+                    // SELF-HEAL, two known death modes of a cached session:
+                    // "No facade": NIGHTGATE's session-expiry sweep evicts
+                    // facades by accountId, so an expiring STALE session of
+                    // this wallet (from an earlier boot) takes the live facade
+                    // down with it. "Session not found or inactive": the
+                    // cached session ROW itself hit its TTL and the cleanup
+                    // removed it (long container uptime, seen live 2026-08-01).
+                    // Either way: drop the cached session and reconnect; the
+                    // fresh connectWalletForSigning restores facade + prewarm.
                     cds.log('producer').warn(
-                        `sponsor '${secrets.id}' facade evicted (stale-session sweep?); reconnecting`);
+                        `sponsor '${secrets.id}' session dead (${msg.slice(0, 80)}); reconnecting`);
                     this.serverSessions.delete(secrets.id);
                     void this.serverSigningSession(secrets.id).catch(() => { /* logged inside */ });
                     out.push(cold(secrets.id, label, 'warming', ''));
@@ -431,6 +437,24 @@ export default class ProducerService extends cds.ApplicationService {
         }
         return out;
     };
+
+    /**
+     * Whether this passport's content root is already anchored on-chain.
+     * Two row shapes count: an explicit succeeded 'anchorContentRoot' tx
+     * (server anchor path records one), or a succeeded wallet 'attest' row.
+     * The wallet batch anchors the root in the SAME tx as the attest and
+     * records only the attest row, so requiring an anchorContentRoot row
+     * made the server re-send the root for wallet-anchored passports, and
+     * the vault rejects that with "failed assert: not attester" (only the
+     * original attester may anchor the root; found live 2026-08-02).
+     * Residual edge: an ancient sequential wallet attest without a root
+     * makes proofs fail honestly with "no content root".
+     */
+    private async contentRootAnchored(passportRowId: string): Promise<boolean> {
+        const hit = await SELECT.one.from(PassportTransactions).columns('ID')
+            .where({ passport_ID: passportRowId, kind: { in: ['anchorContentRoot', 'attest'] }, status: 'succeeded' });
+        return !!hit;
+    }
 
     private async passportRef(passportId: string) {
         return SELECT.one.from(Passports)
@@ -1227,8 +1251,7 @@ export default class ProducerService extends cds.ApplicationService {
         // immutable after create, so re-sending it would just buy a redundant
         // anchorContentRoot tx (fee, ~20s, a confusing duplicate row). Supply
         // it only when no anchored root exists yet for this passport.
-        const rootAnchored = await SELECT.one.from(PassportTransactions).columns('ID')
-            .where({ passport_ID: row.ID, kind: 'anchorContentRoot', status: 'succeeded' });
+        const rootAnchored = await this.contentRootAnchored(row.ID);
         const sponsorSessionId = await this.sponsorSessionIdFor(String(session), sponsorWalletId);
         const args = {
             payloadHash: row.payloadHash, fieldKey: proof.fieldKey, value: proof.value,
@@ -1247,6 +1270,223 @@ export default class ProducerService extends cds.ApplicationService {
         });
         return { mode: 'proving', txHash: '', predicateAttestationId: '', result: null, proofLogId };
     };
+
+    /**
+     * Proof cart, server lane (NIGHTGATE >= 0.12.0). Shares the claim
+     * contract with the browser cart via proofCartPlan; the platform batch
+     * action re-validates and re-dedups server-side, so the plan here mainly
+     * buys the SAME error surface and drop reporting on both lanes.
+     */
+    private provePassportValuesBatch = async (req: cds.Request) => {
+        const { passportId, claimsJson, sessionId, walletId, sponsorWalletId } = req.data as {
+            passportId?: string; claimsJson?: string; sessionId?: string; walletId?: string; sponsorWalletId?: string;
+        };
+        const row: any = await this.passportRef(String(passportId ?? ''));
+        if (!row) return req.reject(404, `passport '${passportId}' not found`);
+        if (!row.payloadHash) return req.reject(400, 'passport has no payload hash yet');
+        let items: any[];
+        try { items = JSON.parse(String(claimsJson ?? '')); } catch { items = null as any; }
+        if (!Array.isArray(items) || !items.length) return req.reject(400, 'claimsJson must be a non-empty JSON array');
+
+        const values = await this.fieldValuesFor(row.ID);
+        const tree = await buildContentRoot(values);
+        type CartEntry = {
+            field: string; pred: 'lessOrEqual' | 'greaterOrEqual'; thresholdScaled: number; unit: string;
+            proof: NonNullable<ReturnType<typeof tree.proofFor>>;
+        };
+        const entries: CartEntry[] = [];
+        for (const it of items) {
+            const field = String(it?.sourceField ?? '');
+            if (values[field] == null) return req.reject(400, `value for '${field}' not found on this passport`);
+            const proof = tree.proofFor(field);
+            if (!proof) return req.reject(400, `field '${field}' is not a provable field`);
+            entries.push({
+                field,
+                pred: it?.predicate === 'greaterOrEqual' ? 'greaterOrEqual' : 'lessOrEqual',
+                thresholdScaled: Math.round(Number(it?.threshold ?? 0) * 1000),
+                unit: String(it?.unit ?? ''),
+                proof
+            });
+        }
+        // Shared plan: validates and drops exact duplicates the same way the
+        // browser cart does (claim keys are idempotent on-chain anyway).
+        let plan;
+        try {
+            plan = proofCartPlan({
+                payloadHash: row.payloadHash,
+                claims: entries.map((e): ProofClaim => ({
+                    fieldKey: e.proof.fieldKey, threshold: e.thresholdScaled,
+                    op: e.pred === 'greaterOrEqual' ? 1 : 0
+                }))
+            });
+        } catch (e: any) {
+            return req.reject(400, String(e?.message ?? e));
+        }
+        const byKey = new Map(entries.map((e) => [
+            `${e.proof.fieldKey.toLowerCase()}|${e.thresholdScaled}|${e.pred === 'greaterOrEqual' ? 1 : 0}`, e
+        ]));
+        const kept = plan.claims.map((c) => byKey.get(`${c.fieldKey}|${c.threshold}|${c.op}`)!);
+
+        const session = await this.effectiveSession(sessionId, walletId);
+        const contractAddress = this.contractAddress() ?? row.contractAddress;
+        if (!session || !contractAddress) {
+            await INSERT.into(PredicateProofLog).entries(kept.map((e) => ({
+                passport_ID: row.ID, sourceField: e.field, predicate: e.pred,
+                threshold: e.thresholdScaled, unit: e.unit, status: 'offline', payloadHash: row.payloadHash ?? null
+            })) as any);
+            return { mode: 'offline', proofLogIds: '[]', dropped: plan.dropped.length };
+        }
+
+        // In-batch root anchor only when none exists yet (same rule as the
+        // single action); it occupies one of the 8 call slots.
+        const rootAnchored = await this.contentRootAnchored(row.ID);
+        const maxClaims = rootAnchored ? 8 : 7;
+        if (kept.length > maxClaims) {
+            return req.reject(400, `at most ${maxClaims} claims per cart` +
+                (rootAnchored ? '' : ' (the content-root anchor occupies one of the 8 call slots)'));
+        }
+
+        const proofLogIds = kept.map(() => cds.utils.uuid());
+        await INSERT.into(PredicateProofLog).entries(kept.map((e, i) => ({
+            ID: proofLogIds[i], passport_ID: row.ID, sourceField: e.field, predicate: e.pred,
+            threshold: e.thresholdScaled, unit: e.unit, status: 'pending', payloadHash: row.payloadHash ?? null
+        })) as any);
+
+        const sponsorSessionId = await this.sponsorSessionIdFor(String(session), sponsorWalletId);
+        const args = {
+            payloadHash: row.payloadHash,
+            ...(rootAnchored ? {} : { contentRoot: tree.contentRoot }),
+            claimsJson: JSON.stringify(kept.map((e) => ({
+                fieldKey: e.proof.fieldKey, value: e.proof.value,
+                siblings: e.proof.siblings, dirs: e.proof.dirs,
+                predicate: e.pred, threshold: e.thresholdScaled,
+                ...(e.unit ? { unit: e.unit } : {})
+            }))),
+            sessionId: session, contractAddress, compiledArtifactRef: CONTRACT_REF,
+            ...(sponsorSessionId ? { sponsorSessionId } : {})
+        };
+        const user = req.user;
+        const claimMeta = kept.map((e, i) => ({
+            proofLogId: proofLogIds[i],
+            key: `${e.proof.fieldKey.toLowerCase()}|${e.thresholdScaled}|${e.pred}`
+        }));
+        (req as any).on('succeeded', () => {
+            void detachedFromRequest(() =>
+                this.runProveBatchDetached(claimMeta, row.ID, !rootAnchored, args, user)
+            ).catch((e: unknown) =>
+                cds.log('producer').error(`detached proof-cart runner crashed for ${row.passportId}:`, e));
+        });
+        return { mode: 'proving', proofLogIds: JSON.stringify(proofLogIds), dropped: plan.dropped.length };
+    };
+
+    /**
+     * The long-running leg of provePassportValuesBatch: ONE tx for the whole
+     * cart. On success every log row gets the SAME txHash and its claim's
+     * predicateAttestationId. Failure paths, honestly separated:
+     *   - pre-submit failure (a false predicate rejects at local proving, or
+     *     the job errors before the mempool): ALL rows flip to failed;
+     *   - post-submit PARTIAL_SUCCESS (ledger fallible phase applied a
+     *     subset): settle EACH row from verifyPredicateAttestation instead of
+     *     assuming all-or-nothing (0.12.0 contract).
+     */
+    private async runProveBatchDetached(
+        claimMeta: { proofLogId: string; key: string }[],
+        passportRowId: string,
+        rootInBatch: boolean,
+        args: Record<string, unknown> & { sessionId: string; contractAddress: string },
+        user: unknown
+    ): Promise<void> {
+        const log = cds.log('producer');
+        let res: any = null;
+        try {
+            const nightgate = await cds.connect.to('NightgateService');
+            const prewarmJob = this.serverPrewarmJobs.get(args.sessionId);
+            if (prewarmJob) {
+                this.serverPrewarmJobs.delete(args.sessionId);
+                await waitForJobResult(nightgate, prewarmJob, args.sessionId, user);
+            }
+            res = await sendDetached(nightgate, 'issueFieldPredicateAttestationBatch', args, user);
+            const jobResult: any = await waitForJobResult(
+                nightgate, res.jobId, args.sessionId, user, { requireChainSuccess: true }
+            );
+            const txHash = String(jobResult?.proof?.proofValue ?? jobResult?.txHash ?? '');
+            const paByKey = this.batchClaimIdsByKey(res, jobResult);
+            await this.runDetached(async () => {
+                for (const m of claimMeta) {
+                    await UPDATE.entity(PredicateProofLog).set({
+                        status: 'succeeded', result: true, txHash,
+                        predicateAttestationId: paByKey.get(m.key) ?? ''
+                    }).where({ ID: m.proofLogId });
+                }
+                if (rootInBatch) {
+                    // The root anchor rode in the SAME tx as the proofs.
+                    await INSERT.into(PassportTransactions).entries({
+                        passport_ID: passportRowId, kind: 'anchorContentRoot', jobId: res.jobId,
+                        txHash, status: 'succeeded', explorerUrl: txExplorerUrl(txHash)
+                    } as any);
+                }
+                await INSERT.into(PassportTransactions).entries({
+                    passport_ID: passportRowId, kind: 'provePredicate', jobId: res.jobId, txHash,
+                    status: 'succeeded', explorerUrl: txExplorerUrl(txHash)
+                } as any);
+            });
+            log.info(`proof cart proven (${claimMeta.length} claims, one tx): ${txHash}`);
+        } catch (e) {
+            const msg = String((e as Error)?.message ?? e).slice(0, 500);
+            const partial = /OnChainStatus|PARTIAL/i.test(msg) && res;
+            log.warn(`proof cart ${partial ? 'PARTIAL' : 'failed'} for passport row ${passportRowId}:`, e);
+            const paByKey = res ? this.batchClaimIdsByKey(res, null) : new Map<string, string>();
+            const verdicts = new Map<string, { verified: boolean; txHash: string }>();
+            if (partial) {
+                // Which claims actually landed? Ask the crawler-free per-claim
+                // verifier; unreachable = leave that row failed (never lie green).
+                const nightgate = await cds.connect.to('NightgateService').catch(() => null);
+                for (const m of claimMeta) {
+                    const paId = paByKey.get(m.key);
+                    if (!nightgate || !paId) continue;
+                    try {
+                        const v: any = await sendDetached(nightgate, 'verifyPredicateAttestation',
+                            { predicateAttestationId: paId }, user);
+                        verdicts.set(m.key, { verified: !!v?.verified, txHash: String(v?.provenTxHash ?? '') });
+                    } catch { /* stays failed */ }
+                }
+            }
+            await this.runDetached(async () => {
+                for (const m of claimMeta) {
+                    const v = verdicts.get(m.key);
+                    if (v?.verified) {
+                        await UPDATE.entity(PredicateProofLog).set({
+                            status: 'succeeded', result: true, txHash: v.txHash,
+                            predicateAttestationId: paByKey.get(m.key) ?? ''
+                        }).where({ ID: m.proofLogId });
+                    } else {
+                        await UPDATE.entity(PredicateProofLog).set({ status: 'failed', result: false })
+                            .where({ ID: m.proofLogId });
+                    }
+                }
+                await INSERT.into(PassportTransactions).entries({
+                    passport_ID: passportRowId, kind: 'provePredicate',
+                    status: 'failed', errorMessage: msg
+                } as any);
+            });
+        }
+    }
+
+    /** Claim key -> predicateAttestationId from the batch action response
+     *  (res.claims, JSON string) or the job result (claims array). */
+    private batchClaimIdsByKey(res: any, jobResult: any): Map<string, string> {
+        const out = new Map<string, string>();
+        const add = (c: any) => {
+            const pred = c?.predicate ?? c?.claim?.predicate;
+            const thr = c?.threshold ?? c?.claim?.threshold;
+            if (c?.predicateAttestationId && c?.fieldKey && pred != null && thr != null) {
+                out.set(`${String(c.fieldKey).toLowerCase()}|${thr}|${pred}`, String(c.predicateAttestationId));
+            }
+        };
+        try { for (const c of JSON.parse(String(res?.claims ?? '[]'))) add(c); } catch { /* job result below */ }
+        for (const c of (Array.isArray(jobResult?.claims) ? jobResult.claims : [])) add(c);
+        return out;
+    }
 
     /**
      * The long-running leg of provePassportValue. The field-bound proof job

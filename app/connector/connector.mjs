@@ -25,6 +25,7 @@ if (typeof globalThis.global === 'undefined') globalThis.global = globalThis;
 // list the server submits via NIGHTGATE submitContractCallBatch, so the two
 // anchor paths cannot drift.
 import { anchorCallPlan } from '../../srv/lib/anchor-plan';
+import { proofCartPlan } from '../../srv/lib/proof-plan';
 
 // NOTE: all heavy SDK/WASM imports are LAZY (loaded inside the action functions)
 // so the page + wallet connect work even before any ZK artifact loads. Importing
@@ -675,8 +676,10 @@ function withOrderedBatchSegments(proofProvider, circuitsInOrder) {
  * withContractScopedTransaction batches the circuit calls and proves,
  * balances and submits ONCE at scope end (one wallet approval). All calls
  * share the first call's witnesses (findDeployedContract binds ONE witness
- * set; the anchor circuits all take just the attester secret). Mirrors
- * NIGHTGATE's runBatchInScope.
+ * set; the anchor circuits all take just the attester secret). A call may
+ * carry an optional `before()` hook, invoked right before its callTx: the
+ * proof cart uses it to swap per-call witness data (Merkle proofs) behind
+ * the ONE bound witness object. Mirrors NIGHTGATE's runBatchInScope.
  */
 async function runPreparedBatch(api, contractAddress, calls, log) {
     if (!contractAddress) throw new Error('contractAddress is required (the deployed vault address)');
@@ -704,7 +707,10 @@ async function runPreparedBatch(api, contractAddress, calls, log) {
     };
     log(`submitting batch [${circuits.join('+')}] (ONE prove + balance + submit via wallet)…`);
     const finalized = await contracts.withContractScopedTransaction(scopedProviders, async (txCtx) => {
-        for (const c of calls) await deployed.callTx[c.circuitId](txCtx, ...c.args);
+        for (const c of calls) {
+            if (typeof c.before === 'function') c.before();
+            await deployed.callTx[c.circuitId](txCtx, ...c.args);
+        }
     }, { scopeName: `batch:${circuits.join('+')}` });
     log(`submitted batch [${circuits.join('+')}]: ${safeStr(finalized?.public?.txId ?? finalized?.public?.txHash ?? '')}`);
     return finalized;
@@ -754,6 +760,75 @@ export async function proveFieldPredicate(api, { contractAddress, payloadHash, f
     const result = await runPreparedCall(api, contractAddress, call, L);
     L(`✓ field-bound predicate proven on-chain: the passport's own value ${opNum === 0 ? '≤' : '≥'} ${threshold} holds.`);
     return result;
+}
+
+/**
+ * Proof cart: prove N field-bound predicates for ONE passport in ONE
+ * transaction (one wallet approval, one fee). `proofs` entries carry the
+ * claim ({ fieldKey, threshold (scaled), op }) plus their inclusion proof
+ * ({ fieldValue (scaled decimal string), siblings (4 x 64-hex), dirs (4
+ * booleans) }); the claim list is validated/deduped by the shared
+ * proofCartPlan (same source the server lane will consume).
+ *
+ * Witness mechanics: findDeployedContract binds ONE witness object, but each
+ * proveFieldPredicate needs its own Merkle proof. The witness functions for
+ * field_value/merkle_siblings/merkle_dirs therefore read a mutable holder,
+ * and each call's before() hook (runPreparedBatch) points the holder at that
+ * call's pre-converted proof data. Calls run sequentially inside the scope,
+ * so this is deterministic and independent of witness invocation counts.
+ *
+ * Failure semantics: a predicate that does not hold rejects during LOCAL
+ * proving ("predicate false"), so the whole cart aborts with nothing
+ * submitted. Proving time stays additive (N proofs = N proving runs); the
+ * cart amortizes approvals, balancing, fees and confirmation waits to one.
+ */
+export async function proveFieldPredicateBatch(api, { contractAddress, payloadHash, proofs }, log = console.log) {
+    const L = mklog(log);
+    if (!Array.isArray(proofs) || !proofs.length) throw new Error('proveFieldPredicateBatch: proofs must be a non-empty array');
+    L('proveFieldPredicateBatch: loading browser SDK…');
+    const { buildAttestationVaultWitnesses } = await loadBrowserSdk();
+    L('proveFieldPredicateBatch: deriving app-managed attester secret…');
+    const attestationSecret = await deriveAttesterSecret(api);
+    const plan = proofCartPlan({
+        payloadHash,
+        claims: proofs.map((p) => ({ fieldKey: p.fieldKey, threshold: p.threshold, op: Number(p.op) }))
+    });
+    if (plan.dropped.length) L(`proveFieldPredicateBatch: dropped ${plan.dropped.length} duplicate claim(s) (already in the cart)`);
+    // Pre-convert each kept claim's witness data; the holder swaps between
+    // calls. Claims were deduped by (fieldKey, threshold, op), so matching
+    // the original proofs entry by the same key is unambiguous.
+    const byKey = new Map(proofs.map((p) => [
+        `${String(p.fieldKey).toLowerCase()}|${String(p.threshold)}|${Number(p.op)}`, p
+    ]));
+    const converted = plan.claims.map((c) => {
+        const src = byKey.get(`${c.fieldKey}|${c.threshold}|${c.op}`);
+        if (!src) throw new Error(`no inclusion proof supplied for claim on field key ${c.fieldKey.slice(0, 16)}…`);
+        const siblings = (src.siblings || []).map((h) => fromHex(h));
+        const dirs = (src.dirs || []).map(Boolean);
+        if (siblings.length !== 4 || dirs.length !== 4) {
+            throw new Error('each proof needs a depth-4 inclusion proof (4 siblings + 4 dirs)');
+        }
+        return { fieldValue: BigInt(src.fieldValue), siblings, dirs };
+    });
+    const holder = { current: null };
+    // Base witnesses carry the attester secret; the Merkle witnesses read the
+    // holder so ONE bound witness object serves every call's distinct proof.
+    const witnesses = {
+        ...buildAttestationVaultWitnesses({ attestationSecret }),
+        field_value: (ctx) => [ctx.privateState, holder.current.fieldValue],
+        merkle_siblings: (ctx) => [ctx.privateState, holder.current.siblings],
+        merkle_dirs: (ctx) => [ctx.privateState, holder.current.dirs]
+    };
+    const calls = plan.calls.map((c, i) => ({
+        circuitId: c.circuit,
+        args: [fromHex(c.args[0]), fromHex(c.args[1]), BigInt(c.args[2]), BigInt(c.args[3])],
+        witnesses,
+        before: () => { holder.current = converted[i]; }
+    }));
+    L(`proveFieldPredicateBatch: ${calls.length} predicate proof(s) in one tx (proving runs once per claim, please wait)…`);
+    const result = await runPreparedBatch(api, contractAddress, calls, L);
+    L(`✓ ${calls.length} field-bound predicate(s) proven on-chain in one transaction, values hidden.`);
+    return { ...(result && typeof result === 'object' ? result : { result }), claims: plan.claims, dropped: plan.dropped };
 }
 
 // --- On-chain verification (indexer scan) -----------------------------------

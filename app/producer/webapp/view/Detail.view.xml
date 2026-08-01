@@ -235,6 +235,29 @@
                 <Input id="proofUnit" value="kg CO₂ / kWh"/>
               </f:content>
             </f:SimpleForm>
+            <!-- Proof cart: collect claims, prove them all in ONE tx. Wallet
+                 mode = one approval via the connector batch; server mode =
+                 the platform batch action (one sponsored tx). -->
+            <Toolbar style="Clear">
+              <Button text="Add to cart" icon="sap-icon://cart-3" press="onCartAdd" enabled="{ui>/anchored}"
+                      tooltip="Collect several claims and prove them together in ONE transaction (one fee; wallet mode: one approval)"/>
+              <ToolbarSpacer/>
+            </Toolbar>
+            <Panel headerText="Proof cart" class="sapUiSmallMarginTop"
+                   visible="{= ${cart>/items}.length > 0 }">
+              <List items="{cart>/items}" mode="Delete" delete="onCartRemove">
+                <StandardListItem title="{cart>label}" icon="sap-icon://simulate"/>
+              </List>
+              <Text class="sapUiTinyMargin"
+                    text="All claims ride in one transaction. If one predicate does not hold, the whole cart is rejected during proving and nothing is submitted. Proving time grows with each claim; values stay confidential."/>
+              <Toolbar style="Clear">
+                <ToolbarSpacer/>
+                <Button text="Clear" press="onCartClear"/>
+                <Button type="Emphasized" press="onProveCart" enabled="{ui>/anchored}"
+                        icon="{= ${session>/mode} === 'server' ? 'sap-icon://it-host' : 'sap-icon://wallet' }"
+                        text="Prove all ({= ${cart>/items}.length }) · one tx"/>
+              </Toolbar>
+            </Panel>
             <Table id="proofTable" items="{/PredicateProofLog}" growing="true" headerText="Proof log">
               <columns>
                 <Column><Text text="Field"/></Column>

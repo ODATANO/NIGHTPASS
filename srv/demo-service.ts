@@ -63,6 +63,7 @@ export default class DemoService extends cds.ApplicationService {
             // inside their attest step.
             void this.prewarmSponsor().catch((e: unknown) =>
                 cds.log('demo').warn('sponsor boot prewarm failed:', (e as Error)?.message));
+            this.startSponsorWatchdog();
         });
         return super.init();
     }
@@ -787,6 +788,47 @@ export default class DemoService extends cds.ApplicationService {
     private patchRun(runId: string, patch: Record<string, unknown>): Promise<unknown> {
         return this.detachedWrite(() =>
             UPDATE.entity(Runs).set(patch).where({ ID: runId }) as any);
+    }
+
+    private sponsorWatchdogTimer?: ReturnType<typeof setInterval>;
+
+    /**
+     * Periodic sponsor health check. Sponsor sessions can die while the
+     * container keeps running: the session row hits its TTL and NIGHTGATE's
+     * cleanup removes it ("Session not found or inactive", seen live
+     * 2026-08-01 after 28h uptime), or the facade gets evicted. The boot
+     * prewarm only runs once, so without this every visitor run fails at
+     * sponsoring until someone restarts the container.
+     *
+     * Each tick calls sponsorPoolStatus, which already self-heals a DEAD
+     * cached session (drops it and reconnects). Members with no session at
+     * all ('cold', e.g. a failed boot prewarm) or a failed open ('error')
+     * additionally get a fresh prewarm kick here. The balance reads behind
+     * the tick are bounded (10s wallet-read timeout) and run detached.
+     *
+     * DEMO_SPONSOR_WATCHDOG_MS overrides the 5-min default; 0 disables.
+     */
+    private startSponsorWatchdog(): void {
+        if (!this.enabled() || !feeSponsorWalletIds().length) return;
+        const interval = Number(process.env.DEMO_SPONSOR_WATCHDOG_MS ?? 300_000);
+        if (!interval || interval < 0) return;
+        const tick = async () => {
+            try {
+                const producer: any = await cds.connect.to('ProducerService');
+                const pool: any[] = await sendDetached(producer, 'sponsorPoolStatus', {}, this.techUser());
+                for (const s of pool ?? []) {
+                    if (!s || s.healthy || s.state === 'warming' || s.state === 'ready') continue;
+                    cds.log('demo').warn(
+                        `sponsor watchdog: '${s.walletId}' is ${s.state}${s.error ? ` (${String(s.error).slice(0, 120)})` : ''}; kicking prewarm`);
+                    await producer.tx({ user: this.techUser() }, (tx: any) =>
+                        tx.send('prewarmServerWallet', { walletId: s.walletId }));
+                }
+            } catch (e) {
+                cds.log('demo').warn('sponsor watchdog tick failed:', (e as Error)?.message);
+            }
+        };
+        this.sponsorWatchdogTimer = setInterval(() => void tick(), interval);
+        this.sponsorWatchdogTimer.unref?.();
     }
 
     /** Kick every pool sponsor's session + sync at boot (non-blocking). The

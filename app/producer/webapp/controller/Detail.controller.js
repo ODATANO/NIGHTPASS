@@ -22,6 +22,8 @@ sap.ui.define([
       // Conformance tab: BatteryPass-Ready validation result.
       this.getView().setModel(new JSONModel({ busy: false, text: "", state: "None", valid: false, issues: [] }), "conf");
       this.getView().setModel(new JSONModel({ busy: false, text: "", state: "None" }), "dd");
+      // Proof cart (wallet mode): collected claims, proven together in ONE tx.
+      this.getView().setModel(new JSONModel({ items: [] }), "cart");
     },
 
     // Publish the anchored passport to the public explorer instance.
@@ -173,6 +175,8 @@ sap.ui.define([
       });
       this._filterLogs(this._id);
       this._syncAnchored();
+      // The cart is per passport; navigating to another row empties it.
+      this.getView().getModel("cart").setProperty("/items", []);
     },
 
     // Refresh the on-chain-anchored flag (Grant/Revoke/Prove enablement) from the
@@ -639,6 +643,155 @@ sap.ui.define([
           await that.callAction("/recordWalletPredicate", { passportId: that._pid(), sourceField: field, predicate: predicate, threshold: thresholdScaled, unit: unit, txHash: r.hash, result: true });
           that._refreshAll(); append("done."); that.toast("field-bound predicate proven via wallet");
         });
+      }).catch(function (e) { that.error(e); });
+    },
+
+    // ---- proof cart: collect claims, prove them all in ONE wallet tx --------
+    // Wallet mode only for now: the server lane submits one tx per proof until
+    // NIGHTGATE ships the batch pendant (feature request pending); the shared
+    // proof-plan module keeps both lanes on the same contract.
+
+    _CART_MAX: 5, // N sequential wasm provings in the browser; keep it modest
+
+    onCartAdd: function () {
+      var oCart = this.getView().getModel("cart");
+      var aItems = oCart.getProperty("/items") || [];
+      if (aItems.length >= this._CART_MAX) {
+        return this.toast("cart is full (" + this._CART_MAX + " claims); prove it first");
+      }
+      var field = this.byId("proofField").getSelectedKey();
+      var predicate = this.byId("proofPredicate").getSelectedKey();
+      var thr = Number(this.byId("proofThreshold").getValue());
+      if (!isFinite(thr) || thr < 0) { return this.toast("threshold must be a non-negative number"); }
+      var unit = this.byId("proofUnit").getValue();
+      var sKey = field + "|" + predicate + "|" + thr;
+      if (aItems.some(function (i) { return i.key === sKey; })) {
+        return this.toast("this claim is already in the cart");
+      }
+      var sFieldLabel = this.byId("proofField").getSelectedItem().getText();
+      aItems = aItems.concat([{
+        key: sKey, field: field, predicate: predicate, threshold: thr, unit: unit,
+        label: sFieldLabel + " " + (predicate === "greaterOrEqual" ? "≥" : "≤") + " " + thr + (unit ? " " + unit : "")
+      }]);
+      oCart.setProperty("/items", aItems);
+      this.toast("claim added (" + aItems.length + " in the cart)");
+    },
+
+    onCartRemove: function (oEvent) {
+      var oCart = this.getView().getModel("cart");
+      var oItem = oEvent.getParameter("listItem");
+      var oCtx = oItem && oItem.getBindingContext("cart");
+      if (!oCtx) { return; }
+      var iIdx = Number(oCtx.getPath().split("/").pop());
+      var aItems = (oCart.getProperty("/items") || []).slice();
+      aItems.splice(iIdx, 1);
+      oCart.setProperty("/items", aItems);
+    },
+
+    onCartClear: function () {
+      this.getView().getModel("cart").setProperty("/items", []);
+    },
+
+    // Prove the whole cart in ONE tx. Dispatches on the signing mode:
+    // server -> provePassportValuesBatch (platform batch action, sponsored),
+    // wallet -> connector proveFieldPredicateBatch (one approval).
+    onProveCart: function () {
+      if (this._isServer()) { return this._proveCartServer(); }
+      var that = this;
+      var oCtx = this.getView().getBindingContext();
+      var ph = oCtx && (oCtx.getProperty("payloadHash") || "");
+      if (!ph) { return this.toast("attest the passport with your wallet first"); }
+      var aItems = this.getView().getModel("cart").getProperty("/items") || [];
+      if (!aItems.length) { return this.toast("the cart is empty"); }
+      // Server-side resolution first (the producer owns the values); abort
+      // before any wallet popup when an item is not provable.
+      Promise.all(aItems.map(function (it) {
+        return that.callAction("/passportFieldValue", { passportId: that._pid(), sourceField: it.field });
+      })).then(function (aRes) {
+        var aProofs = [];
+        for (var i = 0; i < aItems.length; i++) {
+          var res = aRes[i];
+          if (!res || !res.found || res.value === "" || !res.fieldKey || res.scaledValue === "" || !res.siblingsJson) {
+            return that.toast("'" + aItems[i].field + "' is not provable on this passport; remove it from the cart");
+          }
+          aProofs.push({
+            item: aItems[i],
+            fieldKey: res.fieldKey,
+            threshold: Math.round(aItems[i].threshold * 1000),
+            op: aItems[i].predicate === "greaterOrEqual" ? 1 : 0,
+            fieldValue: res.scaledValue,
+            siblings: JSON.parse(res.siblingsJson),
+            dirs: JSON.parse(res.dirsJson)
+          });
+        }
+        that._lace("Prove " + aProofs.length + " claims in one transaction", async function (mod, api, append, vault) {
+          if (typeof mod.proveFieldPredicateBatch !== "function") {
+            append("this connector build has no proof cart; falling back is manual (prove claims one by one).");
+            return that.toast("connector build too old for the proof cart");
+          }
+          append("proving " + aProofs.length + " claims bound to the anchored content root (values hidden). "
+            + "One approval, one fee; proving still runs once per claim, please wait…");
+          try {
+            await mod.proveFieldPredicateBatch(api, {
+              contractAddress: vault, payloadHash: ph,
+              proofs: aProofs.map(function (p) {
+                return { fieldKey: p.fieldKey, threshold: p.threshold, op: p.op,
+                         fieldValue: p.fieldValue, siblings: p.siblings, dirs: p.dirs };
+              })
+            }, append);
+          } catch (e) {
+            var msg = (e && (e.message || String(e))) || "";
+            if (/predicate false/i.test(msg)) {
+              // The circuit does not say WHICH claim failed; the cart is
+              // all-or-nothing and nothing reached the chain.
+              append("at least one claim does NOT hold for the passport's values; the whole cart was "
+                + "rejected during proving, nothing was submitted. Remove the failing claim and retry "
+                + "(claims: " + aProofs.map(function (p) { return p.item.label; }).join(" · ") + ").");
+              return that.toast("cart rejected: a claim does not hold");
+            }
+            throw e;
+          }
+          var r = await that._resolveHash(mod, append);
+          append("saving " + aProofs.length + " proofs in cockpit…");
+          for (var j = 0; j < aProofs.length; j++) {
+            var p = aProofs[j];
+            await that.callAction("/recordWalletPredicate", {
+              passportId: that._pid(), sourceField: p.item.field, predicate: p.item.predicate,
+              threshold: p.threshold, unit: p.item.unit, txHash: r.hash, result: true
+            });
+          }
+          that.getView().getModel("cart").setProperty("/items", []);
+          that._refreshAll(); append("done.");
+          that.toast(aProofs.length + " claims proven in one transaction");
+        });
+      }).catch(function (e) { that.error(e); });
+    },
+
+    // Server-mode cart: the server resolves values + inclusion proofs itself;
+    // the raw human thresholds travel as claimsJson (scaled server-side, same
+    // as the single prove action). The proof runs detached; poll a log row.
+    _proveCartServer: function () {
+      var that = this;
+      var aItems = this.getView().getModel("cart").getProperty("/items") || [];
+      if (!aItems.length) { return this.toast("the cart is empty"); }
+      this.callAction("/provePassportValuesBatch", {
+        passportId: this._pid(),
+        claimsJson: JSON.stringify(aItems.map(function (it) {
+          return { sourceField: it.field, predicate: it.predicate, threshold: it.threshold, unit: it.unit };
+        })),
+        walletId: this._walletId()
+      }).then(function (res) {
+        if (res.mode === "proving") {
+          var aIds = [];
+          try { aIds = JSON.parse(res.proofLogIds || "[]"); } catch (e) { /* toast below */ }
+          that.toast(aItems.length + " claims proving in one background tx"
+            + (res.dropped ? " (" + res.dropped + " duplicate(s) dropped)" : ""));
+          if (aIds.length) { that._pollProof(aIds[0]); }
+          that.getView().getModel("cart").setProperty("/items", []);
+        } else {
+          that.toast("stored offline (no signing session): " + res.mode);
+        }
+        that._refreshAll();
       }).catch(function (e) { that.error(e); });
     },
 
