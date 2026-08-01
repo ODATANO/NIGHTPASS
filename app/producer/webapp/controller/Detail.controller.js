@@ -46,7 +46,7 @@ sap.ui.define([
           var text, state;
           if (r.error) { text = r.error; state = "Warning"; }
           else if (r.valid) { text = "Conformant · 0 findings (" + r.guide + ")"; state = "Success"; }
-          else { text = r.errorCount + " finding(s) against " + r.guide + " — see below"; state = "Error"; }
+          else { text = r.errorCount + " finding(s) against " + r.guide + ", see below"; state = "Error"; }
           oConf.setData({ busy: false, text: text, state: state, valid: !!r.valid, issues: r.issues || [] });
           that._session().setProperty("/lastValidated", r.valid ? that._pid() : "");
         })
@@ -691,8 +691,16 @@ sap.ui.define([
           return;
         }
         var sVault = await this._vault();
-        // The picker always asks, even with a single wallet (see util/WalletPicker.js).
-        var sKey = await WalletPicker.choose(w);
+        // Reuse the wallet chosen at sign-in when it is still injected: the user
+        // already expressed the preference THIS session (in-memory only; the
+        // localStorage variant was removed for good reason, see WalletPicker.js).
+        // Any other case falls back to the picker, and a fresh pick is
+        // remembered for the next action in the same session.
+        var sKey = this._session().getProperty("/browserWalletKey") || "";
+        if (!sKey || !w.some(function (x) { return x.key === sKey; })) {
+          sKey = await WalletPicker.choose(w);
+          this._session().setProperty("/browserWalletKey", sKey);
+        }
         var oChosen = w.filter(function (x) { return x.key === sKey; })[0] || { name: sKey };
         append("connecting " + oChosen.name + ", approve the request in your wallet…");
         var api = await mod.connect(sKey);
@@ -718,19 +726,38 @@ sap.ui.define([
       if (!ph) { return this.toast("passport has no payloadHash yet, save it first"); }
       var that = this;
       // Fetch the content root (Merkle over the passport's provable fields) so
-      // attest also anchors it; later field-bound proofs bind to this root.
-      this.callAction("/passportFieldValue", { passportId: this._pid(), sourceField: "carbonFootprintKgCO2" }).then(function (res) {
-        var contentRoot = (res && res.contentRoot) || "";
+      // attest also anchors it, and the passportIdHash for the QR binding.
+      // requestProperty forces passportIdHash into $select (it is not bound in
+      // the view).
+      Promise.all([
+        this.callAction("/passportFieldValue", { passportId: this._pid(), sourceField: "carbonFootprintKgCO2" }),
+        oCtx.requestProperty("passportIdHash")
+      ]).then(function (aRes) {
+        var contentRoot = (aRes[0] && aRes[0].contentRoot) || "";
+        var pidHash = aRes[1] || "";
         that._lace("Attest with your wallet", async function (mod, api, append, vault) {
-          append("attesting the passport hash on-chain (prove -> balance -> submit)…");
-          await mod.attest(api, { contractAddress: vault, payloadHash: ph, metadataHash: ph }, append);
-          var r = await that._resolveHash(mod, append);
-          append("saving tx in cockpit…");
-          await that.callAction("/recordWalletAttest", { passportId: that._pid(), txHash: r.hash, identifier: r.id, contractAddress: vault });
-          if (contentRoot) {
-            append("anchoring content root (binds passport fields for field-bound proofs)…");
-            await mod.anchorContentRoot(api, { contractAddress: vault, payloadHash: ph, contentRoot: contentRoot }, append);
-            await that._resolveHash(mod, append);
+          // Batch path: a connector bundle with anchorBatch composes attest +
+          // bindPassport + anchorContentRoot as ONE transaction (one wallet
+          // approval), same call plan as the server's submitContractCallBatch
+          // path. Feature-detected so a stale bundle keeps the proven
+          // sequential flow (which has no bindPassport).
+          if (typeof mod.anchorBatch === "function" && pidHash) {
+            append("anchoring attest + bindPassport" + (contentRoot ? " + content root" : "") + " as ONE transaction (prove -> balance -> submit)…");
+            await mod.anchorBatch(api, { contractAddress: vault, payloadHash: ph, metadataHash: ph, passportIdHash: pidHash, contentRoot: contentRoot }, append);
+            var r = await that._resolveHash(mod, append);
+            append("saving tx in cockpit…");
+            await that.callAction("/recordWalletAttest", { passportId: that._pid(), txHash: r.hash, identifier: r.id, contractAddress: vault });
+          } else {
+            append("attesting the passport hash on-chain (prove -> balance -> submit)…");
+            await mod.attest(api, { contractAddress: vault, payloadHash: ph, metadataHash: ph }, append);
+            var r2 = await that._resolveHash(mod, append);
+            append("saving tx in cockpit…");
+            await that.callAction("/recordWalletAttest", { passportId: that._pid(), txHash: r2.hash, identifier: r2.id, contractAddress: vault });
+            if (contentRoot) {
+              append("anchoring content root (binds passport fields for field-bound proofs)…");
+              await mod.anchorContentRoot(api, { contractAddress: vault, payloadHash: ph, contentRoot: contentRoot }, append);
+              await that._resolveHash(mod, append);
+            }
           }
           that._refreshAll(); append("done."); that.toast("attest via wallet saved");
         });

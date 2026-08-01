@@ -109,6 +109,7 @@ sap.ui.define([
 
     onInit: function () {
       this._router().getRoute("main").attachPatternMatched(this._onMatched, this);
+      this.getView().setModel(new JSONModel({ rows: [], busy: false }), "s4");
       this._applyOwnerFilter();
     },
 
@@ -202,6 +203,50 @@ sap.ui.define([
       var oDraft = defaultDraft(oEvent.getParameter("selectedItem").getKey());
       oDraft.passportId = sKeep;
       oModel.setData(oDraft);
+    },
+
+    // ---- S/4 goods receipts ----
+
+    // Pull the latest goods receipts from the configured S/4 system. The
+    // server does the mapping (product master + live enrichment) and returns
+    // ready-to-create passportJson per row; 503 = no S/4 system configured.
+    onS4Fetch: function () {
+      var oModel = this.getView().getModel("s4");
+      var that = this;
+      oModel.setProperty("/busy", true);
+      fetch("/api/v1/producer/s4GoodsReceipts()", { headers: this._authHeaders() })
+        .then(function (r) {
+          if (r.status === 503) { throw new Error("No S/4 system configured on this server (S4_BASE_URL)."); }
+          if (!r.ok) { return r.text().then(function (t) { throw new Error(t || ("HTTP " + r.status)); }); }
+          return r.json();
+        })
+        .then(function (b) {
+          var aRows = b.value || [];
+          oModel.setProperty("/rows", aRows);
+          var nReady = aRows.filter(function (r) { return r.status === "ready"; }).length;
+          that.toast(aRows.length + " goods receipts fetched, " + nReady + " ready for a passport");
+        })
+        .catch(function (e) { that.error(e); })
+        .finally(function () { oModel.setProperty("/busy", false); });
+    },
+
+    // Same create path as the dialog: the S/4 row already carries the exact
+    // passportJson; the passport lands as an off-chain draft owned by the
+    // connected wallet and is anchored from the detail cockpit as usual.
+    onS4Create: function (oEvent) {
+      if (!this._session().getProperty("/connected")) { return this.toast("connect your wallet first"); }
+      var oCtx = oEvent.getSource().getBindingContext("s4");
+      var oRow = oCtx.getObject();
+      var that = this;
+      this.callAction("/createPassport", {
+        passportJson: oRow.passportJson,
+        submit: false,
+        owner: this._session().getProperty("/owner")
+      }).then(function (res) {
+        that.getView().getModel("s4").setProperty(oCtx.getPath() + "/status", "exists");
+        that.onRefresh();
+        that.toast("Passport " + res.passportId + " created from " + oRow.docKey + " (" + res.mode + ")");
+      }).catch(function (e) { that.error(e); });
     },
 
     // ---- register partner (self-service registry) ----

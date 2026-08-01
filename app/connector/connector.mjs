@@ -21,6 +21,11 @@ import { Buffer as NodeBuffer } from 'buffer';
 if (typeof globalThis.Buffer === 'undefined') globalThis.Buffer = NodeBuffer;
 if (typeof globalThis.global === 'undefined') globalThis.global = globalThis;
 
+// Shared anchor call plan (pure TS, bundled by vite): the SAME ordered circuit
+// list the server submits via NIGHTGATE submitContractCallBatch, so the two
+// anchor paths cannot drift.
+import { anchorCallPlan } from '../../srv/lib/anchor-plan';
+
 // NOTE: all heavy SDK/WASM imports are LAZY (loaded inside the action functions)
 // so the page + wallet connect work even before any ZK artifact loads. Importing
 // @odatano/nightgate/browser eagerly would pull ledger/runtime WASM at page load
@@ -574,6 +579,158 @@ export async function anchorContentRoot(api, { contractAddress, payloadHash, con
     };
     L('anchoring content root (binds the passport fields for later field-bound proofs)…');
     return runPreparedCall(api, contractAddress, call, L);
+}
+
+// --- Batched anchor: attest + bindPassport + anchorContentRoot in ONE tx -----
+// Ported from NIGHTGATE's server-side batch submitter (srv/midnight/
+// batch-segment-order.ts + batch-call-scope.ts, plugin >= 0.10.0).
+// midnight-js-contracts builds each circuit call via
+// Transaction.fromPartsRandomized, which RANDOMIZES the intent's segment id,
+// and the ledger applies merged intents in ascending segment order. A batch of
+// dependent calls (bindPassport asserts the attest) would only land when the
+// dice fell in call order. The fix window: the scope hands the merged tx to
+// the proof provider FIRST, still unbound and unproven, and ledger-v8
+// documents Transaction.intents as writable exactly then. So before proving
+// we reassign the EXISTING segment ids, sorted ascending, to the batch's
+// intents in call order: apply order == call order, deterministically.
+
+const utf8Decoder = new TextDecoder();
+function entryPointName(ep) {
+    if (typeof ep === 'string') return ep;
+    if (ep instanceof Uint8Array) return utf8Decoder.decode(ep);
+    return String(ep ?? '');
+}
+
+/**
+ * Rewrite `tx.intents` so the intents matching `circuitsInOrder` (via their
+ * first action's entryPoint) carry ascending segment ids in call order. Only
+ * the matched intents' own ids are permuted; unmatched intents keep theirs, so
+ * nothing can collide with segments added later (fee/dust balancing). Returns
+ * true when a rewrite happened; on ANY mismatch the tx is left untouched and
+ * false is returned (the wrapper below treats that as fatal for multi-call
+ * batches).
+ */
+function orderBatchSegments(tx, circuitsInOrder) {
+    const intents = tx?.intents;
+    if (!intents || typeof intents.entries !== 'function') return false;
+    if (circuitsInOrder.length < 2 || intents.size < 2) return false;
+    const entries = Array.from(intents.entries());
+    const pools = new Map();
+    for (const [segId, intent] of entries) {
+        const name = entryPointName(intent?.actions?.[0]?.entryPoint);
+        const pool = pools.get(name);
+        if (pool) pool.push([segId, intent]);
+        else pools.set(name, [[segId, intent]]);
+    }
+    const picked = [];
+    for (const circuit of circuitsInOrder) {
+        const pool = pools.get(circuit);
+        if (!pool || pool.length === 0) return false;
+        picked.push(pool.shift());
+    }
+    const pickedIntents = new Set(picked.map(([, intent]) => intent));
+    const pickedIdsAsc = picked.map(([segId]) => segId).sort((a, b) => a - b);
+    const next = new Map();
+    for (const [segId, intent] of entries) {
+        if (!pickedIntents.has(intent)) next.set(segId, intent);
+    }
+    picked.forEach(([, intent], i) => next.set(pickedIdsAsc[i], intent));
+    if (next.size !== intents.size) return false;
+    tx.intents = next; // ledger-v8 re-computes binding (unbound + unproven only)
+    return true;
+}
+
+/**
+ * Wrap a proof provider so `proveTx` first rewrites the batch's segment ids
+ * into call order, then delegates. Prototype-preserving (Object.create), so
+ * any extra provider surface stays reachable. FAIL-CLOSED for multi-call
+ * batches: if the ordering cannot be established the wrapper THROWS before
+ * proving, so nothing reaches the chain instead of silently proving in
+ * randomized order and risking PARTIAL_SUCCESS with partial on-chain effects.
+ */
+function withOrderedBatchSegments(proofProvider, circuitsInOrder) {
+    const wrapped = Object.create(proofProvider);
+    wrapped.proveTx = async (tx, ...rest) => {
+        if (circuitsInOrder.length >= 2) {
+            let ordered = false;
+            try {
+                ordered = orderBatchSegments(tx, circuitsInOrder);
+            } catch (err) {
+                throw new Error(`batch segment ordering failed for [${circuitsInOrder.join('+')}]: ${err?.message ?? err}; ` +
+                    'aborting before proving (nothing submitted) because the deterministic apply order cannot be guaranteed');
+            }
+            if (!ordered) {
+                throw new Error(`batch segment ordering could not match the transaction intents to the call list [${circuitsInOrder.join('+')}]; ` +
+                    'aborting before proving (nothing submitted) because the deterministic apply order cannot be guaranteed');
+            }
+        }
+        return proofProvider.proveTx(tx, ...rest);
+    };
+    return wrapped;
+}
+
+/**
+ * Run an ordered list of prepared calls ({ circuitId, args, witnesses })
+ * against the SAME vault as ONE transaction: the SDK's
+ * withContractScopedTransaction batches the circuit calls and proves,
+ * balances and submits ONCE at scope end (one wallet approval). All calls
+ * share the first call's witnesses (findDeployedContract binds ONE witness
+ * set; the anchor circuits all take just the attester secret). Mirrors
+ * NIGHTGATE's runBatchInScope.
+ */
+async function runPreparedBatch(api, contractAddress, calls, log) {
+    if (!contractAddress) throw new Error('contractAddress is required (the deployed vault address)');
+    const { fullProviders, compiledContract, contracts } = await prepareSdkContext(api, calls[0].witnesses, log);
+    if (typeof contracts.withContractScopedTransaction !== 'function') {
+        throw new Error('the installed midnight-js SDK has no withContractScopedTransaction; batched call transactions are not supported');
+    }
+    const circuits = calls.map((c) => c.circuitId);
+    log(`finding deployed contract for batch [${circuits.join('+')}]…`);
+    const deployed = await contracts.findDeployedContract(fullProviders, {
+        contractAddress, compiledContract,
+        privateStateId: PRIVATE_STATE_ID,
+        initialPrivateState: {}
+    });
+    for (const c of calls) {
+        if (typeof deployed?.callTx?.[c.circuitId] !== 'function') {
+            throw new Error(`circuit '${c.circuitId}' not found on contract at ${contractAddress}`);
+        }
+    }
+    // Deterministic apply order: only the scope's providers get the wrapped
+    // proof provider (findDeployedContract above proves nothing).
+    const scopedProviders = {
+        ...fullProviders,
+        proofProvider: withOrderedBatchSegments(fullProviders.proofProvider, circuits)
+    };
+    log(`submitting batch [${circuits.join('+')}] (ONE prove + balance + submit via wallet)…`);
+    const finalized = await contracts.withContractScopedTransaction(scopedProviders, async (txCtx) => {
+        for (const c of calls) await deployed.callTx[c.circuitId](txCtx, ...c.args);
+    }, { scopeName: `batch:${circuits.join('+')}` });
+    log(`submitted batch [${circuits.join('+')}]: ${safeStr(finalized?.public?.txId ?? finalized?.public?.txHash ?? '')}`);
+    return finalized;
+}
+
+/**
+ * Anchor a passport in ONE transaction: attest + bindPassport + optional
+ * anchorContentRoot against the same vault, one wallet approval. The call
+ * list comes from the shared anchorCallPlan (the same source as the server's
+ * batched submitContractCallBatch path). bindPassport binds the
+ * passportIdHash to this wallet's attester identity and asserts the attest,
+ * which is exactly why the deterministic call order above is required.
+ */
+export async function anchorBatch(api, { contractAddress, payloadHash, metadataHash, passportIdHash, contentRoot }, log = console.log) {
+    const L = mklog(log);
+    L('anchorBatch: loading browser SDK (first call downloads ~10MB WASM, please wait)…');
+    const { buildAttestationVaultWitnesses } = await loadBrowserSdk();
+    L('anchorBatch: deriving app-managed attester secret (no wallet popup)…');
+    const attestationSecret = await deriveAttesterSecret(api);
+    const witnesses = buildAttestationVaultWitnesses({ attestationSecret });
+    // Plan args are 64-hex Bytes<32> strings in circuit signature order; the
+    // anchor circuits take no other argument types.
+    const calls = anchorCallPlan({ payloadHash, metadataHash, passportIdHash, ...(contentRoot ? { contentRoot } : {}) })
+        .map((c) => ({ circuitId: c.circuit, args: c.args.map((h) => fromHex(h)), witnesses }));
+    L(`anchorBatch: ${calls.length} vault calls in one tx [${calls.map((c) => c.circuitId).join('+')}]`);
+    return runPreparedBatch(api, contractAddress, calls, L);
 }
 
 /**

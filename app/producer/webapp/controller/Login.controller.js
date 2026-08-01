@@ -68,6 +68,9 @@ sap.ui.define([
         if (!sOwner) { return this.error("wallet returned no address"); }
         // The signer label is the wallet that actually signed, not a hard-coded "Lace". The cockpit
         // shows it in the header, and naming the wrong wallet there is worse than naming none.
+        // Remember the connector KEY for this session (in-memory only, dies with
+        // the page): the detail flows reuse it instead of re-asking per action.
+        this._session().setProperty("/browserWalletKey", sKey);
         this._enter("wallet", "", sOwner, oChosen.name || "wallet");
       } catch (e) {
         if (e && e.cancelled) { return; } // user closed the picker; not an error

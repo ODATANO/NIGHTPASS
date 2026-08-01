@@ -29,29 +29,25 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {
     goodsReceiptItems, materialDocumentToPassportInput, toCloudEvent,
-    signErpEventBody, docItemKey, applyProductData,
-    type ProductMaster, type S4MaterialDocumentHeader, type S4ProductData
+    signErpEventBody, docItemKey
 } from '../srv/lib/s4-material-document';
+import { s4ConfigFromEnv, fetchMaterialDocuments, enrichMaster, loadProductMaster } from '../srv/lib/s4-client';
 
 const ONCE = process.argv.includes('--once');
 
-const S4_BASE = (process.env.S4_BASE_URL ?? '').replace(/\/+$/, '');
+const cfg = s4ConfigFromEnv();
 const NIGHTPASS_BASE = process.env.NIGHTPASS_BASE ?? 'http://localhost:4004';
 const SECRET = process.env.ERP_WEBHOOK_SECRET ?? '';
-const MOVEMENT_TYPES = (process.env.S4_MOVEMENT_TYPES ?? '101').split(',').map(s => s.trim()).filter(Boolean);
-const TOP = Math.max(1, Number(process.env.S4_TOP ?? 50) || 50);
-const MASTER_PATH = process.env.S4_PRODUCT_MASTER ?? 'config/s4-product-master.json';
 const STATE_PATH = process.env.S4_STATE_FILE ?? 'secrets/s4-bridge-state.json';
 const INTERVAL_MS = Math.max(5_000, Number(process.env.S4_POLL_INTERVAL_MS ?? 60_000) || 60_000);
 const SOURCE = process.env.S4_SOURCE ?? 'urn:odatano:s4-bridge';
-
-if (!S4_BASE) { console.error('S4_BASE_URL is required'); process.exit(1); }
-if (!SECRET) { console.error('ERP_WEBHOOK_SECRET is required'); process.exit(1); }
-
 const POST_DELAY_MS = Math.max(0, Number(process.env.S4_POST_DELAY_MS ?? 0) || 0);
 
-const master: ProductMaster = JSON.parse(fs.readFileSync(MASTER_PATH, 'utf8'));
-console.log(`[s4-bridge] product master: ${Object.keys(master).length} materials from ${MASTER_PATH}`);
+if (!cfg) { console.error('S4_BASE_URL is required'); process.exit(1); }
+if (!SECRET) { console.error('ERP_WEBHOOK_SECRET is required'); process.exit(1); }
+
+const master = loadProductMaster(cfg);
+console.log(`[s4-bridge] product master: ${Object.keys(master).length} materials from ${cfg.masterPath}`);
 
 // --- seen-state (bounded, best effort; the webhook stays the idempotency truth)
 
@@ -66,69 +62,6 @@ function saveState(state: BridgeState): void {
     state.seen = state.seen.slice(-SEEN_CAP);
     fs.mkdirSync(path.dirname(STATE_PATH), { recursive: true });
     fs.writeFileSync(STATE_PATH, JSON.stringify(state));
-}
-
-// --- S/4 read ----------------------------------------------------------------
-
-function s4Headers(): Record<string, string> {
-    const h: Record<string, string> = { Accept: 'application/json' };
-    if (process.env.S4_API_KEY) h.APIKey = process.env.S4_API_KEY;
-    else if (process.env.S4_USER) {
-        h.Authorization = 'Basic ' + Buffer.from(`${process.env.S4_USER}:${process.env.S4_PASSWORD ?? ''}`).toString('base64');
-    }
-    return h;
-}
-
-// --- product-master enrichment (API_PRODUCT_SRV, best effort) ----------------
-// Real S/4 master data wins over the configured JSON: net weight and (as a
-// fallback for a missing model) the product description. Disable with
-// S4_PRODUCT_LOOKUP=off. A failed lookup keeps the configured values.
-
-async function fetchProductData(material: string): Promise<S4ProductData | null> {
-    const base = `${S4_BASE}/sap/opu/odata/sap/API_PRODUCT_SRV`;
-    try {
-        const res = await fetch(
-            `${base}/A_Product('${encodeURIComponent(material)}')?$select=Product,NetWeight,GrossWeight,WeightUnit&$format=json`,
-            { headers: s4Headers(), signal: AbortSignal.timeout(30_000) });
-        if (!res.ok) return null;
-        const p: any = (await res.json())?.d ?? null;
-        if (!p) return null;
-        let description: string | null = null;
-        const dRes = await fetch(
-            `${base}/A_ProductDescription(Product='${encodeURIComponent(material)}',Language='EN')?$format=json`,
-            { headers: s4Headers(), signal: AbortSignal.timeout(30_000) });
-        if (dRes.ok) description = (await dRes.json())?.d?.ProductDescription ?? null;
-        return { NetWeight: p.NetWeight, GrossWeight: p.GrossWeight, WeightUnit: p.WeightUnit, description };
-    } catch {
-        return null;
-    }
-}
-
-async function enrichMaster(configured: ProductMaster): Promise<ProductMaster> {
-    if ((process.env.S4_PRODUCT_LOOKUP ?? 'on') === 'off') return configured;
-    const enriched: ProductMaster = {};
-    for (const [material, entry] of Object.entries(configured)) {
-        const product = await fetchProductData(material);
-        enriched[material] = applyProductData(entry, product);
-        if (product) {
-            console.log(`[s4-bridge] enriched ${material}: weightKg=${enriched[material].weightKg}`
-                + ` (S/4 ${product.NetWeight ?? product.GrossWeight ?? '?'} ${product.WeightUnit ?? ''})`
-                + (product.description ? ` desc="${product.description}"` : ''));
-        } else {
-            console.log(`[s4-bridge] no S/4 product data for ${material}, using configured values`);
-        }
-    }
-    return enriched;
-}
-
-async function fetchMaterialDocuments(): Promise<S4MaterialDocumentHeader[]> {
-    const url = `${S4_BASE}/sap/opu/odata/sap/API_MATERIAL_DOCUMENT_SRV/A_MaterialDocumentHeader`
-        + `?$expand=to_MaterialDocumentItem&$orderby=MaterialDocument desc&$top=${TOP}&$format=json`;
-    const res = await fetch(url, { headers: s4Headers(), signal: AbortSignal.timeout(60_000) });
-    if (!res.ok) throw new Error(`S/4 read failed: ${res.status} ${await res.text().then(t => t.slice(0, 300))}`);
-    const body: any = await res.json();
-    // V2 wraps in d.results; V4 (or a mock) uses value.
-    return body?.d?.results ?? body?.value ?? [];
 }
 
 // --- webhook post ------------------------------------------------------------
@@ -158,8 +91,8 @@ async function postEvent(data: ReturnType<typeof materialDocumentToPassportInput
 // --- poll cycle --------------------------------------------------------------
 
 async function cycle(state: BridgeState): Promise<void> {
-    const headers = await fetchMaterialDocuments();
-    const receipts = goodsReceiptItems(headers, MOVEMENT_TYPES);
+    const headers = await fetchMaterialDocuments(cfg);
+    const receipts = goodsReceiptItems(headers, cfg.movementTypes);
     const seen = new Set(state.seen);
     let posted = 0, skipped = 0;
 
@@ -191,8 +124,16 @@ async function cycle(state: BridgeState): Promise<void> {
 }
 
 const state = loadState();
-const resolvedMaster = await enrichMaster(master);
-console.log(`[s4-bridge] polling ${S4_BASE} (movement types ${MOVEMENT_TYPES.join(',')}) -> ${NIGHTPASS_BASE}`);
+const resolvedMaster = await enrichMaster(cfg, master, (material, entry, product) => {
+    if (product) {
+        console.log(`[s4-bridge] enriched ${material}: weightKg=${entry.weightKg}`
+            + ` (S/4 ${product.NetWeight ?? product.GrossWeight ?? '?'} ${product.WeightUnit ?? ''})`
+            + (product.description ? ` desc="${product.description}"` : ''));
+    } else {
+        console.log(`[s4-bridge] no S/4 product data for ${material}, using configured values`);
+    }
+});
+console.log(`[s4-bridge] polling ${cfg.baseUrl} (movement types ${cfg.movementTypes.join(',')}) -> ${NIGHTPASS_BASE}`);
 
 if (ONCE) {
     await cycle(state);

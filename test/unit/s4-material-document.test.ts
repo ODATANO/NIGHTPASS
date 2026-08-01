@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {
     parseS4Date, itemsOf, goodsReceiptItems, passportIdFor, docItemKey,
     materialDocumentToPassportInput, toCloudEvent, signErpEventBody,
-    applyProductData, ERP_EVENT_TYPE,
+    applyProductData, buildReceiptRows, ERP_EVENT_TYPE,
     type S4MaterialDocumentHeader, type ProductMaster
 } from '../../srv/lib/s4-material-document';
 import crypto from 'node:crypto';
@@ -224,6 +224,34 @@ describe('applyProductData', () => {
         const receipt = goodsReceiptItems(HEADERS)[0];
         const unresolved: ProductMaster = { 'EV-BATTERY-75': { ...entry, weightKg: undefined } };
         assert.throws(() => materialDocumentToPassportInput(receipt, unresolved), /missing model\/weightKg/);
+    });
+});
+
+describe('buildReceiptRows', () => {
+    it('classifies rows: ready with passportJson, unmapped without', () => {
+        const rows = buildReceiptRows(HEADERS, MASTER, new Set());
+        assert.equal(rows.length, 2);
+        const [battery, foil] = rows;
+        assert.equal(battery.status, 'ready');
+        assert.equal(battery.material, 'EV-BATTERY-75');
+        assert.equal(battery.passportId, 'BAT-EVBATTERY75-49000000010001');
+        assert.equal(battery.postingDate, '2025-07-30');
+        assert.equal(JSON.parse(battery.passportJson!).model, 'PowerCell EV-75');
+        assert.equal(foil.status, 'unmapped');
+        assert.equal(foil.passportJson, null);
+        assert.equal(foil.model, null);
+    });
+
+    it('marks known passport ids as exists', () => {
+        const rows = buildReceiptRows(HEADERS, MASTER, new Set(['BAT-EVBATTERY75-49000000010001']));
+        assert.equal(rows[0].status, 'exists');
+        assert.ok(rows[0].passportJson, 'exists rows keep their payload');
+    });
+
+    it('an unresolved master entry degrades to unmapped, not a throw', () => {
+        const unresolved = { 'EV-BATTERY-75': { ...MASTER['EV-BATTERY-75'], weightKg: undefined } };
+        const rows = buildReceiptRows(HEADERS, unresolved, new Set());
+        assert.equal(rows[0].status, 'unmapped');
     });
 });
 

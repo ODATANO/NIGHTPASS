@@ -99,6 +99,26 @@ service ProducerService {
     };
 
     /**
+     * Live view into the connected S/4 system's goods receipts (movement type
+     * 101). Each row is one material document item; 'ready' rows carry the
+     * exact `passportJson` for createPassport, 'exists' means this document
+     * already has a passport (ids are deterministic per document item),
+     * 'unmapped' marks materials outside the product master. 503 when no S/4
+     * system is configured (S4_BASE_URL).
+     */
+    function s4GoodsReceipts()                                           returns array of {
+        docKey          : String; // MaterialDocumentYear/MaterialDocument/Item
+        material        : String;
+        postingDate     : String;
+        passportId      : String;
+        status          : String; // ready | exists | unmapped
+        model           : String;
+        batteryCategory : String;
+        weightKg        : Double;
+        passportJson    : LargeString;
+    };
+
+    /**
      * Open (or reuse) the signing session for a server wallet and kick off the
      * NIGHTGATE facade prewarm right away, so the first attest does not pay the
      * wallet-sync wait. Called by the cockpit when a server wallet is picked at

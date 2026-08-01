@@ -53,6 +53,41 @@
         </items>
       </Table>
 
+      <Panel expandable="true" expanded="true" class="sapUiMediumMarginTop">
+        <headerToolbar>
+          <OverflowToolbar>
+            <Title text="S/4HANA goods receipts"/>
+            <ToolbarSpacer/>
+            <Button text="Fetch from S/4" icon="sap-icon://synchronize" press="onS4Fetch" enabled="{= !${s4>/busy} }"/>
+          </OverflowToolbar>
+        </headerToolbar>
+        <Table id="s4Table" items="{s4>/rows}" noDataText="Nothing fetched yet. 'Fetch from S/4' pulls the latest goods receipts from the connected system.">
+          <columns>
+            <Column><Text text="Document"/></Column>
+            <Column><Text text="Material"/></Column>
+            <Column demandPopin="true" minScreenWidth="Tablet"><Text text="Posted"/></Column>
+            <Column demandPopin="true" minScreenWidth="Tablet"><Text text="Maps to"/></Column>
+            <Column><Text text="Status"/></Column>
+            <Column hAlign="End"><Text text=""/></Column>
+          </columns>
+          <items>
+            <ColumnListItem>
+              <cells>
+                <ObjectIdentifier title="{s4>docKey}"/>
+                <Text text="{s4>material}"/>
+                <Text text="{s4>postingDate}"/>
+                <ObjectIdentifier title="{s4>model}" text="{s4>batteryCategory}"/>
+                <ObjectStatus
+                  text="{= ${s4>status} === 'ready' ? 'ready' : ${s4>status} === 'exists' ? 'passport exists' : 'not a battery' }"
+                  state="{= ${s4>status} === 'ready' ? 'Success' : ${s4>status} === 'exists' ? 'Information' : 'None' }"/>
+                <Button text="Create passport" type="Emphasized" icon="sap-icon://add"
+                        press="onS4Create" visible="{= ${s4>status} === 'ready' }"/>
+              </cells>
+            </ColumnListItem>
+          </items>
+        </Table>
+      </Panel>
+
       <Panel headerText="Registered dataspace partners" expandable="true" expanded="true" class="sapUiMediumMarginTop">
         <Table id="partnersTable" items="{/Partners}">
           <columns>

@@ -241,6 +241,54 @@ export function materialDocumentToPassportInput(
     };
 }
 
+/** One row of the cockpit's goods-receipt list (ProducerService.s4GoodsReceipts). */
+export interface GoodsReceiptListRow {
+    docKey: string;
+    material: string;
+    postingDate: string | null;
+    passportId: string;
+    status: 'ready' | 'exists' | 'unmapped';
+    model: string | null;
+    batteryCategory: string | null;
+    weightKg: number | null;
+    passportJson: string | null;    // ready rows carry the exact createPassport input
+}
+
+/**
+ * Flatten fetched documents into list rows for the cockpit: 'ready' rows carry
+ * a serialized PassportInput, 'exists' marks ids that already have a passport
+ * (the id is deterministic per document item), 'unmapped' marks receipts of
+ * materials outside the product master (visible, but not creatable).
+ */
+export function buildReceiptRows(
+    headers: S4MaterialDocumentHeader[],
+    master: ProductMaster,
+    existingIds: ReadonlySet<string>,
+    movementTypes?: readonly string[]
+): GoodsReceiptListRow[] {
+    return goodsReceiptItems(headers, movementTypes).map((r) => {
+        const base = {
+            docKey: docItemKey(r.item),
+            material: r.item.Material,
+            postingDate: parseS4Date(r.header.PostingDate) ?? parseS4Date(r.header.DocumentDate),
+            passportId: passportIdFor(r.item)
+        };
+        try {
+            const input = materialDocumentToPassportInput(r, master);
+            return {
+                ...base,
+                status: existingIds.has(base.passportId) ? 'exists' as const : 'ready' as const,
+                model: input.model,
+                batteryCategory: input.batteryCategory,
+                weightKg: input.weightKg,
+                passportJson: JSON.stringify(input)
+            };
+        } catch {
+            return { ...base, status: 'unmapped' as const, model: null, batteryCategory: null, weightKg: null, passportJson: null };
+        }
+    });
+}
+
 /** Wrap a PassportInput in the webhook's CloudEvent envelope. */
 export function toCloudEvent(
     data: PassportInput,

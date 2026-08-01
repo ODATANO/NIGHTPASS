@@ -16,6 +16,8 @@ import { payloadFromDb, readPayloadInputs } from './lib/passport-payload';
 import { validateTransition, parseBatteryStatus, encodeBatteryStatus, type BatteryStatus } from './lib/battery-lifecycle';
 import { validateDiligenceUpload, decodeUpload, sha256Hex } from './lib/diligence-upload';
 import { listProducerWallets, producerWalletSecrets, feeSponsorWalletId, feeSponsorWalletIds } from './lib/producer-wallets';
+import { s4ConfigFromEnv, fetchMaterialDocuments, enrichMaster, loadProductMaster } from './lib/s4-client';
+import { buildReceiptRows } from './lib/s4-material-document';
 import { verifyContractTx, type ChainVerdict } from './lib/chain-verify';
 import { verifyAttestState, verifyGrantState, verifyPredicateState } from './lib/state-verify';
 
@@ -88,6 +90,7 @@ export default class ProducerService extends cds.ApplicationService {
         this.on('createPassport', this.createPassport);
         this.on('submitPassport', this.submitPassport);
         this.on('listServerWallets', this.listServerWallets);
+        this.on('s4GoodsReceipts', this.s4GoodsReceipts);
         this.on('prewarmServerWallet', this.prewarmServerWallet);
         this.on('serverWalletStatus', this.serverWalletStatus);
         this.on('serverWalletSession', this.serverWalletSession);
@@ -232,6 +235,34 @@ export default class ProducerService extends cds.ApplicationService {
     /** The configured server wallets the cockpit can sign with (no secrets). */
     private listServerWallets = async () => {
         return listProducerWallets();
+    };
+
+    // Enriched S/4 product master, cached briefly: the enrichment is two HTTP
+    // calls per material and master data changes rarely.
+    private s4MasterCache: { at: number; master: import('./lib/s4-material-document').ProductMaster } | null = null;
+
+    /** Live goods-receipt list from the configured S/4 system (see .cds doc). */
+    private s4GoodsReceipts = async (req: cds.Request) => {
+        const cfg = s4ConfigFromEnv();
+        if (!cfg) {
+            return req.reject(503, 'no S/4 system configured (set S4_BASE_URL plus S4_API_KEY or S4_USER/S4_PASSWORD)');
+        }
+        try {
+            if (!this.s4MasterCache || Date.now() - this.s4MasterCache.at > 300_000) {
+                this.s4MasterCache = { at: Date.now(), master: await enrichMaster(cfg, loadProductMaster(cfg)) };
+            }
+            const headers = await fetchMaterialDocuments(cfg);
+            const rows = buildReceiptRows(headers, this.s4MasterCache.master, new Set(), cfg.movementTypes);
+            const ids = rows.map(r => r.passportId);
+            const existing: any[] = ids.length
+                ? await SELECT.from('passport.Passports').columns('passportId').where({ passportId: { in: ids } })
+                : [];
+            const existingIds = new Set(existing.map(r => String(r.passportId)));
+            return rows.map(r => (r.status === 'ready' && existingIds.has(r.passportId)) ? { ...r, status: 'exists' } : r);
+        } catch (e: any) {
+            const msg = String(e?.message ?? e);
+            return req.reject(502, msg.startsWith('S/4') ? msg : `S/4 read failed: ${msg}`);
+        }
     };
 
     /**

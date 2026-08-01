@@ -1,4 +1,5 @@
 import cds from '@sap/cds';
+import { anchorCallPlan } from './anchor-plan';
 import { blake2b } from '@noble/hashes/blake2b';
 import { bytesToHex } from '@noble/hashes/utils';
 import { createCipheriv, hkdfSync, randomBytes } from 'node:crypto';
@@ -530,12 +531,15 @@ export async function anchorPassport(nightgate: cds.Service, opts: AnchorOpts): 
 
     if (orderedBatchAvailable()) {
         // Full anchor as ONE batched transaction (attest -> bind -> root in
-        // guaranteed apply order).
-        const calls = [
-            { circuit: 'attest',       args: [payloadHash, blake2b256Hex(`passport://${passportId}`)] },
-            { circuit: 'bindPassport', args: [passportIdHash, payloadHash] },
-            ...(contentRoot ? [{ circuit: 'anchorContentRoot', args: [payloadHash, contentRoot] }] : [])
-        ];
+        // guaranteed apply order). The call list comes from the shared plan
+        // (srv/lib/anchor-plan.ts), the same source the browser connector's
+        // anchorBatch consumes, so the two submit paths cannot drift.
+        const calls = anchorCallPlan({
+            payloadHash,
+            metadataHash: blake2b256Hex(`passport://${passportId}`),
+            passportIdHash,
+            ...(contentRoot ? { contentRoot } : {})
+        });
         let jobId = '';
         const txHash = await runStep(calls.map(c => c.circuit).join('+'), async () => {
             const batch: any = await sendDetached(nightgate, 'submitContractCallBatch', {

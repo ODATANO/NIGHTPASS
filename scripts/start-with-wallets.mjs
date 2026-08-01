@@ -28,5 +28,18 @@ if (existsSync(SECRETS)) {
     console.log(`[start] no ${SECRETS}; only the legacy PRODUCER_* wallet (if set) will be offered`);
 }
 
+// Optional S/4 connection (api.sap.com sandbox key or trial/CAL credentials)
+// for the cockpit's goods-receipt view and the bridge. Values already present
+// in the environment win.
+const S4_SECRETS = 'secrets/s4-sandbox.env';
+if (existsSync(S4_SECRETS)) {
+    for (const line of readFileSync(S4_SECRETS, 'utf8').split(/\r?\n/)) {
+        const m = line.match(/^([A-Z_0-9]+)=(.*)$/);
+        if (m && !env[m[1]]) env[m[1]] = m[2].replace(/^"(.*)"$/, '$1').trim();
+    }
+    if (!env.S4_BASE_URL) env.S4_BASE_URL = 'https://sandbox.api.sap.com/s4hanacloud';
+    console.log(`[start] S/4 connection loaded from ${S4_SECRETS} (${env.S4_BASE_URL})`);
+}
+
 const child = spawn('npx', ['cds-tsx', 'serve'], { env, stdio: 'inherit', shell: true });
 child.on('exit', (code) => process.exit(code ?? 0));
