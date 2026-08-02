@@ -5,8 +5,9 @@ sap.ui.define([
   "sap/ui/model/Sorter",
   "sap/ui/core/Fragment",
   "sap/ui/model/json/JSONModel",
-  "producer/util/WalletPicker"
-], function (BaseController, Filter, FilterOperator, Sorter, Fragment, JSONModel, WalletPicker) {
+  "producer/util/WalletPicker",
+  "sap/m/MessageBox"
+], function (BaseController, Filter, FilterOperator, Sorter, Fragment, JSONModel, WalletPicker, MessageBox) {
   "use strict";
 
   return BaseController.extend("producer.controller.Detail", {
@@ -219,6 +220,33 @@ sap.ui.define([
         .catch(function () { oUi.setProperty("/batteryStatus", ""); oUi.setProperty("/statusTargets", ""); });
     },
 
+    // First lifecycle step: claim the passport id on-chain. The registrar
+    // registers the id to the acting server wallet's attester identity; from
+    // then on only this wallet can bind it. Same poll as the handover (both
+    // settle a registerPassport transaction row).
+    onClaimPassport: function () {
+      if (!this._isServer()) { return this.toast("claiming is registrar-signed; log in with a server wallet"); }
+      var that = this;
+      MessageBox.confirm(
+        "Claim the passport id on-chain for this wallet? The registrar registers it to your attester identity; afterwards only this wallet can bind or re-bind the id.",
+        {
+          title: "Claim passport id",
+          actions: ["Claim", MessageBox.Action.CANCEL],
+          emphasizedAction: "Claim",
+          onClose: function (sAction) {
+            if (sAction !== "Claim") { return; }
+            that.callAction("/claimPassportId", { passportId: that._pid(), walletId: that._walletId() })
+              .then(function (res) {
+                that.toast("claim started (registrar tx pending, attester " + (res.ownerAttesterId || "").slice(0, 10) + "...)");
+                that._pollRegister(that._pid(), "passport id claim");
+                that._refreshAll();
+              })
+              .catch(function (e) { that.error(e); });
+          }
+        }
+      );
+    },
+
     // Operator handover (Second Life): pick a target server wallet, then the
     // registrar re-registers the passport id on-chain and the owner scope
     // flips. Poll the registerPassport transaction row until it settles.
@@ -252,7 +280,7 @@ sap.ui.define([
                     that.toast("handover to '" + sTarget + "' " +
                       (res.mode === "transferring" ? "started (registrar tx pending)" : "done (" + res.mode + ")") +
                       ((res.activeGrants || []).length ? "; " + res.activeGrants.length + " grant(s) to re-issue" : ""));
-                    if (res.mode === "transferring") { that._pollTransfer(that._pid()); }
+                    if (res.mode === "transferring") { that._pollRegister(that._pid(), "operator handover"); }
                     that._refreshAll();
                   })
                   .catch(function (e) { that.error(e); });
@@ -268,7 +296,8 @@ sap.ui.define([
     },
 
     // Poll the newest registerPassport transaction row until it settles.
-    _pollTransfer: function (sPid) {
+    // Shared by the id claim and the operator handover; sWhat labels the toasts.
+    _pollRegister: function (sPid, sWhat) {
       var that = this;
       var nToken = (this._transferToken = (this._transferToken || 0) + 1);
       var iLeft = 60;
@@ -285,8 +314,8 @@ sap.ui.define([
               .then(function (r) { return r.json(); })
               .then(function (t) {
                 var oRow = (t.value || [])[0] || {};
-                if (oRow.status === "succeeded") { that._refreshAll(); return that.toast("operator handover of '" + sPid + "' registered on-chain"); }
-                if (oRow.status === "failed") { that._refreshAll(); return that.error("operator handover failed: " + (oRow.errorMessage || "see Transactions tab")); }
+                if (oRow.status === "succeeded") { that._refreshAll(); return that.toast(sWhat + " of '" + sPid + "' registered on-chain"); }
+                if (oRow.status === "failed") { that._refreshAll(); return that.error(sWhat + " failed: " + (oRow.errorMessage || "see Transactions tab")); }
                 setTimeout(tick, 5000);
               });
           })

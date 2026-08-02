@@ -25,6 +25,9 @@
         state="Warning"
         visible="{ui>/drifted}" class="sapUiTinyMarginEnd"
         tooltip="The database content (e.g. accumulated telemetry) no longer hashes to the anchored payload hash. Re-anchor to commit a new on-chain version; the old version stays verifiable."/>
+      <Button text="Claim id" enabled="{= ${session>/mode} === 'server' }" icon="sap-icon://key"
+              tooltip="Claim the passport id on-chain before anchoring: the registrar registers it to this wallet's attester identity, so only this wallet can ever bind it. An unclaimed id binds first-come-first-served."
+              press="onClaimPassport"/>
       <Button text="Attest" icon="{= ${session>/mode} === 'server' ? 'sap-icon://it-host' : 'sap-icon://wallet' }" press="onAttest"/>
       <Button text="Re-anchor" visible="{ui>/drifted}" enabled="{= ${session>/mode} === 'server' }"
               icon="sap-icon://synchronize"

@@ -301,6 +301,28 @@ service ProducerService {
     };
 
     /**
+     * Claim the passport id on-chain BEFORE (or independent of) anchoring: the
+     * REGISTRAR (vault deployer, PASSPORT_REGISTRAR_WALLET, default 'default')
+     * registers the passportIdHash to the acting server wallet's attester
+     * identity. From then on ONLY that wallet can bind or re-bind the id, so
+     * the id is squat-proof from its very first on-chain second (an unclaimed
+     * id binds first-come-first-served). Works on drafts, which is the point:
+     * claim first, anchor later. Runs DETACHED (mode 'claiming'; poll the
+     * registerPassport PassportTransactions row). Registrar-gated in-circuit,
+     * so browser wallets cannot self-claim; wallet-mode passports claim
+     * through this server action too.
+     */
+    action   claimPassportId(passportId: String,
+                             walletId: String,
+                             sponsorWalletId: String
+    )                                                                    returns {
+        passportId      : String;
+        walletId        : String;
+        ownerAttesterId : String;
+        mode            : String; // 'claiming'
+    };
+
+    /**
      * Operator handover (Second Life): transfer the passport's responsible
      * economic operator to another server wallet. On-chain the REGISTRAR (the
      * vault deployer's wallet, PASSPORT_REGISTRAR_WALLET, default 'default')

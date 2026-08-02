@@ -115,6 +115,7 @@ export default class ProducerService extends cds.ApplicationService {
         this.on('passportDrift', this.passportDrift);
         this.on('changeBatteryStatus', this.changeBatteryStatus);
         this.on('transferPassportOperator', this.transferPassportOperator);
+        this.on('claimPassportId', this.claimPassportId);
         return super.init();
     }
 
@@ -1880,6 +1881,70 @@ export default class ProducerService extends cds.ApplicationService {
     }
 
     /**
+     * Initial on-chain claim of the passport id: the registrar registers the
+     * passportIdHash to the ACTING wallet's attester identity, before or
+     * independent of anchoring (drafts are the main case; an unclaimed id
+     * binds first-come-first-served until someone claims it). Same registrar
+     * plumbing as the operator handover, without the owner flip.
+     */
+    private claimPassportId = async (req: cds.Request) => {
+        const { passportId, walletId, sponsorWalletId } = req.data as {
+            passportId?: string; walletId?: string; sponsorWalletId?: string;
+        };
+        const pid = String(passportId ?? '').trim();
+        if (!pid) return req.reject(400, 'passportId is required');
+        const wid = String(walletId ?? '').trim() || 'default';
+
+        const row: any = await SELECT.one.from(Passports)
+            .columns('ID', 'passportId', 'passportIdHash', 'owner', 'status', 'contractAddress')
+            .where({ passportId: pid });
+        if (!row) return req.reject(404, `passport '${pid}' not found`);
+        this.assertWalletOwnsPassport(req, row, wid);
+
+        const contractAddress = this.contractAddress() ?? row.contractAddress;
+        if (!contractAddress) return req.reject(400, 'no PASSPORT_CONTRACT_ADDRESS available');
+        const registrarId = process.env.PASSPORT_REGISTRAR_WALLET?.trim() || 'default';
+        const regSession = await this.serverSigningSession(registrarId);
+        if (!regSession) {
+            return req.reject(400, `claiming needs the registrar wallet's signing session ('${registrarId}', PASSPORT_REGISTRAR_WALLET); none available`);
+        }
+        const attesterId = await this.attesterIdFor(req, wid);
+
+        // Idempotence guard: the newest settled registration already points at
+        // this attester = nothing to do (the circuit overwrite is idempotent,
+        // this just saves the pointless transaction).
+        const last: any = await SELECT.one.from(PassportTransactions)
+            .columns('identifier', 'status')
+            .where({ passport_ID: row.ID, kind: 'registerPassport', status: 'succeeded' })
+            .orderBy('createdAt desc' as any);
+        if (last && String(last.identifier) === attesterId) {
+            return req.reject(400, `passport '${pid}' is already claimed by wallet '${wid}'`);
+        }
+
+        const sponsorSessionId = await this.sponsorSessionIdFor(regSession, sponsorWalletId);
+        const txRowId = cds.utils.uuid();
+        await INSERT.into(PassportTransactions).entries({
+            ID: txRowId, passport_ID: row.ID, kind: 'registerPassport',
+            identifier: attesterId, status: 'pending'
+        } as any);
+
+        const args = {
+            passportId: String(row.passportIdHash ?? '') || blake2b256Hex(pid),
+            ownerId: attesterId,
+            sessionId: regSession, contractAddress,
+            ...(sponsorSessionId ? { sponsorSessionId } : {})
+        };
+        const user = req.user;
+        (req as any).on('succeeded', () => {
+            void detachedFromRequest(() =>
+                this.runRegisterDetached(txRowId, String(row.ID), pid, args, user, { what: 'id claim' })
+            ).catch((e: unknown) =>
+                cds.log('producer').error(`detached passport claim crashed for ${pid}:`, e));
+        });
+        return { passportId: pid, walletId: wid, ownerAttesterId: attesterId, mode: 'claiming' };
+    };
+
+    /**
      * Operator handover: on-chain registrar re-registration of the passport id
      * to the new operator's attester identity, then the local owner flip. See
      * producer-service.cds for the contract; the old operator loses the
@@ -1951,18 +2016,23 @@ export default class ProducerService extends cds.ApplicationService {
         const user = req.user;
         (req as any).on('succeeded', () => {
             void detachedFromRequest(() =>
-                this.runTransferDetached(txRowId, String(row.ID), pid, newOwner, args, user)
+                this.runRegisterDetached(txRowId, String(row.ID), pid, args, user, { what: 'operator transfer', newOwner })
             ).catch((e: unknown) =>
                 cds.log('producer').error(`detached operator transfer crashed for ${pid}:`, e));
         });
         return { passportId: pid, previousOwner, newOwner, newOwnerAttesterId: attesterId, mode: 'transferring', activeGrants };
     };
 
-    /** The long-running leg of transferPassportOperator (one registerPassport tx). */
-    private async runTransferDetached(
-        txRowId: string, passportRowId: string, passportId: string, newOwner: string,
+    /**
+     * The long-running registrar leg shared by claimPassportId and
+     * transferPassportOperator: one registerPassport tx, settled into the
+     * PassportTransactions row. The transfer additionally flips the owner
+     * scope on chain success (`newOwner`); the claim leaves it untouched.
+     */
+    private async runRegisterDetached(
+        txRowId: string, passportRowId: string, passportId: string,
         args: Record<string, unknown> & { sessionId: string },
-        user: unknown
+        user: unknown, opts: { what: string; newOwner?: string }
     ): Promise<void> {
         const log = cds.log('producer');
         try {
@@ -1980,15 +2050,17 @@ export default class ProducerService extends cds.ApplicationService {
             await this.runDetached(async () => {
                 // Owner flips ONLY on chain success: until then the previous
                 // operator remains the owner in every server-side check.
-                await UPDATE.entity(Passports).set({ owner: newOwner }).where({ ID: passportRowId });
+                if (opts.newOwner) {
+                    await UPDATE.entity(Passports).set({ owner: opts.newOwner }).where({ ID: passportRowId });
+                }
                 await UPDATE.entity(PassportTransactions).set({
                     status: 'succeeded', txHash, explorerUrl: txExplorerUrl(txHash)
                 } as any).where({ ID: txRowId });
             });
-            log.info(`passport ${passportId} operator transferred (register tx ${txHash})`);
+            log.info(`passport ${passportId} ${opts.what} registered on-chain (register tx ${txHash})`);
         } catch (e) {
             const msg = String((e as Error)?.message ?? e).slice(0, 500);
-            log.warn(`operator transfer failed for ${passportId}:`, e);
+            log.warn(`${opts.what} failed for ${passportId}:`, e);
             await this.runDetached(async () => {
                 await UPDATE.entity(PassportTransactions).set({ status: 'failed', errorMessage: msg } as any).where({ ID: txRowId });
             }).catch(() => { /* best effort */ });
