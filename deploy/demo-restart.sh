@@ -29,7 +29,18 @@ for wait_i in 1 2 3; do
 done
 
 echo "=== $(date -Is) demo restart (cron) ==="
-/usr/bin/docker compose --profile demo restart nightpass-demo
+/usr/bin/docker compose --profile demo restart nightpass-demo \
+  || echo "=== $(date -Is) restart command failed ==="
+
+# A wedged container can make `docker restart` fail ("did not receive an exit
+# event") and be left Exited without the restart policy kicking in. Verify the
+# container is actually running and fall back to a hard kill + up -d.
+if ! docker ps --format '{{.Names}}' | grep -q '^deploy-nightpass-demo-1$'; then
+  echo "=== $(date -Is) container not running after restart, forcing kill + up -d ==="
+  docker kill deploy-nightpass-demo-1 2>/dev/null
+  docker rm -f deploy-nightpass-demo-1 2>/dev/null
+  /usr/bin/docker compose --profile demo up -d nightpass-demo
+fi
 
 # Wait for sponsor prewarm to catch up, then log the result.
 for i in $(seq 1 40); do

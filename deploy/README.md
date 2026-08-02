@@ -133,3 +133,21 @@ chmod +x /root/nightpass/deploy/demo-restart.sh
 
 Check runs with `tail -20 /root/nightpass-demo-restart.log` (expect
 `prewarm CAUGHT UP lines: 3`).
+
+On top of the nightly restart, `demo-autoheal.sh` recovers from a dead or
+wedged container within 5 minutes: the compose file gives `nightpass-demo` a
+healthcheck (node-fetch on demoInfo), and the script force-recreates the
+container when it is not running or unhealthy. Docker's restart policy alone
+does not cover either case (it ignores health, and a wedged process can
+survive `docker restart` with "did not receive an exit event", which is how
+the 2026-08-02 outage happened). Install as a 5-minute cron:
+
+```bash
+( crontab -l 2>/dev/null | grep -v demo-autoheal.sh; \
+  echo "*/5 * * * * bash /root/nightpass/deploy/demo-autoheal.sh >> /root/nightpass-demo-autoheal.log 2>&1" ) | crontab -
+```
+
+The log stays empty while everything is healthy. Kill switch: the demo stays
+down only if you also `touch /root/nightpass/deploy/.demo-off` before
+`docker compose stop nightpass-demo` (otherwise autoheal resurrects it);
+remove the file to re-enable.

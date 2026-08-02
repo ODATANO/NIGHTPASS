@@ -51,6 +51,18 @@ services:
       cds_requires_db_credentials_password: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in deploy/.env}
       cds_requires_db_credentials_database: nightpass_demo
     expose: ["4004"]
+    # Wedged-process detection. demoInfo is DB-free and cheap; a container
+    # that stops answering HTTP goes unhealthy. Docker itself only MARKS the
+    # state: the actual recovery is demo-autoheal.sh from host cron, because
+    # the restart policy ignores health and a wedged process can even survive
+    # `docker restart` (2026-08-02 outage). No curl in node:22-slim, so the
+    # probe uses node's built-in fetch.
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:4004/api/v1/demo/demoInfo()').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 300s
     depends_on:
       proof-server:
         condition: service_started
