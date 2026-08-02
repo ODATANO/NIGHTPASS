@@ -77,6 +77,23 @@ describe('payloadFromDb (projection v2)', () => {
         assert.notEqual(before, after);
     });
 
+    // createPassport hashes payloadFromDb over the INPUT-shaped rows before
+    // inserting them; the drift check later recomputes over DB-read rows.
+    // Pin the equivalence the create-time v2 hash relies on: missing input
+    // keys (undefined) and DB nulls project identically.
+    it('projects input-shaped rows (undefined fields) and db-read rows (nulls) identically', () => {
+        const fromInput = baseInputs();
+        delete (fromInput.batteries[0] as Record<string, unknown>).leadContentPpm;
+        delete (fromInput.recycledMaterials[1] as Record<string, unknown>).sourceSupplierName;
+        const fromDbRead = baseInputs();
+        (fromDbRead.batteries[0] as Record<string, unknown>).leadContentPpm = null;
+        (fromDbRead.recycledMaterials[1] as Record<string, unknown>).sourceSupplierName = null;
+        assert.equal(
+            hashPayload(payloadFromDb(fromInput)).payloadHash,
+            hashPayload(payloadFromDb(fromDbRead)).payloadHash,
+        );
+    });
+
     it('never collides with a v1 hash of the same content (version marker)', () => {
         const inputs = baseInputs();
         const v1Shaped = {

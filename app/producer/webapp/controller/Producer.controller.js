@@ -109,7 +109,7 @@ sap.ui.define([
 
     onInit: function () {
       this._router().getRoute("main").attachPatternMatched(this._onMatched, this);
-      this.getView().setModel(new JSONModel({ rows: [], busy: false }), "s4");
+      this.getView().setModel(new JSONModel({ rows: [], all: [], batteriesOnly: true, hiddenCount: 0, busy: false }), "s4");
       this._applyOwnerFilter();
     },
 
@@ -222,12 +222,26 @@ sap.ui.define([
         })
         .then(function (b) {
           var aRows = b.value || [];
-          oModel.setProperty("/rows", aRows);
+          oModel.setProperty("/all", aRows);
+          that._applyS4Filter();
           var nReady = aRows.filter(function (r) { return r.status === "ready"; }).length;
           that.toast(aRows.length + " goods receipts fetched, " + nReady + " ready for a passport");
         })
         .catch(function (e) { that.error(e); })
         .finally(function () { oModel.setProperty("/busy", false); });
+    },
+
+    // "Batteries only" (default): hide receipts of materials outside the
+    // product master (status 'unmapped'); the toggle shows everything.
+    onS4FilterToggle: function () { this._applyS4Filter(); },
+
+    _applyS4Filter: function () {
+      var oModel = this.getView().getModel("s4");
+      var aAll = oModel.getProperty("/all") || [];
+      var bOnly = oModel.getProperty("/batteriesOnly");
+      var aRows = bOnly ? aAll.filter(function (r) { return r.status !== "unmapped"; }) : aAll;
+      oModel.setProperty("/rows", aRows);
+      oModel.setProperty("/hiddenCount", aAll.length - aRows.length);
     },
 
     // Same create path as the dialog: the S/4 row already carries the exact

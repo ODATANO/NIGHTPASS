@@ -17,7 +17,7 @@ sap.ui.define([
       // Whether the passport is anchored on-chain (Grant/Revoke/Prove gate; the
       // Page context does not reliably reach headerContent buttons, so drive it
       // from an absolute named-model flag).
-      this.getView().setModel(new JSONModel({ anchored: false }), "ui");
+      this.getView().setModel(new JSONModel({ anchored: false, claimTxHash: "", claimAttester: "" }), "ui");
       // Catena-X tab: generated aspect JSON + built PAC.
       this.getView().setModel(new JSONModel({ aspect: "", pac: "" }), "cx");
       // Conformance tab: BatteryPass-Ready validation result.
@@ -193,6 +193,24 @@ sap.ui.define([
         if (s === "anchored") { that._syncDrift(); } else { oUi.setProperty("/drifted", false); }
       }).catch(function () { oUi.setProperty("/anchored", false); oUi.setProperty("/drifted", false); });
       this._syncBatteryStatus();
+      this._syncClaim();
+    },
+
+    // Overview "Id claim tx": the newest settled on-chain id registration
+    // (initial claim or handover), shown with its explorer link.
+    _syncClaim: function () {
+      var oUi = this.getView().getModel("ui");
+      if (!this._id) { oUi.setProperty("/claimTxHash", ""); oUi.setProperty("/claimAttester", ""); return; }
+      fetch("/api/v1/producer/PassportTransactions?$filter=passport_ID eq " + this._id +
+        " and kind eq 'registerPassport' and status eq 'succeeded'&$orderby=createdAt desc&$top=1&$select=txHash,identifier",
+        { headers: this._authHeaders() })
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (b) {
+          var oRow = (((b || {}).value || [])[0]) || {};
+          oUi.setProperty("/claimTxHash", oRow.txHash || "");
+          oUi.setProperty("/claimAttester", oRow.identifier || "");
+        })
+        .catch(function () { oUi.setProperty("/claimTxHash", ""); oUi.setProperty("/claimAttester", ""); });
     },
 
     // Client copy of the lifecycle transition matrix (server enforces it too;

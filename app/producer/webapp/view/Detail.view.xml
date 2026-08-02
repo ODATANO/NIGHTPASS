@@ -80,6 +80,11 @@
                 <Link text="{= ${attestationTxHash} || 'not anchored' }"
                       href="{parts: ['attestationTxHash', 'anchorNetwork'], formatter: '.explorerTx'}"
                       target="_blank" enabled="{= !!${attestationTxHash} }"/>
+                <Label text="Id claim tx"/>
+                <Link text="{= ${ui>/claimTxHash} || 'not claimed' }"
+                      href="{parts: ['ui>/claimTxHash', 'anchorNetwork'], formatter: '.explorerTx'}"
+                      target="_blank" enabled="{= !!${ui>/claimTxHash} }"
+                      tooltip="{= ${ui>/claimAttester} ? 'Passport id registered on-chain to attester ' + ${ui>/claimAttester} : 'No on-chain id registration yet (claim or handover)' }"/>
               </f:content>
             </f:SimpleForm>
             <Table items="{batteries}" headerText="Cells">

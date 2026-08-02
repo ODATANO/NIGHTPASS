@@ -514,7 +514,18 @@ export default class ProducerService extends cds.ApplicationService {
                 passportId, model: input.model, performanceClass: input.performanceClass,
                 batteryCategory: input.batteryCategory,
             }));
-        const { canonicalPayload, payloadHash } = hashPayload({ batteries, recycledMaterials, diligenceDocs, attributes });
+        // Hash the v2 projection (payloadFromDb) over EXACTLY the rows the
+        // insert below persists, so the drift check's recompute reproduces
+        // this hash from the DB. Hashing the raw input objects (v1) made
+        // every fresh anchor report drift until its first re-anchor. Only
+        // docType survives the create insert for diligence docs (evidence
+        // uploads come later), so only docType may enter the hash.
+        const { canonicalPayload, payloadHash } = hashPayload(payloadFromDb({
+            batteries: batteries as unknown as Record<string, unknown>[],
+            recycledMaterials: recycledMaterials as unknown as Record<string, unknown>[],
+            diligenceDocs: diligenceDocs.map((d) => ({ docType: d.docType })),
+            attributes
+        }));
         const passportIdHash = blake2b256Hex(passportId);
         const payloadCipher = encryptPayload(canonicalPayload, passportId);
 

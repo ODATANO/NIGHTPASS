@@ -22,7 +22,7 @@
       <Button icon="sap-icon://refresh" tooltip="Refresh" press="onRefresh"/>
     </headerContent>
     <content>
-      <Table id="passportTable" items="{path: '/Passports', parameters: {'$count': true}}" growing="true" growingThreshold="50"
+      <Table id="passportTable" items="{path: '/Passports', parameters: {'$count': true}}" growing="true" growingThreshold="5"
              mode="None" itemPress="onOpen" visible="{session>/connected}">
         <headerToolbar>
           <OverflowToolbar>
@@ -57,11 +57,15 @@
         <headerToolbar>
           <OverflowToolbar>
             <Title text="S/4HANA goods receipts"/>
+            <Text text="{= ${s4>/hiddenCount} > 0 ? '(' + ${s4>/hiddenCount} + ' non-battery positions hidden)' : '' }" class="sapUiTinyMarginBegin"/>
             <ToolbarSpacer/>
+            <ToggleButton text="Batteries only" pressed="{s4>/batteriesOnly}" press="onS4FilterToggle"
+                          tooltip="Hide goods receipts of materials that do not map to a battery in the product master"/>
             <Button text="Fetch from S/4" icon="sap-icon://synchronize" press="onS4Fetch" enabled="{= !${s4>/busy} }"/>
           </OverflowToolbar>
         </headerToolbar>
-        <Table id="s4Table" items="{s4>/rows}" noDataText="Nothing fetched yet. 'Fetch from S/4' pulls the latest goods receipts from the connected system.">
+        <Table id="s4Table" items="{s4>/rows}" growing="true" growingThreshold="5"
+               noDataText="Nothing fetched yet. 'Fetch from S/4' pulls the latest goods receipts from the connected system.">
           <columns>
             <Column><Text text="Document"/></Column>
             <Column><Text text="Material"/></Column>
@@ -89,7 +93,7 @@
       </Panel>
 
       <Panel headerText="Registered dataspace partners" expandable="true" expanded="true" class="sapUiMediumMarginTop">
-        <Table id="partnersTable" items="{/Partners}">
+        <Table id="partnersTable" items="{/Partners}" growing="true" growingThreshold="5">
           <columns>
             <Column><Text text="Name"/></Column>
             <Column><Text text="Role"/></Column>
