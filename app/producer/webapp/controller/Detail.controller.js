@@ -594,27 +594,43 @@ sap.ui.define([
 
     // Poll the pending PredicateProofLog row until the detached proof runner
     // resolves it, then refresh and notify. Bounded like the anchor poll.
-    _pollProof: function (sLogId) {
+    // Poll one or more proof-log rows until ALL of them settle, then report the
+    // aggregate. Polling only the first row of a cart would report its outcome
+    // as the whole cart's: the server settles each claim independently on a
+    // post-submit PARTIAL_SUCCESS precisely so a partly-applied batch is never
+    // reported green, and that honesty must survive into the UI.
+    _pollProof: function (vLogIds) {
+      var aIds = Array.isArray(vLogIds) ? vLogIds : [vLogIds];
+      if (!aIds.length) { return; }
       var that = this;
       var nToken = (this._proofToken = (this._proofToken || 0) + 1);
       var iLeft = 120;
+      var sFilter = aIds.map(function (id) { return "ID eq " + id; }).join(" or ");
       var tick = function () {
         if (nToken !== that._proofToken || iLeft-- <= 0) { return; }
-        fetch("/api/v1/producer/PredicateProofLog?$select=status,result,txHash&$filter=ID eq " + sLogId,
+        fetch("/api/v1/producer/PredicateProofLog?$select=ID,status,result,txHash&$filter=" + encodeURIComponent(sFilter),
           { headers: that._authHeaders() })
           .then(function (r) { return r.ok ? r.json() : Promise.reject(new Error("status " + r.status)); })
           .then(function (b) {
             if (nToken !== that._proofToken) { return; }
-            var row = (b.value || [])[0] || {};
-            if (row.status === "succeeded") {
-              that._refreshAll();
-              return that.toast("predicate proven on-chain" + (row.txHash ? " · tx " + row.txHash.slice(0, 16) + "…" : ""));
+            var aRows = b.value || [];
+            var aDone = aRows.filter(function (r) { return r.status === "succeeded" || r.status === "failed"; });
+            if (aDone.length < aIds.length) { return setTimeout(tick, 5000); }
+            var aOk = aDone.filter(function (r) { return r.status === "succeeded"; });
+            var sTx = (aOk[0] || {}).txHash;
+            var sTxNote = sTx ? " · tx " + sTx.slice(0, 16) + "…" : "";
+            that._refreshAll();
+            if (aOk.length === aIds.length) {
+              return that.toast(aIds.length === 1
+                ? "predicate proven on-chain" + sTxNote
+                : aIds.length + " predicates proven on-chain in one tx" + sTxNote);
             }
-            if (row.status === "failed") {
-              that._refreshAll();
+            if (!aOk.length) {
               return that.error("predicate proof failed (or the predicate does not hold), see the Proofs and Transactions tabs");
             }
-            setTimeout(tick, 5000);
+            // Partial: say so plainly rather than reporting the first outcome.
+            return that.error(aOk.length + " of " + aIds.length
+              + " predicates proven, the rest failed; see the Proofs tab for which");
           })
           .catch(function () { if (nToken === that._proofToken) { setTimeout(tick, 8000); } });
       };
@@ -833,7 +849,7 @@ sap.ui.define([
           try { aIds = JSON.parse(res.proofLogIds || "[]"); } catch (e) { /* toast below */ }
           that.toast(aItems.length + " claims proving in one background tx"
             + (res.dropped ? " (" + res.dropped + " duplicate(s) dropped)" : ""));
-          if (aIds.length) { that._pollProof(aIds[0]); }
+          if (aIds.length) { that._pollProof(aIds); }
           that.getView().getModel("cart").setProperty("/items", []);
         } else {
           that.toast("stored offline (no signing session): " + res.mode);

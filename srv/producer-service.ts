@@ -21,6 +21,7 @@ import { s4ConfigFromEnv, fetchMaterialDocuments, enrichMaster, loadProductMaste
 import { buildReceiptRows } from './lib/s4-material-document';
 import { verifyContractTx, type ChainVerdict } from './lib/chain-verify';
 import { verifyAttestState, verifyGrantState, verifyPredicateState } from './lib/state-verify';
+import { sweepAction, verdictToStatus } from './lib/stuck-rows';
 
 const CONTRACT_REF = 'attestation-vault';
 
@@ -116,7 +117,82 @@ export default class ProducerService extends cds.ApplicationService {
         this.on('changeBatteryStatus', this.changeBatteryStatus);
         this.on('transferPassportOperator', this.transferPassportOperator);
         this.on('claimPassportId', this.claimPassportId);
+
+        // Crash recovery. Every on-chain leg runs detached after the request
+        // commits, so a restart in between strands the row in an in-flight
+        // state that only the dead process could have moved on. Sweep once
+        // after serving starts; best-effort, a failure here must never keep
+        // the service from serving.
+        cds.once('served', () => {
+            void this.sweepStuckRows().catch((e) =>
+                cds.log('producer').warn('stuck-row sweep skipped:', (e as Error)?.message));
+        });
         return super.init();
+    }
+
+    /**
+     * Close out on-chain work that a restart interrupted: transaction rows left
+     * `pending` and passports left `anchoring`. Rows younger than STUCK_AFTER_MS
+     * are left alone (a detached runner may legitimately still be working on a
+     * cold wallet). Older rows are re-verified against the chain where possible
+     * and otherwise marked failed, because an unconfirmable row must never be
+     * reported as succeeded.
+     */
+    private async sweepStuckRows(): Promise<void> {
+        const log = cds.log('producer');
+        const now = Date.now();
+        const ageOf = (r: any) => now - new Date(String(r.modifiedAt ?? r.createdAt ?? 0)).getTime();
+
+        const txRows: any[] = await SELECT.from(PassportTransactions)
+            .columns('ID', 'passport_ID', 'kind', 'txHash', 'modifiedAt', 'createdAt')
+            .where({ status: 'pending' });
+        let closed = 0;
+        for (const row of txRows ?? []) {
+            const action = sweepAction({ ageMs: ageOf(row), checkable: !!row.txHash });
+            if (action.kind === 'leave') continue;
+
+            let verdict: ChainVerdict = 'unknown';
+            if (action.kind === 'recheck') {
+                // The passport carries the anchor coordinates; without them the
+                // chain cannot be asked and the row stays unconfirmable.
+                const p: any = await SELECT.one.from(Passports)
+                    .columns('payloadHash', 'contractAddress').where({ ID: row.passport_ID });
+                if (p?.contractAddress && p?.payloadHash && row.kind === 'attest') {
+                    verdict = await verifyAttestState({ contractAddress: p.contractAddress, payloadHash: p.payloadHash })
+                        .catch(() => 'unknown' as ChainVerdict);
+                }
+            }
+            const outcome = action.kind === 'fail'
+                ? { status: 'failed' as const, reason: action.reason }
+                : verdictToStatus(verdict);
+            await UPDATE.entity(PassportTransactions)
+                .set({ status: outcome.status, ...(outcome.reason ? { errorMessage: outcome.reason } : {}) } as any)
+                .where({ ID: row.ID });
+            // The passport follows its attest row: a confirmed attest means the
+            // anchor landed after all, anything else leaves a retryable failure.
+            if (row.kind === 'attest' && row.passport_ID) {
+                await UPDATE.entity(Passports)
+                    .set({ status: outcome.status === 'succeeded' ? 'anchored' : 'failed' })
+                    .where({ ID: row.passport_ID, status: 'anchoring' });
+            }
+            closed++;
+        }
+
+        // Proof and grant logs have no passport status to follow; they are
+        // simply closed out so the cockpit stops showing a spinner forever.
+        for (const entity of [PredicateProofLog, DisclosureGrantLog]) {
+            const rows: any[] = await SELECT.from(entity)
+                .columns('ID', 'modifiedAt', 'createdAt').where({ status: 'pending' });
+            for (const row of rows ?? []) {
+                if (sweepAction({ ageMs: ageOf(row), checkable: false }).kind === 'leave') continue;
+                await UPDATE.entity(entity).set({
+                    status: 'failed',
+                    errorMessage: 'interrupted by a server restart; retry the operation'
+                } as any).where({ ID: row.ID });
+                closed++;
+            }
+        }
+        if (closed) log.info(`stuck-row sweep closed ${closed} row(s) left in flight by a restart`);
     }
 
     // --- session + config ----------------------------------------------------
