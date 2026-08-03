@@ -4,10 +4,8 @@ using {passport} from '../db/passport-schema';
  * PassportService is the NIGHTPASS consumer surface.
  *
  * Read-side projections of the passport-domain entities, co-served with the
- * NIGHTGATE plugin services on one port. `generatePassport` is the write path
- * that builds a passport from a goods-receipt batch, anchors it on Midnight
- * via the NIGHTGATE plugin (attest + bindPassport on the attestation vault)
- * and returns the QR URL.
+ * NIGHTGATE plugin services on one port. Passport creation lives in
+ * ProducerService.createPassport; this surface reads, verifies and resolves.
  *
  * These projections ARE the Annex XIII disclosure boundary: after-READ
  * handlers in passport-service.ts redact every row to the caller's tier
@@ -45,7 +43,12 @@ service PassportService {
     entity PassportAttributes as projection on passport.PassportAttributes;
 
     // Registered dataspace partners (secret never served).
+    //
+    // NOT anonymous: partners log in with did + secret, so an open listing is a
+    // free user-name directory for that credential surface. Producers manage
+    // the registry, authorities audit it; nobody else needs to enumerate it.
     @readonly
+    @(requires: ['producer', 'authority'])
     entity Partners          as
         projection on passport.Partners
         excluding {
@@ -72,25 +75,6 @@ service PassportService {
         name      : String;
         role      : String;
         granteeId : String;
-    };
-
-    /**
-     * Generate a battery passport from a goods-receipt batch and anchor it on
-     * Midnight. `sessionId` is a signing-enabled NIGHTGATE wallet session (from
-     * connectWallet → connectWalletForSigning); when omitted, the deterministic
-     * off-chain steps still run (hash, encrypt, row, QR) but no tx is submitted
-     * and `attestationTxHash` is null. Useful for offline/dev runs.
-     *
-     * Producer-gated: passport creation is a producer write path. On a public
-     * demo host an anonymous visitor must not be able to insert rows.
-     */
-    @(requires: 'producer')
-    action   generatePassport(batchId: String,
-                              sessionId: UUID)       returns {
-        passportId        : String;
-        attestationTxHash : String;
-        qrCodeUrl         : String;
-        qrCodePng         : LargeString; // data-URL PNG of qrCodeUrl
     };
 
     /**

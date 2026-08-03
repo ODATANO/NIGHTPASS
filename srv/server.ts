@@ -2,10 +2,24 @@ import cds from '@sap/cds';
 import QRCode from 'qrcode';
 import crypto from 'node:crypto';
 import express from 'express';
-import { verifyPeers, explorerLinks, passportSources } from './lib/passport-anchor';
+import { verifyPeers, explorerLinks, passportSources, assertEncryptionKey } from './lib/passport-anchor';
 import { passportHttpSecurity } from './http-security';
 
 const { SELECT, INSERT, UPDATE, DELETE } = cds.ql;
+
+/**
+ * Telemetry replay window. A signed frame is accepted only within this skew of
+ * its signed timestamp, and each signature is remembered for the same span, so
+ * a captured request can be replayed neither later (outside the window) nor
+ * immediately (already seen). The set is bounded by the window, not by count.
+ */
+const TELEMETRY_MAX_SKEW_MS = 5 * 60_000;
+const seenTelemetrySignatures = new Set<string>();
+function rememberTelemetrySignature(sig: string): void {
+    seenTelemetrySignatures.add(sig);
+    const t = setTimeout(() => seenTelemetrySignatures.delete(sig), TELEMETRY_MAX_SKEW_MS * 2);
+    t.unref?.();
+}
 
 /**
  * NIGHTPASS bootstrap extras: the public QR landing resolver and the QR
@@ -21,6 +35,11 @@ cds.on('bootstrap', (app: any) => {
     // NIGHTPASS owns host-wide HTTP policy. Plugins (including NIGHTGATE) must
     // not alter unrelated routes in the shared CAP process.
     app.use(passportHttpSecurity);
+
+    // Fail closed on a missing app secret: without a valid ENCRYPTION_KEY every
+    // payload cipher would be written under a default key. Better to refuse the
+    // boot than to serve a passport whose confidentiality is an illusion.
+    assertEncryptionKey();
 
     // Behind a reverse proxy (Caddy on the public hosts) req.ip is the proxy
     // container's address unless Express is told to trust X-Forwarded-For.
@@ -304,11 +323,35 @@ cds.on('bootstrap', (app: any) => {
 
             const raw: Buffer = Buffer.isBuffer(req.body) ? req.body : Buffer.from('');
             const given = String(req.headers['x-bms-signature'] ?? '');
-            const expected = 'sha256=' + crypto.createHmac('sha256', secret).update(raw).digest('hex');
+            const stamp = String(req.headers['x-bms-timestamp'] ?? '');
+            // The timestamp is signed ALONGSIDE the body (Stripe-style
+            // `<timestamp>.<body>`). Signing the body alone would let a captured
+            // request be replayed with a fresh timestamp header, which is
+            // exactly the attack the timestamp is there to stop.
+            const expected = 'sha256=' + crypto.createHmac('sha256', secret)
+                .update(stamp).update('.').update(raw).digest('hex');
             const a = Buffer.from(given), b = Buffer.from(expected);
             if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
                 return res.status(401).json({ error: 'invalid or missing x-bms-signature' });
             }
+
+            // Replay protection. The ERP webhook is idempotent on passportId,
+            // but every telemetry frame legitimately appends a new attribute
+            // version, so a captured request replayed later would age the
+            // battery again and push the row into anchor drift. A signature
+            // alone cannot distinguish that from a fresh frame; a timestamp
+            // inside the signed body plus a short-lived seen-set can.
+            const sentAt = Date.parse(stamp);
+            if (!Number.isFinite(sentAt)) {
+                return res.status(400).json({ error: 'x-bms-timestamp header (ISO 8601) is required' });
+            }
+            if (Math.abs(Date.now() - sentAt) > TELEMETRY_MAX_SKEW_MS) {
+                return res.status(401).json({ error: 'x-bms-timestamp is outside the accepted window (+/- 5 minutes)' });
+            }
+            if (seenTelemetrySignatures.has(given)) {
+                return res.status(409).json({ error: 'replayed request (signature already seen)' });
+            }
+            rememberTelemetrySignature(given);
 
             let body: any;
             try { body = JSON.parse(raw.toString('utf8')); }

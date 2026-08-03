@@ -46,10 +46,14 @@ console.log(`passport ${PASSPORT_ID}: ${present.length} attributes, resuming at 
 for (let tick = lastTick + 1; tick <= lastTick + TICKS; tick++) {
     const updates = generateTelemetry(PASSPORT_ID, tick, present);
     const body = Buffer.from(JSON.stringify({ passportId: PASSPORT_ID, source: 'bms', updates }));
-    const signature = 'sha256=' + crypto.createHmac('sha256', SECRET).update(body).digest('hex');
+    // The timestamp is signed with the body (replay protection); the server
+    // rejects a frame whose stamp is missing, unsigned or older than 5 minutes.
+    const stamp = new Date().toISOString();
+    const signature = 'sha256=' + crypto.createHmac('sha256', SECRET)
+        .update(stamp).update('.').update(body).digest('hex');
     const res = await fetch(`${BASE}/api/v1/passport/telemetry`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json', 'x-bms-signature': signature },
+        headers: { 'content-type': 'application/json', 'x-bms-signature': signature, 'x-bms-timestamp': stamp },
         body,
     });
     const out: any = await res.json().catch(() => ({}));

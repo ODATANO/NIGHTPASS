@@ -17,7 +17,7 @@
  */
 import express from 'express';
 import cds from '@sap/cds';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHmac, timingSafeEqual } from 'node:crypto';
 import {
     DppStore, DppRole, DppVersion, filterDocumentForRole, mergePatch, splitElementPath,
     getElement, patchElement, operatorIdOf, touchLastUpdate,
@@ -43,6 +43,46 @@ function pick(data: Record<string, unknown> | undefined, ...names: string[]): un
         if (k !== undefined && data[k] !== undefined && data[k] !== '') return data[k];
     }
     return undefined;
+}
+
+/**
+ * Whether this process serves a public host. The conformance harness accepts
+ * an unauthenticated caller AS the economic operator so the executor can drive
+ * operator scenarios; that convenience must not exist where anyone can reach
+ * the surface.
+ */
+const IS_PUBLIC_HOST = !!process.env.PASSPORT_PUBLIC_SURFACE?.trim();
+
+/**
+ * Secret behind the self-describing conformance tokens. Set
+ * DPP_API_TOKEN_SECRET to keep issued tokens valid across a restart; otherwise
+ * a per-process secret is used and a restart invalidates them (safe default,
+ * the executor re-issues via TestSetup).
+ */
+const TOKEN_SECRET = process.env.DPP_API_TOKEN_SECRET?.trim() || randomUUID();
+
+function signTokenBody(body: string): string {
+    return createHmac('sha256', TOKEN_SECRET).update(body).digest('hex').slice(0, 32);
+}
+
+/** Mint `bp.<role>.<uuid>.<sig>`; the signature is what makes it unforgeable. */
+export function mintDppToken(role: string): string {
+    const body = `bp.${role}.${randomUUID()}`;
+    return `${body}.${signTokenBody(body)}`;
+}
+
+/**
+ * The role a signed token carries, or undefined when it is unsigned, tampered
+ * with or shaped like a token but not issued by us. Constant-time compare so
+ * the signature cannot be brute-forced byte by byte.
+ */
+export function roleFromSignedToken(raw: string): string | undefined {
+    const m = /^(bp\.([a-z_]+)\.[0-9a-f-]+)\.([0-9a-f]{32})$/.exec(raw);
+    if (!m) return undefined;
+    const expected = Buffer.from(signTokenBody(m[1]), 'utf8');
+    const given = Buffer.from(m[3], 'utf8');
+    if (expected.length !== given.length || !timingSafeEqual(expected, given)) return undefined;
+    return m[2];
 }
 
 export function createDppApiRouter(): express.Router {
@@ -155,10 +195,17 @@ export function createDppApiRouter(): express.Router {
         const header = String(req.headers.authorization ?? '');
         const raw = header.replace(/^(Bearer|ApiKey)\s+/i, '').trim()
             || String(req.headers['x-api-key'] ?? '').trim();
-        if (!raw) return { role: null, invalid: false };
-        // Tokens are self-describing (bp.<role>.<uuid>) so a restart between
-        // TestSetup and the scenario run does not invalidate them.
-        const resolved = tokens.get(raw) ?? /^bp\.([a-z_]+)\./.exec(raw)?.[1];
+        if (!raw) {
+            // No credential. On a PUBLIC host that must not mean "operator with
+            // full write access"; the permissive behaviour exists only so the
+            // conformance executor can drive operator scenarios unauthenticated.
+            return { role: null, invalid: IS_PUBLIC_HOST };
+        }
+        // Tokens are self-describing (bp.<role>.<uuid>.<sig>) so a restart
+        // between TestSetup and the scenario run does not invalidate them. The
+        // signature is what makes that safe: without it, any string shaped like
+        // `bp.authority.x` would have granted that role.
+        const resolved = tokens.get(raw) ?? roleFromSignedToken(raw);
         if (resolved === 'economic_operator') return { role: null, invalid: false };
         if (resolved && (READ_ROLES as string[]).includes(resolved)) {
             return { role: resolved as DppRole, invalid: false };
@@ -222,7 +269,7 @@ export function createDppApiRouter(): express.Router {
                         results.push({ name: 'issueCredentials', data: { success: false } });
                         continue;
                     }
-                    const token = `bp.${role}.${randomUUID()}`;
+                    const token = mintDppToken(role);
                     tokens.set(token, role);
                     results.push({ name: 'issueCredentials', data: { success: true, type, token, role } });
                 } else {

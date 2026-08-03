@@ -1,10 +1,8 @@
 import cds from '@sap/cds';
-import QRCode from 'qrcode';
 import { Passport, Passports, PredicateProofLog, Partners } from '#cds-models/passport';
-import { hashPayload, blake2b256Hex, encryptPayload, anchorPassport, effectiveNetwork, explorerTxUrl, verifyPeers, fieldKeyHex } from './lib/passport-anchor';
-import { defaultGuideAttributes, hashableAttributes } from './lib/guide-attribute-defaults';
+import { effectiveNetwork, explorerTxUrl, verifyPeers, fieldKeyHex } from './lib/passport-anchor';
 import { granteeIdForDid } from './lib/grantee';
-import { rowToBatch, type Batch, type GoodsReceiptRow } from './lib/goods-receipt';
+import { restrictedProbe } from './lib/query-guard';
 
 const { INSERT, SELECT, UPDATE } = cds.ql;
 
@@ -108,9 +106,14 @@ async function effectiveGrantsFor(grantees: string[]): Promise<Map<string, numbe
     return out;
 }
 
-/** Fields on Passports beyond Annex XIII Point 1. Authority-only lineage. */
+/**
+ * Fields on Passports beyond Annex XIII Point 1. Authority-only lineage.
+ * `owner` is the operator's shielded wallet address: publishing it would link
+ * every passport of one producer (and every demo visitor's Midnight identity)
+ * on a surface whose whole point is unlinkability.
+ */
 const PASSPORT_AUTHORITY_FIELDS = [
-    'payloadHash', 'passportIdHash', 'contractAddress', 'attestationTxHash', 'attestation', 'attestation_ID'
+    'payloadHash', 'passportIdHash', 'contractAddress', 'attestationTxHash', 'attestation', 'attestation_ID', 'owner'
 ] as const;
 
 /** Delete a set of keys from a row in place. */
@@ -143,6 +146,10 @@ function redactPassport(row: Record<string, unknown>, tier: Tier): void {
     }
 }
 
+/** Authority-only columns on the child entities (supplier identity, CO2). */
+const BATTERY_AUTHORITY_FIELDS = ['carbonFootprintKgCO2', 'supplierName'] as const;
+const RECYCLED_AUTHORITY_FIELDS = ['sourceSupplierName'] as const;
+
 /**
  * carbonFootprint + supplierName are authority-only; the rest is legitimate
  * interest, so a consumer sees nothing at all. That matters on DIRECT child
@@ -152,13 +159,35 @@ function redactPassport(row: Record<string, unknown>, tier: Tier): void {
  */
 function redactBattery(row: Record<string, unknown>, tier: Tier): void {
     if (tier === 'consumer') { strip(row, Object.keys(row)); return; }
-    if (tier !== 'authority') strip(row, ['carbonFootprintKgCO2', 'supplierName']);
+    if (tier !== 'authority') strip(row, BATTERY_AUTHORITY_FIELDS);
 }
 
 /** sourceSupplierName (supplier identity) is authority-only; consumers see nothing. */
 function redactRecycled(row: Record<string, unknown>, tier: Tier): void {
     if (tier === 'consumer') { strip(row, Object.keys(row)); return; }
-    if (tier !== 'authority') strip(row, ['sourceSupplierName']);
+    if (tier !== 'authority') strip(row, RECYCLED_AUTHORITY_FIELDS);
+}
+
+/**
+ * Reject a read whose $filter / $orderby / $apply touches a column the tier
+ * may not see. Without this, redacting rows AFTER the database read is not a
+ * disclosure boundary at all: `$filter=carbonFootprintKgCO2 lt 3000&$count=true`
+ * turns the row COUNT into an oracle that reconstructs the exact confidential
+ * value the ZK predicate exists to hide (verified against the live host).
+ */
+function rejectRestrictedProbing(req: cds.Request, restricted: readonly string[]): void {
+    const hit = restrictedProbe((req.query as any)?.SELECT, restricted);
+    if (hit) req.reject(403, `'${hit}' is not readable at your disclosure tier and cannot be filtered, sorted or aggregated on`);
+}
+
+/**
+ * Restrict a child-entity read to nothing at all. The tier sees no row of this
+ * entity, so returning zero rows is the honest answer; serving stripped-empty
+ * rows would still publish their COUNT. `ID` is a non-null key, so `ID is null`
+ * is an always-false predicate on both SQLite and PostgreSQL.
+ */
+function restrictToNothing(req: cds.Request): void {
+    (req.query as any).where({ ID: null });
 }
 
 /** Which longlist access classes a tier may read (guide-format attribute rows). */
@@ -175,27 +204,12 @@ function asRows(data: unknown): Record<string, unknown>[] {
 }
 
 /**
- * PassportService implementation
- *
- * `generatePassport(batchId, sessionId)` builds a battery passport from a
- * goods-receipt batch, commits its payload hash on Midnight via the NIGHTGATE
- * plugin, and returns the resolvable QR URL.
- *
- * Flow:
- *   1. Fetch batch data
- *   2. payload_hash = blake2b-256(canonical JSON of the private payload).
- *   3. Encrypt the payload with a per-passport key → Passports.payloadCipher.
- *   4. Anchor on-chain via the shared sequence in srv/lib/passport-anchor
- *      (attest + bindPassport + content root), polling each job to inclusion.
- *   5. INSERT the Passports row with the resulting txHash + payloadHash.
- *   6. QR URL = https://<demoHost>/p/<passportId>.
- *
- * If `sessionId` is omitted the deterministic off-chain steps still run and the
- * tx fields stay null. An offline/dev path that needs no wallet.
+ * PassportService implementation: the public read/verify surface (tier-gated
+ * reads, anonymous on-chain verification, QR resolution, publish/ingest).
+ * Passport creation lives in ProducerService.createPassport.
  */
 export default class PassportService extends cds.ApplicationService {
     override async init(): Promise<void> {
-        this.on('generatePassport', this.generatePassport);
         this.on('resolveByHash', this.resolveByHash);
         this.on('passportCredential', this.passportCredential);
         this.on('registerPartner', this.registerPartner);
@@ -244,9 +258,24 @@ export default class PassportService extends cds.ApplicationService {
         });
         // Direct child reads carry no passport scope, so on-chain (per-attestation)
         // grants can't be resolved here; gate on the local role only.
+        //
+        // The boundary is enforced BEFORE the database: a consumer gets no row
+        // at all (an empty row still leaks through $count), and a recycler may
+        // not filter, sort or aggregate on the authority-only columns. The
+        // after-READ redaction below stays as defense in depth.
+        this.before('READ', 'Batteries', (req) => {
+            const tier = localTierOf(req);
+            if (tier === 'consumer') return restrictToNothing(req);
+            if (tier !== 'authority') rejectRestrictedProbing(req, BATTERY_AUTHORITY_FIELDS);
+        });
         this.after('READ', 'Batteries', (data, req) => {
             const tier = localTierOf(req);
             asRows(data).forEach((row) => redactBattery(row, tier));
+        });
+        this.before('READ', 'RecycledMaterials', (req) => {
+            const tier = localTierOf(req);
+            if (tier === 'consumer') return restrictToNothing(req);
+            if (tier !== 'authority') rejectRestrictedProbing(req, RECYCLED_AUTHORITY_FIELDS);
         });
         this.after('READ', 'RecycledMaterials', (data, req) => {
             const tier = localTierOf(req);
@@ -262,7 +291,11 @@ export default class PassportService extends cds.ApplicationService {
             const allowed = tier === 'recycler' ? ['public', 'legitimateInterest'] : ['public'];
             (req.query as any).where({ accessClass: { in: allowed } });
         });
-        // DiligenceDoc is authority-only in full; below-tier requests get nothing.
+        // DiligenceDoc is authority-only in full; below-tier requests get nothing
+        // (not even a row count, hence the before-READ restriction).
+        this.before('READ', 'DiligenceDoc', (req) => {
+            if (localTierOf(req) !== 'authority') restrictToNothing(req);
+        });
         this.after('READ', 'DiligenceDoc', (data, req) => {
             if (localTierOf(req) === 'authority') return;
             asRows(data).forEach((row) => strip(row, Object.keys(row)));
@@ -270,86 +303,6 @@ export default class PassportService extends cds.ApplicationService {
 
         return super.init();
     }
-
-    private generatePassport = async (req: cds.Request) => {
-        const { batchId, sessionId } = req.data as { batchId?: string; sessionId?: string };
-        if (!batchId) return req.reject(400, 'batchId is required');
-
-        // 1. Fetch batch data from the mock SAP goods-receipt feed. The row
-        //    carries the public header + the shielded payload; rowToBatch parses it.
-        const batch = await resolveBatch(batchId);
-        if (!batch) return req.reject(404, `batch '${batchId}' not found`);
-        const passportId = batch.passportId;
-
-        // passportId is unique (Regulation 2023/1542). Reject re-generation of an
-        // existing passport rather than creating a duplicate row.
-        const existing = await SELECT.one.from(Passports).columns('ID').where({ passportId });
-        if (existing) return req.reject(409, `passport '${passportId}' already exists`);
-
-        // 2. Canonical payload + blake2b-256 hash. The hash is what goes on-chain;
-        //    the payload body stays off-chain (encrypted, step 3). The passportId
-        //    is a human string, so derive a stable Bytes<32> id for the on-chain
-        //    binding by hashing it the same way. Guide-format attributes (DIN DKE
-        //    SPEC 99100 longlist) are part of the anchored payload, canonically
-        //    sorted so row order never changes the hash.
-        const attributes = hashableAttributes(defaultGuideAttributes({
-            passportId, model: batch.public.model, performanceClass: batch.public.performanceClass,
-            batteryCategory: batch.public.batteryCategory,
-        }));
-        const { canonicalPayload, payloadHash } = hashPayload({ ...batch.payload, attributes });
-        const passportIdHash = blake2b256Hex(passportId);
-
-        // 3. Encrypt the payload with a per-passport key derived from passportId.
-        const payloadCipher = encryptPayload(canonicalPayload, passportId);
-
-        const demoHost = process.env.PASSPORT_DEMO_HOST ?? 'https://passport.example';
-        const qrCodeUrl = `${demoHost}/p/${passportId}`;
-        const contractAddress = process.env.PASSPORT_CONTRACT_ADDRESS ?? null;
-
-        // 4. On-chain anchor (only when a signing session is supplied); the
-        // sequence is shared with the producer cockpit via srv/lib/passport-anchor.
-        let attestationTxHash: string | null = null;
-        if (sessionId) {
-            if (!contractAddress) {
-                return req.reject(400,
-                    'PASSPORT_CONTRACT_ADDRESS env is required for on-chain anchoring (a deployed attestation-vault address)');
-            }
-            const nightgate = await cds.connect.to('NightgateService');
-            ({ attestationTxHash } = await anchorPassport(nightgate, {
-                payloadHash, passportId, passportIdHash, contractAddress, sessionId, user: req.user
-            }));
-        }
-
-        // 5. Persist the passport row (payloadCipher excluded from the read
-        //    projection; stored here on the base entity). Cast on entries: the
-        //    LargeBinary column is typed `Readable | null` by cds-types, but the
-        //    runtime accepts a Buffer for binary inserts.
-        await INSERT.into(Passports).entries({
-            passportId,
-            manufacturerId: batch.public.manufacturerId,
-            batteryCategory: batch.public.batteryCategory as Passport['batteryCategory'],
-            model: batch.public.model,
-            manufactureDate: batch.public.manufactureDate as Passport['manufactureDate'],
-            weightKg: batch.public.weightKg,
-            performanceClass: batch.public.performanceClass,
-            qrCodeUrl,
-            payloadCipher: payloadCipher as unknown as Passport['payloadCipher'],
-            payloadHash,
-            passportIdHash,
-            contractAddress,
-            anchorNetwork: contractAddress ? effectiveNetwork() : null,
-            attestationTxHash,
-            attributes: attributes.map((a) => ({ ...a }))
-        } as any);
-
-        // Mark the goods-receipt consumed so the feed reflects that this batch
-        // was turned into a passport (best-effort; the passport row is the SoT).
-        await UPDATE.entity('mocksap.GoodsReceipts').set({ status: 'consumed' }).where({ batchId });
-
-        // 6. Return the action result, incl. the QR as a data-URL PNG.
-        const qrCodePng = await QRCode.toDataURL(qrCodeUrl, { width: 320, margin: 1 });
-        return { passportId, attestationTxHash, qrCodeUrl, qrCodePng };
-    };
 
     /** Supplier resolution by on-chain payloadHash → identity + verification + link. */
     private resolveByHash = async (req: cds.Request) => {
@@ -806,20 +759,5 @@ export default class PassportService extends cds.ApplicationService {
         }
         return { did: d, name, role: r, granteeId };
     };
-}
-
-// --- Batch source
-
-/**
- * Resolve a goods-receipt batch by id from the mock SAP feed
- * (mocksap.GoodsReceipts, served by MockSapService). Rows are emitted by the
- * deterministic generator, not hard-coded; rowToBatch parses the stored public
- * header + shielded payload back into the batch shape generatePassport consumes.
- * Returns null when the batch id is unknown.
- */
-async function resolveBatch(batchId: string): Promise<Batch | null> {
-    const row = await SELECT.one.from('mocksap.GoodsReceipts').where({ batchId });
-    if (!row) return null;
-    return rowToBatch(row as GoodsReceiptRow);
 }
 

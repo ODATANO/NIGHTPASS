@@ -1,7 +1,15 @@
 # Never bake secrets or local state into the image.
-.env
-.env.*
-!.env.example
+#
+# The patterns MUST be recursive: .dockerignore matches against the path
+# relative to the build context root, and the context here is the REPO root
+# (deploy/docker-compose.yml uses `build: ..`). A bare `.env` therefore only
+# excludes the top-level file and would let deploy/.env, deploy/.env.demo and
+# secrets/ into an image layer, where `docker save` reveals every wallet
+# mnemonic. Verified with a build-context probe; do not "simplify" these.
+**/.env
+**/.env.*
+!**/.env.example
+secrets/
 
 node_modules
 .git

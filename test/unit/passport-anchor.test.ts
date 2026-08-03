@@ -2,7 +2,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
     sortKeys, canonicalize, blake2b256Hex, hashPayload,
-    scaleValue, fieldKeyHex, VALUE_SCALE, encryptPayload, waitForJobResult
+    scaleValue, fieldKeyHex, VALUE_SCALE, encryptPayload, assertEncryptionKey, waitForJobResult
 } from '../../srv/lib/passport-anchor';
 
 describe('canonicalize + hashPayload', () => {
@@ -47,12 +47,44 @@ describe('scaleValue + fieldKeyHex', () => {
 });
 
 describe('encryptPayload', () => {
+    const KEY = 'a'.repeat(64);
+    const withKey = <T>(value: string | undefined, fn: () => T): T => {
+        const prev = process.env.ENCRYPTION_KEY;
+        if (value === undefined) delete process.env.ENCRYPTION_KEY;
+        else process.env.ENCRYPTION_KEY = value;
+        try { return fn(); } finally {
+            if (prev === undefined) delete process.env.ENCRYPTION_KEY;
+            else process.env.ENCRYPTION_KEY = prev;
+        }
+    };
+
     it('lays out iv(12) || tag(16) || ciphertext and is nonce-randomized', () => {
-        const pt = 'hello passport';
-        const a = encryptPayload(pt, 'BAT-PREVIEW-0001');
-        const b = encryptPayload(pt, 'BAT-PREVIEW-0001');
-        assert.equal(a.length, 12 + 16 + Buffer.byteLength(pt, 'utf8'));
-        assert.notDeepEqual(a.subarray(0, 12), b.subarray(0, 12)); // random iv per call
+        withKey(KEY, () => {
+            const pt = 'hello passport';
+            const a = encryptPayload(pt, 'BAT-PREVIEW-0001');
+            const b = encryptPayload(pt, 'BAT-PREVIEW-0001');
+            assert.equal(a.length, 12 + 16 + Buffer.byteLength(pt, 'utf8'));
+            assert.notDeepEqual(a.subarray(0, 12), b.subarray(0, 12)); // random iv per call
+        });
+    });
+
+    // Fail closed: encrypting confidential Annex XIII payloads under a default
+    // key would look completely normal from the outside, which is what makes it
+    // dangerous. Refusing is the only safe answer.
+    it('REFUSES to encrypt without a valid ENCRYPTION_KEY', () => {
+        withKey(undefined, () => {
+            assert.throws(() => encryptPayload('x', 'BAT-1'), /ENCRYPTION_KEY/);
+        });
+        for (const bad of ['', 'not-hex', 'ab', 'z'.repeat(64), KEY.slice(0, 63)]) {
+            withKey(bad, () => {
+                assert.throws(() => encryptPayload('x', 'BAT-1'), /ENCRYPTION_KEY/, `accepted bad key '${bad}'`);
+            });
+        }
+    });
+
+    it('assertEncryptionKey mirrors that check for the boot guard', () => {
+        withKey(KEY, () => assert.doesNotThrow(() => assertEncryptionKey()));
+        withKey(undefined, () => assert.throws(() => assertEncryptionKey(), /ENCRYPTION_KEY/));
     });
 });
 

@@ -286,15 +286,35 @@ export async function buildContentRoot(values: Record<string, number | string | 
 // --- Payload encryption ------------------------------------------------------
 
 /**
+ * The app secret behind every payload cipher. FAIL CLOSED: a missing or
+ * malformed ENCRYPTION_KEY used to fall back to an all-zero key silently,
+ * which encrypts confidential Annex XIII payloads under a publicly known key
+ * and looks completely normal from the outside. Refusing to encrypt is the
+ * only safe answer; `assertEncryptionKey()` turns this into a boot failure so
+ * it surfaces at deploy time rather than on the first passport.
+ */
+export function encryptionMasterKey(): Buffer {
+    const hex = String(process.env.ENCRYPTION_KEY ?? '').trim();
+    if (!/^[0-9a-fA-F]{64}$/.test(hex)) {
+        throw new Error(
+            'ENCRYPTION_KEY must be 32 bytes of hex (64 characters); refusing to encrypt passport payloads '
+            + 'with a default key. Generate one with: openssl rand -hex 32');
+    }
+    return Buffer.from(hex, 'hex');
+}
+
+/** Boot-time guard so a misconfigured deployment fails loudly, not silently. */
+export function assertEncryptionKey(): void {
+    encryptionMasterKey();
+}
+
+/**
  * AES-256-GCM encrypt with a per-passport key derived via HKDF from the app
  * secret (ENCRYPTION_KEY) and passportId as salt. Output layout:
  * iv(12) || authTag(16) || ciphertext, as a Buffer for the LargeBinary column.
  */
 export function encryptPayload(plaintext: string, passportId: string): Buffer {
-    const masterHex = process.env.ENCRYPTION_KEY;
-    const master = masterHex
-        ? Buffer.from(masterHex, 'hex')
-        : Buffer.from('00'.repeat(32), 'hex'); // dev fallback; prod must set ENCRYPTION_KEY
+    const master = encryptionMasterKey();
     const key = Buffer.from(
         hkdfSync('sha256', master, Buffer.from(passportId, 'utf8'), Buffer.from('passport-payload'), 32)
     );

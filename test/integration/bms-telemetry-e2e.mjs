@@ -48,10 +48,12 @@ async function http(method, path, { body, auth, headers } = {}) {
     return { status: r.status, body: parsed };
 }
 
-function signed(payload) {
+function signed(payload, stamp = new Date().toISOString()) {
     const raw = Buffer.from(JSON.stringify(payload));
-    const signature = 'sha256=' + crypto.createHmac('sha256', SECRET).update(raw).digest('hex');
-    return { body: raw, headers: { 'x-bms-signature': signature } };
+    // Timestamp is part of the signed material (replay protection).
+    const signature = 'sha256=' + crypto.createHmac('sha256', SECRET)
+        .update(stamp).update('.').update(raw).digest('hex');
+    return { body: raw, headers: { 'x-bms-signature': signature, 'x-bms-timestamp': stamp } };
 }
 
 async function postTelemetry(payload) {
@@ -126,6 +128,30 @@ const badSig = await http('POST', '/api/v1/passport/telemetry', {
 if (badSig.status !== 401) fail(`bad signature should give 401, got ${badSig.status}`);
 console.log('OK   invalid signature rejected (401)');
 
+// Replay protection: an old stamp is refused even though its signature is
+// valid, and a correctly signed frame cannot be sent twice.
+const stale = signed({ passportId: pid, updates: [{ attribute: 'CapacityFade', value: 3 }] },
+    new Date(Date.now() - 30 * 60_000).toISOString());
+const staleRes = await http('POST', '/api/v1/passport/telemetry',
+    { body: stale.body, headers: { 'Content-Type': 'application/json', ...stale.headers } });
+if (staleRes.status !== 401) fail(`stale timestamp should give 401, got ${staleRes.status}`);
+console.log('OK   stale timestamp rejected (401)');
+
+const replayable = signed({ passportId: pid, updates: [{ attribute: 'CapacityFade', value: 4 }] });
+const first = await http('POST', '/api/v1/passport/telemetry',
+    { body: replayable.body, headers: { 'Content-Type': 'application/json', ...replayable.headers } });
+if (first.status !== 200) fail(`first send should succeed, got ${first.status}`);
+const replay = await http('POST', '/api/v1/passport/telemetry',
+    { body: replayable.body, headers: { 'Content-Type': 'application/json', ...replayable.headers } });
+if (replay.status !== 409) fail(`replayed request should give 409, got ${replay.status}`);
+console.log('OK   replayed request rejected (409)');
+
+const noStamp = signed({ passportId: pid, updates: [{ attribute: 'CapacityFade', value: 5 }] });
+const missing = await http('POST', '/api/v1/passport/telemetry',
+    { body: noStamp.body, headers: { 'Content-Type': 'application/json', 'x-bms-signature': noStamp.headers['x-bms-signature'] } });
+if (missing.status !== 401) fail(`missing timestamp should give 401, got ${missing.status}`);
+console.log('OK   missing timestamp rejected (401)');
+
 const notAllowed = await postTelemetry({ passportId: pid, updates: [{ attribute: 'RatedCapacity', value: 250 }] });
 if (notAllowed.status !== 400) fail(`non-dynamic attribute should give 400, got ${notAllowed.status}`);
 console.log('OK   non-allowlisted attribute rejected (400)');
@@ -161,11 +187,11 @@ if (remCap?.amperehourMiliamperehourValue !== 190 || remCap?.ampereHourMiliamper
 console.log('OK   recycler tier sees the updated values in correct guide shapes');
 
 // --- 5. Second batch via the mock-BMS simulator action -----------------------
-step('Telemetry batch 2 (mock-sap triggerBmsTelemetry)');
+step('Telemetry batch 2 (bms-sim triggerBmsTelemetry)');
 await sleep(1100);
 const t1 = new Date().toISOString();
 await sleep(1100);
-const sim = await http('POST', '/api/v1/mock-sap/triggerBmsTelemetry', { auth: PRODUCER, body: { passportId: pid, ticks: 1 } });
+const sim = await http('POST', '/api/v1/bms-sim/triggerBmsTelemetry', { auth: PRODUCER, body: { passportId: pid, ticks: 1 } });
 if (sim.status !== 200 || !(sim.body?.updated > 0)) fail(`triggerBmsTelemetry -> ${sim.status}: ${pretty(sim.body)}`);
 console.log(`OK   simulator applied tick ${sim.body.fromTick} (${sim.body.updated} updates)`);
 
