@@ -89,7 +89,7 @@ jobs:
             (async () => {
               await cds.plugins;
               const m = await cds.load("*");
-              const need = ["MockSapService", "PassportService", "ProducerService", "mocksap.GoodsReceipts"];
+              const need = ["BmsSimulatorService", "PassportService", "ProducerService", "passport.Passports"];
               const missing = need.filter((n) => !m.definitions[n]);
               if (missing.length) {
                 console.error("::error::missing CDS definitions: " + missing.join(", "));

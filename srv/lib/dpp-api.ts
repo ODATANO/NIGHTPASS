@@ -17,7 +17,8 @@
  */
 import express from 'express';
 import cds from '@sap/cds';
-import { randomUUID, createHmac, timingSafeEqual } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
+import { mintDppToken, roleFromSignedToken } from './dpp-token';
 import {
     DppStore, DppRole, DppVersion, filterDocumentForRole, mergePatch, splitElementPath,
     getElement, patchElement, operatorIdOf, touchLastUpdate,
@@ -52,38 +53,6 @@ function pick(data: Record<string, unknown> | undefined, ...names: string[]): un
  * the surface.
  */
 const IS_PUBLIC_HOST = !!process.env.PASSPORT_PUBLIC_SURFACE?.trim();
-
-/**
- * Secret behind the self-describing conformance tokens. Set
- * DPP_API_TOKEN_SECRET to keep issued tokens valid across a restart; otherwise
- * a per-process secret is used and a restart invalidates them (safe default,
- * the executor re-issues via TestSetup).
- */
-const TOKEN_SECRET = process.env.DPP_API_TOKEN_SECRET?.trim() || randomUUID();
-
-function signTokenBody(body: string): string {
-    return createHmac('sha256', TOKEN_SECRET).update(body).digest('hex').slice(0, 32);
-}
-
-/** Mint `bp.<role>.<uuid>.<sig>`; the signature is what makes it unforgeable. */
-export function mintDppToken(role: string): string {
-    const body = `bp.${role}.${randomUUID()}`;
-    return `${body}.${signTokenBody(body)}`;
-}
-
-/**
- * The role a signed token carries, or undefined when it is unsigned, tampered
- * with or shaped like a token but not issued by us. Constant-time compare so
- * the signature cannot be brute-forced byte by byte.
- */
-export function roleFromSignedToken(raw: string): string | undefined {
-    const m = /^(bp\.([a-z_]+)\.[0-9a-f-]+)\.([0-9a-f]{32})$/.exec(raw);
-    if (!m) return undefined;
-    const expected = Buffer.from(signTokenBody(m[1]), 'utf8');
-    const given = Buffer.from(m[3], 'utf8');
-    if (expected.length !== given.length || !timingSafeEqual(expected, given)) return undefined;
-    return m[2];
-}
 
 export function createDppApiRouter(): express.Router {
     const store = new DppStore();

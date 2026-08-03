@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mintDppToken, roleFromSignedToken } from '../../srv/lib/dpp-api';
+import { mintDppToken, roleFromSignedToken } from '../../srv/lib/dpp-token';
 
 describe('DPP conformance tokens', () => {
     it('round-trips a minted token to its role', () => {
