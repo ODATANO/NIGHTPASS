@@ -124,7 +124,7 @@ if (!SKIP_PROOF) {
 
 // --- 3. Telemetry drift ------------------------------------------------------
 step('2 BMS telemetry ticks + drift check');
-const sim = await post('/api/v1/mock-sap/triggerBmsTelemetry', { passportId: pid, ticks: 2 });
+const sim = await post('/api/v1/bms-sim/triggerBmsTelemetry', { passportId: pid, ticks: 2 });
 if (sim.status !== 200 || !(sim.body?.updated > 0)) fail(`triggerBmsTelemetry -> ${sim.status}: ${pretty(sim.body)}`);
 console.log(`OK   ${sim.body.updated} attribute updates over ${sim.body.ticksApplied} ticks`);
 const drift = await get(`/api/v1/producer/passportDrift(passportId=${q(pid)})`);

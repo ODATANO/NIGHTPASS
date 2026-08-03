@@ -1,6 +1,6 @@
 // ERP ingest e2e against a RUNNING NIGHTPASS server:
 //
-//   mock-SAP goods-receipt -> CloudEvent -> HMAC-signed webhook
+//   synthetic ERP goods-receipt event -> CloudEvent -> HMAC-signed webhook
 //   POST /api/v1/passport/erp-events -> createPassport (auto-anchor when
 //   ERP_AUTO_ANCHOR=true on the server) -> poll row -> verifyAttestationState.
 //
@@ -13,9 +13,7 @@
 //   ERP_EXPECT_ANCHOR    default '1'; set '0' when the server runs without
 //                        ERP_AUTO_ANCHOR (asserts the offline-draft path only)
 
-import { Agent, setGlobalDispatcher } from 'undici';
 import crypto from 'node:crypto';
-setGlobalDispatcher(new Agent({ headersTimeout: 0, bodyTimeout: 0, connectTimeout: 30_000 }));
 
 const BASE = process.env.NIGHTPASS_BASE || 'http://localhost:4004';
 const SECRET = process.env.ERP_WEBHOOK_SECRET;
@@ -48,36 +46,39 @@ async function get(path) {
     return r.json();
 }
 
-// --- 1. Emit a fresh goods-receipt from the mock ERP feed -------------------
-step('MockSap triggerGoodsReceipt(1)');
-const trig = await post('/api/v1/mock-sap/triggerGoodsReceipt', { count: 1 });
-if (trig.status !== 200) fail(`triggerGoodsReceipt -> ${trig.status}: ${pretty(trig.body)}`);
-const emitted = trig.body?.value?.[0] ?? trig.body?.[0];
-if (!emitted?.batchId) fail(`no batchId in response: ${pretty(trig.body)}`);
-console.log(`OK   emitted batch ${emitted.batchId} / passport ${emitted.passportId}`);
-
-const feed = await get(`/api/v1/mock-sap/GoodsReceipts?$filter=batchId eq '${emitted.batchId}'`);
-const receipt = feed.value?.[0];
-if (!receipt?.payloadJson) fail('goods-receipt row has no payloadJson');
+// --- 1. Build a synthetic ERP goods-receipt event ---------------------------
 // createPassport expects the FLAT PassportInput shape: passportId + the public
-// Annex-XIII point-1 fields + the private arrays from payloadJson.
+// Annex-XIII point-1 fields + the private child arrays. Unique per run so the
+// webhook's create path (not the duplicate path) is what gets exercised.
+step('Build synthetic goods-receipt event');
+const stamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);
+const batchId = `BATCH-E2E-${stamp}`;
 const payload = {
-    passportId: receipt.passportId,
-    manufacturerId: receipt.manufacturerId,
-    batteryCategory: receipt.batteryCategory,
-    model: receipt.model,
-    manufactureDate: receipt.manufactureDate,
-    weightKg: receipt.weightKg,
-    performanceClass: receipt.performanceClass,
-    ...JSON.parse(receipt.payloadJson)
+    passportId: `BAT-ERP-${stamp}`,
+    manufacturerId: 'ERP-E2E Works GmbH',
+    batteryCategory: 'EV',
+    model: 'IngestCell EV-75',
+    manufactureDate: new Date().toISOString().slice(0, 10),
+    weightKg: 450,
+    performanceClass: 'B',
+    batteries: [{
+        serialNumber: `SN-${stamp}`, cellChemistry: 'NMC-811', capacityKwh: 75,
+        carbonFootprintKgCO2: 3500, supplierName: 'CathodeWorks GmbH', recycledContentPct: 12
+    }],
+    recycledMaterials: [
+        { material: 'Li', recycledPercentage: 8, sourceSupplierName: 'LiLoop Recycling BV' },
+        { material: 'Co', recycledPercentage: 16, sourceSupplierName: 'ReCobalt Recyclers SA' }
+    ],
+    diligenceDocs: [{ docType: 'supply-chain-due-diligence-report' }]
 };
+console.log(`OK   built batch ${batchId} / passport ${payload.passportId}`);
 
 // --- 2. Wrap in the EQUINOX CloudEvent and HMAC-sign the raw body -----------
 step('POST signed CloudEvent to /api/v1/passport/erp-events');
 const event = {
     specversion: '1.0',
     id: crypto.randomUUID(),
-    source: 'urn:odatano:equinox:mock-sap',
+    source: 'urn:odatano:equinox:erp-e2e',
     type: 'com.odatano.equinox.goodsreceipt.created',
     time: new Date().toISOString(),
     data: payload
@@ -135,5 +136,5 @@ const v = await get(`/api/v1/nightgate/verifyAttestationState(contractAddress='$
 console.log(`verifyAttestationState -> ${pretty(v)}`);
 if (v?.verified !== true) fail('on-chain state did NOT confirm the attested payload hash');
 
-console.log(`\nERP INGEST E2E PASSED. Goods-receipt ${emitted.batchId} -> passport ${passportId} anchored on-chain.`);
+console.log(`\nERP INGEST E2E PASSED. Goods-receipt ${batchId} -> passport ${passportId} anchored on-chain.`);
 console.log(`Attest tx: ${row.attestationTxHash}`);

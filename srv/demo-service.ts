@@ -632,7 +632,7 @@ export default class DemoService extends cds.ApplicationService {
                 await this.patchRun(runId, { state: 'aging' });
                 await setStep('secondLife', { status: 'running' });
                 try {
-                    const mocksap: any = await cds.connect.to('MockSapService');
+                    const mocksap: any = await cds.connect.to('BmsSimulatorService');
                     await mocksap.tx({ user }, (tx: any) => tx.send('triggerBmsTelemetry', { passportId, ticks: 2 }));
                     const st: any = await producer.tx({ user }, (tx: any) => tx.send('changeBatteryStatus', {
                         passportId, newStatus: 'repurposed', sessionId,
