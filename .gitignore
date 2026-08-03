@@ -84,8 +84,9 @@ docs/dev-hangout-ablauf.md
 # events, reproduce SDK balancing offline). Local evidence toolkit, not app code.
 zz-*.mjs
 
-docs/one-pager.md
 docs/pitch-deck.html
+docs/PITCHDECK_V1.pdf
+docs/PITCHDECK_V2.pdf
 docs/demo-script.md
 # BatteryPass-Ready conformance evidence (local working docs; contains
 # third-party material from the GEFEG test environment, not for publishing)

@@ -69,9 +69,16 @@ commitments and predicate results ever reach the chain. The payload never does.
 **Dynamic data ingest (post-market updates).** After the battery is placed on the
 market, its dynamic SoH attributes (capacity fade, remaining capacity, cycle
 counts, and the other Performance-and-Durability telemetry rows) keep changing.
-A BMS or telemetry source pushes updates to `POST /api/v1/passport/telemetry`
-(HMAC over the raw body via `TELEMETRY_WEBHOOK_SECRET`, same machine-auth
-pattern as the ERP webhook), which runs `ProducerService.updateDynamicAttributes`.
+A BMS or telemetry source pushes updates to `POST /api/v1/passport/telemetry`,
+which runs `ProducerService.updateDynamicAttributes`. Machine auth is an HMAC
+over `<x-bms-timestamp>.<raw body>` via `TELEMETRY_WEBHOOK_SECRET`, sent as
+`x-bms-signature`. Signing the timestamp alongside the body is what makes the
+frame replay-proof: the server rejects a stamp outside a five-minute window and
+remembers each signature for that span, so a captured frame can be replayed
+neither later nor immediately. Unlike the ERP webhook, which is idempotent on
+`passportId`, every telemetry frame legitimately appends a new attribute
+version, so a replay would age the battery a second time and push the row into
+anchor drift.
 The action accepts RAW values, encodes them into the exact guide shapes
 (`srv/lib/attribute-update.ts`; note the validator requires integer values for
 the ampere-hour and Celsius attributes), updates the current
@@ -82,7 +89,7 @@ never change through this path, so the tier gate applies unchanged and the
 recycler view reflects updates immediately. The DPP Life Cycle API's
 `dppsByProductIdAndDate` reconstructs the document as of any date from that
 history. A deterministic BMS simulator stands in for a real feed
-(`srv/lib/bms-simulator.ts`, `MockSapService.triggerBmsTelemetry`,
+(`srv/lib/bms-simulator.ts`, `BmsSimulatorService.triggerBmsTelemetry`,
 `scripts/zz-bms-simulate.mts`).
 
 ![NIGHTPASS passport lifecycle](lifecycle.png)

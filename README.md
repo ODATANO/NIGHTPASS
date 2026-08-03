@@ -8,13 +8,13 @@
 [![SAP CAP](https://img.shields.io/badge/SAP%20CAP-%40sap%2Fcds%20%5E10-0faaff?logo=sap)](https://cap.cloud.sap/)
 [![Midnight](https://img.shields.io/badge/Midnight-preprod-2b2b6f)](https://midnight.network/)
 
-**EU Battery Regulation 2023/1542 Digital Battery Passport with three disclosure tiers, backed by zero-knowledge attestations on Midnight.**
-NIGHTPASS implements the EU Battery Passport. One dataset is exposed with a different view per audience (consumer, recycler, authority), and sensitive numbers (for example "recycled cobalt share is at least the legal minimum") can be **proven without revealing the value**. Only a payload hash and public metadata are anchored on-chain; everything else stays encrypted off-chain, and the disclosure tier is enforced in the API layer.
+**The battery passport that proves without revealing.**
+NIGHTPASS implements the EU Battery Regulation 2023/1542 Digital Battery Passport, mandatory from 18 February 2027. One dataset is exposed with a different view per audience (consumer, recycler, authority), and sensitive numbers (for example "recycled cobalt share is at least the legal minimum") can be **proven without revealing the value**. Only a payload hash and public metadata are anchored on Midnight; everything else stays encrypted off-chain, and the disclosure tier is enforced in the API layer. Integrates with any ERP solution, fully SAP-compatible by design.
 
 ## How it works
 
 - **Three disclosure tiers** (Annex XIII): one dataset, server-enforced views for consumer, recycler and authority. An on-chain grant raises a partner's tier per passport.
-- **Zero-knowledge proofs**: prove `carbon footprint <= threshold` without revealing the value, cryptographically bound to *this* passport's anchored fields.
+- **Zero-knowledge proofs**: prove `carbon footprint <= threshold` without revealing the value, cryptographically bound to *this* passport's anchored fields. Batchable: prove up to 8 field values in ONE transaction (proof cart in the cockpit, one wallet approval; or a single server call).
 - **Only hashes on-chain**: the `attestation-vault` contract holds hashes, ownership, disclosure grants and proofs. The passport data itself never leaves your infrastructure.
 - **One transaction per anchor**: attest, id binding and content root land in a single batched tx.
 - **No crypto needed**: a fee-sponsor pool pays all fees, producers hold zero tokens, and passport ids are pre-registered on-chain so nobody can squat them.
@@ -22,7 +22,7 @@ NIGHTPASS implements the EU Battery Passport. One dataset is exposed with a diff
 - **Second Life**: hand the passport to a new operator on-chain; the old one is locked out, the new one updates from day one.
 - **Straight out of SAP**: a goods receipt posted in S/4HANA mints the passport with no manual step; a small bridge polls the standard Material Documents API, pulls weight and description from the live product master and anchors automatically. Proven against SAP's public API sandbox ([example passport](https://zkpassport.eu/p/BAT-MZRMC90001-50001739511)); see [docs/s4-mapping.md](docs/s4-mapping.md).
 - **Sign your way**: server wallets or the user's own Lace wallet; offline-first without either.
-- **Independently conformant**: 0 errors against all five official BatteryPass validation guides, 11/11 official DPP API interop scenarios, and a proven registration flow against the EU registry test environment.
+- **Independently conformant**: EU DPP Registry enrolled (verified economic operator, first passport registration submitted) · 11/11 official DPP API interoperability scenarios · 0 validation errors against all five official BatteryPass validation guides.
 - **Evidence on file**: due-diligence documents stay off-chain; only their sha256 is anchored, so anyone can verify they are untampered.
 - **Zero-infrastructure proving**: ZK proofs run in-process; local dev and CI need no proof server.
 - **Catena-X**: CX-0143 aspect export plus a **Predicate Attestation Credential (PAC)** with `valueDisclosed: false`, the predicate capability Tractus-X currently lacks.
@@ -53,6 +53,8 @@ Every Demo run produces exactly three on-chain transactions. [BAT-TRY-2026072420
 | [docs/producer-walkthrough.md](docs/producer-walkthrough.md) | Producer cockpit with screenshots, tab by tab |
 | [docs/architecture.md](docs/architecture.md) | Layers, data flow, security model, field-bound proof construction, plugin build & deploy |
 | [docs/s4-mapping.md](docs/s4-mapping.md) | S/4HANA integration: the goods-receipt bridge, field-by-field Annex XIII mapping, and the sandbox / S/4 Cloud / Event Mesh lanes |
+| [docs/PITCHDECK.pdf](docs/PITCHDECK.pdf) | Pitch deck: problem, market, solution, architecture, traction, go-to-market |
+| [docs/one-pager.md](docs/one-pager.md) | One-pager: problem, product, live proof points, data room |
 
 ## Quick start full local dev environment
 
@@ -74,7 +76,7 @@ Open http://localhost:4004/ for the launchpad.
 | Producer cockpit (create, attest, disclose, prove; in-app Lace wallet flow) | `/producer/webapp/index.html` |
 | Consumer passport viewer (3 tiers) | `/passport/webapp/` |
 | Passport Explorer (public, block-explorer style, live verification) | `/explorer/` |
-| MockSapService (goods-receipt feed) | `/api/v1/mock-sap` |
+| BmsSimulatorService (simulated BMS telemetry) | `/api/v1/bms-sim` |
 | ProducerService | `/api/v1/producer` |
 | PassportService | `/api/v1/passport` |
 | NightgateService (+ indexer / analytics / admin) | `/api/v1/nightgate` |
