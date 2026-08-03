@@ -126,28 +126,58 @@ waits out any in-flight visitor run (up to 3 x 10 min), restarts only the
 prewarm result. Install as a daily cron on the server:
 
 ```bash
-chmod +x /root/nightpass/deploy/demo-restart.sh
 ( crontab -l 2>/dev/null | grep -v demo-restart.sh; \
-  echo "17 5 * * * /root/nightpass/deploy/demo-restart.sh >> /root/nightpass-demo-restart.log 2>&1" ) | crontab -
+  echo "17 5 * * * bash /root/nightpass/deploy/demo-restart.sh >> /root/nightpass-demo-restart.log 2>&1" ) | crontab -
 ```
+
+The `bash` prefix is deliberate: a deploy that lays the repo down as a tar can
+drop the exec bit, and a cron line calling the path directly then dies with
+"Permission denied" (that killed the nightly restart for two days once).
 
 Check runs with `tail -20 /root/nightpass-demo-restart.log` (expect
 `prewarm CAUGHT UP lines: 3`).
 
-On top of the nightly restart, `demo-autoheal.sh` recovers from a dead or
-wedged container within 5 minutes: the compose file gives `nightpass-demo` a
-healthcheck (node-fetch on demoInfo), and the script force-recreates the
-container when it is not running or unhealthy. Docker's restart policy alone
-does not cover either case (it ignores health, and a wedged process can
-survive `docker restart` with "did not receive an exit event", which is how
-the 2026-08-02 outage happened). Install as a 5-minute cron:
+### Auto-heal (both sites)
+
+`autoheal.sh <service>` recovers a dead or wedged container within 5 minutes.
+Both `nightpass` and `nightpass-demo` carry a compose healthcheck (a node-fetch
+against their own anonymous endpoint), and the script force-recreates the
+container when it is not running or reports unhealthy. Docker's restart policy
+covers neither case: it ignores health, and a wedged process can survive
+`docker restart` with "did not receive an exit event", which is exactly how the
+2026-08-02 outage happened. Install one cron line per service:
 
 ```bash
-( crontab -l 2>/dev/null | grep -v demo-autoheal.sh; \
-  echo "*/5 * * * * bash /root/nightpass/deploy/demo-autoheal.sh >> /root/nightpass-demo-autoheal.log 2>&1" ) | crontab -
+( crontab -l 2>/dev/null | grep -v autoheal.sh; \
+  echo "*/5 * * * * bash /root/nightpass/deploy/autoheal.sh nightpass      >> /root/nightpass-autoheal.log 2>&1"; \
+  echo "*/5 * * * * bash /root/nightpass/deploy/autoheal.sh nightpass-demo >> /root/nightpass-demo-autoheal.log 2>&1" ) | crontab -
 ```
 
-The log stays empty while everything is healthy. Kill switch: the demo stays
-down only if you also `touch /root/nightpass/deploy/.demo-off` before
-`docker compose stop nightpass-demo` (otherwise autoheal resurrects it);
-remove the file to re-enable.
+The logs stay empty while everything is healthy. Auto-heal and the nightly
+restart take the same `flock`, so they cannot fight over the same container.
+
+**Kill switch:** a plain `docker compose stop` is undone within 5 minutes.
+To keep a service down, `touch /root/nightpass/deploy/.<service>-off` first
+(for example `.nightpass-demo-off`) and remove the file to re-enable.
+
+### Database backups
+
+`backup-db.sh` dumps both databases (`pg_dump -Fc`, restore with `pg_restore`)
+and prunes dumps older than `RETAIN_DAYS` (default 14):
+
+```bash
+( crontab -l 2>/dev/null | grep -v backup-db.sh; \
+  echo "23 3 * * * bash /root/nightpass/deploy/backup-db.sh >> /root/nightpass-backup.log 2>&1" ) | crontab -
+```
+
+Set `OFFSITE_CMD` in the cron line (for example an `rclone copy`) to ship the
+dumps off the box; on their own they survive an accidental delete but not a
+host loss.
+
+### Key material
+
+A database dump is NOT a full backup. `deploy/.env` and `deploy/.env.demo` hold
+the wallet mnemonics and the `ENCRYPTION_KEY`, and without the matching key
+every `payloadCipher` in a restored dump stays unreadable forever. Keep an
+encrypted copy of both files (and of `secrets/producer-wallets.env` from the
+development machine) somewhere that is not this server and not that one laptop.

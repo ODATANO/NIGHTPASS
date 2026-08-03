@@ -1,10 +1,22 @@
 # NIGHTPASS public demo, single preprod instance behind Caddy (auto-TLS).
 # See deploy/README.md for the five manual steps; full background in
 # docs/public-demo.md.
+
+# Bounded json-file logging for every service. The default is unbounded, and
+# this host has already run its disk to 93% once; a wallet-sync error storm can
+# produce gigabytes in hours.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   nightpass:
     build: ..
     restart: unless-stopped
+    logging: *default-logging
+    mem_limit: 12g
     env_file: .env
     environment:
       NIGHTGATE_REPLICA_COUNT: "1"
@@ -14,6 +26,17 @@ services:
       cds_requires_db_credentials_password: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in deploy/.env}
       cds_requires_db_credentials_database: nightpass
     expose: ["4004"]
+    # Wedged-process detection, same contract as the demo service below:
+    # anchorExplorer is anonymous and needs no wallet, so a failing probe means
+    # the process really stopped serving. Docker only MARKS the state; recovery
+    # is host-side (deploy/autoheal.sh via cron), because the restart policy
+    # ignores health and a wedged process can survive `docker restart`.
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:4004/api/v1/passport/anchorExplorer()').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 180s
     depends_on:
       postgres:
         condition: service_healthy
@@ -21,6 +44,8 @@ services:
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped
+    logging: *default-logging
+    mem_limit: 2g
     environment:
       POSTGRES_DB: nightpass
       POSTGRES_USER: nightpass
@@ -41,6 +66,8 @@ services:
   nightpass-demo:
     build: ..
     restart: unless-stopped
+    logging: *default-logging
+    mem_limit: 12g
     profiles: ["demo"]
     env_file: .env.demo
     environment:
@@ -72,6 +99,8 @@ services:
   postgres-demo:
     image: postgres:16-alpine
     restart: unless-stopped
+    logging: *default-logging
+    mem_limit: 2g
     profiles: ["demo"]
     environment:
       POSTGRES_DB: nightpass_demo
@@ -90,6 +119,8 @@ services:
   proof-server:
     image: midnightntwrk/proof-server:8.1.0
     restart: unless-stopped
+    logging: *default-logging
+    mem_limit: 8g
     profiles: ["demo"]
     command: ["midnight-proof-server"]
     expose: ["6300"]
@@ -97,6 +128,8 @@ services:
   caddy:
     image: caddy:2-alpine
     restart: unless-stopped
+    logging: *default-logging
+    mem_limit: 512m
     ports: ["80:80", "443:443"]
     environment:
       DEMO_DOMAIN: ${DEMO_DOMAIN}

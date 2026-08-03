@@ -28,6 +28,13 @@ for wait_i in 1 2 3; do
   fi
 done
 
+# Take the lock only now, NOT during the busy wait above: autoheal.sh takes the
+# same one, and holding it for up to 30 minutes would stop it from rescuing a
+# container that wedges while we wait. Waits (no -n) because the nightly
+# restart must not be skipped.
+exec 9>/var/lock/nightpass-nightpass-demo.lock
+flock 9
+
 echo "=== $(date -Is) demo restart (cron) ==="
 /usr/bin/docker compose --profile demo restart nightpass-demo \
   || echo "=== $(date -Is) restart command failed ==="
