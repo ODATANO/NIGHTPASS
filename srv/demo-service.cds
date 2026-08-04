@@ -30,7 +30,12 @@ service DemoService @(path: '/api/v1/demo', requires: 'any') {
         performanceClass : String,    // A to E, public on the explorer
         co2Kg            : Decimal,   // confidential, never published
         proveThreshold   : Decimal,   // public claim bound (kg CO2)
-        secondLife       : Boolean    // optional bonus act: age + repurpose = second anchor version
+        secondLife       : Boolean,   // optional bonus act: age + repurpose = second anchor version
+        // Optional extra claims, JSON array of { field, value, threshold }.
+        // Fields come from demoClaimFields(); every value stays confidential
+        // and all claims are proven in ONE transaction together with the
+        // carbon footprint above.
+        claimsJson       : LargeString
     ) returns {
         runId         : UUID;
         passportId    : String;
@@ -62,6 +67,24 @@ service DemoService @(path: '/api/v1/demo', requires: 'any') {
         runningCount   : Integer;
         waitingCount   : Integer;
         dailyRemaining : Integer;
+    };
+
+    /**
+     * The confidential values a visitor can prove, so the form builds itself
+     * from the server's catalogue instead of hard-coding fields and bounds.
+     * The carbon footprint is always proven; the rest are optional and ride in
+     * the same transaction.
+     */
+    function demoClaimFields() returns array of {
+        field            : String;
+        label            : String;
+        unit             : String;
+        predicate        : String;  // lessOrEqual | greaterOrEqual
+        min              : Decimal;
+        max              : Decimal;
+        defaultValue     : Decimal;
+        defaultThreshold : Decimal;
+        primary          : Boolean; // always proven, driven by the co2 inputs
     };
 
     /**

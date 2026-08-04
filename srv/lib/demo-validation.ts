@@ -22,6 +22,13 @@ export interface DemoInput {
      * sponsored transaction and one or two extra minutes.
      */
     secondLife: boolean;
+    /**
+     * Extra confidential values to prove alongside the carbon footprint. All
+     * of them ride in ONE transaction, so a visitor pays one wait for any
+     * number of claims. The footprint claim is always present (built from
+     * co2Kg/proveThreshold) and never appears here twice.
+     */
+    extraClaims: DemoClaim[];
 }
 
 export interface DemoValidation {
@@ -29,6 +36,8 @@ export interface DemoValidation {
     errors: string[];
     value?: DemoInput;
 }
+
+import { validateClaims, PRIMARY_CLAIM_FIELD, type DemoClaim } from './demo-claims';
 
 const TEXT_RE = /^[A-Za-z0-9 ._\-]{2,40}$/;
 
@@ -59,8 +68,20 @@ export function validateDemoInput(raw: Record<string, unknown>): DemoValidation 
 
     const secondLife = raw.secondLife === true || raw.secondLife === 'true';
 
+    // Extra claims are optional; the footprint claim always comes from
+    // co2Kg/proveThreshold above, so a duplicate of it here is rejected.
+    const claimCheck = validateClaims(raw.claims);
+    errors.push(...claimCheck.errors);
+    const extraClaims = claimCheck.claims.filter((c) => c.field !== PRIMARY_CLAIM_FIELD);
+    if (claimCheck.claims.length !== extraClaims.length) {
+        errors.push(`${PRIMARY_CLAIM_FIELD} is proven from co2Kg/proveThreshold, do not repeat it in claims`);
+    }
+
     if (errors.length) return { ok: false, errors };
-    return { ok: true, errors, value: { model, manufacturer, weightKg, performanceClass, co2Kg, proveThreshold, secondLife } };
+    return {
+        ok: true, errors,
+        value: { model, manufacturer, weightKg, performanceClass, co2Kg, proveThreshold, secondLife, extraClaims }
+    };
 }
 
 export function validNickname(raw: unknown): string | null {

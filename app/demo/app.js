@@ -235,12 +235,129 @@
   $('fThreshold').addEventListener('change', () => syncClaimBounds(true));
   syncClaimBounds(false);
 
+  // ---- extra claims ------------------------------------------------------
+  // The catalogue comes from the server (demoClaimFields) so the fields, their
+  // bounds and their direction are defined in exactly one place. Each entry is
+  // opt-in: tick it, set a confidential value and the public bound.
+
+  var claimSpecs = [];
+
+  /**
+   * Escape for the one place this app builds markup from server data. The
+   * catalogue is our own static list, but a template that interpolates without
+   * escaping is a habit that outlives the data it was written for.
+   */
+  function esc(s) {
+    return String(s == null ? '' : s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+
+  function claimRow(spec) {
+    var wrap = document.createElement('label');
+    wrap.className = 'claim-item';
+    var rel = spec.predicate === 'lessOrEqual' ? 'at most' : 'at least';
+    var idBase = 'claim_' + spec.field;
+    wrap.innerHTML =
+      '<span class="claim-line">' +
+        '<input type="checkbox" id="' + idBase + '_on" data-field="' + esc(spec.field) + '">' +
+        '<span class="claim-label">' + esc(spec.label) + '</span>' +
+        '<span class="chip-conf">confidential</span>' +
+      '</span>' +
+      '<span class="claim-inputs" hidden>' +
+        '<span class="claim-input">Value (' + esc(spec.unit) + ')' +
+          '<input type="number" id="' + idBase + '_v" min="' + spec.min + '" max="' + spec.max +
+            '" step="1" value="' + spec.defaultValue + '">' +
+        '</span>' +
+        '<span class="claim-input">Prove: ' + rel +
+          '<input type="number" id="' + idBase + '_t" min="' + spec.min + '" max="' + (spec.max * 2) +
+            '" step="1" value="' + spec.defaultThreshold + '">' +
+        '</span>' +
+      '</span>' +
+      '<span class="hint claim-hint"></span>';
+    var box = wrap.querySelector('#' + idBase + '_on');
+    var inputs = wrap.querySelector('.claim-inputs');
+    box.addEventListener('change', function () {
+      inputs.hidden = !box.checked;
+      updateClaimState();
+    });
+    wrap.querySelector('#' + idBase + '_v').addEventListener('input', updateClaimState);
+    wrap.querySelector('#' + idBase + '_t').addEventListener('input', updateClaimState);
+    return wrap;
+  }
+
+  /** The claims the visitor ticked, with their spec attached. */
+  function selectedClaims() {
+    var out = [];
+    claimSpecs.forEach(function (spec) {
+      var on = $('claim_' + spec.field + '_on');
+      if (!on || !on.checked) return;
+      out.push({
+        spec: spec,
+        field: spec.field,
+        value: Number($('claim_' + spec.field + '_v').value),
+        threshold: Number($('claim_' + spec.field + '_t').value)
+      });
+    });
+    return out;
+  }
+
+  function claimTrue(c) {
+    return c.spec.predicate === 'lessOrEqual' ? c.value <= c.threshold : c.value >= c.threshold;
+  }
+
+  /** Live count plus a per-row warning when a claim would not hold. */
+  function updateClaimState() {
+    var picked = selectedClaims();
+    var n = picked.length + 1; // the footprint claim is always proven
+    $('claimCount').textContent = n === 1 ? '1 claim' : n + ' claims, one transaction';
+    claimSpecs.forEach(function (spec) {
+      var row = $('claim_' + spec.field + '_on');
+      if (!row) return;
+      var hint = row.closest('.claim-item').querySelector('.claim-hint');
+      var c = picked.find(function (p) { return p.field === spec.field; });
+      if (!c) { hint.textContent = ''; hint.classList.remove('err'); return; }
+      var rel = spec.predicate === 'lessOrEqual' ? 'at most' : 'at least';
+      if (claimTrue(c)) {
+        hint.textContent = 'Public: ' + spec.label.toLowerCase() + ' is ' + rel + ' ' + c.threshold + ' ' + spec.unit +
+          '. The real value stays hidden.';
+        hint.classList.remove('err');
+      } else {
+        hint.textContent = 'This claim is not true, so it cannot be proven: ' + c.value + ' is not ' + rel + ' ' + c.threshold + '.';
+        hint.classList.add('err');
+      }
+    });
+  }
+
+  async function loadClaimFields() {
+    try {
+      var all = await api('GET', '/demoClaimFields()');
+      claimSpecs = (all.value || all || []).filter(function (c) { return !c.primary; });
+    } catch (e) {
+      claimSpecs = []; // older server: the demo still runs with the single claim
+    }
+    var list = $('claimList');
+    if (!list) return;
+    list.innerHTML = '';
+    if (!claimSpecs.length) { $('claimCart').hidden = true; return; }
+    claimSpecs.forEach(function (spec) { list.appendChild(claimRow(spec)); });
+    updateClaimState();
+  }
+  loadClaimFields();
+
   $('passportForm').addEventListener('submit', async (ev) => {
     ev.preventDefault();
     $('formError').textContent = '';
     const co2 = Number($('fCo2').value), thr = Number($('fThreshold').value);
     if (co2 > thr) {
       $('formError').textContent = 'The threshold must be at least the CO2 value: the demo proves a TRUE claim.';
+      return;
+    }
+    const extra = selectedClaims();
+    const untrue = extra.find(function (c) { return !claimTrue(c); });
+    if (untrue) {
+      $('formError').textContent = untrue.spec.label + ': that claim is not true, so it cannot be proven. '
+        + 'Adjust the value or the bound.';
       return;
     }
     setLoading($('btnCreate'), 'Submitting your passport…');
@@ -253,7 +370,10 @@
         performanceClass: $('fPerf').value,
         co2Kg: co2,
         proveThreshold: thr,
-        secondLife: $('fSecondLife').checked
+        secondLife: $('fSecondLife').checked,
+        claimsJson: JSON.stringify(extra.map(function (c) {
+          return { field: c.field, value: c.value, threshold: c.threshold };
+        }))
       });
       store.set('runId', r.runId);
       store.set('passportId', r.passportId);

@@ -50,12 +50,12 @@
         <span class="feature-pill"><span class="fdot"></span>dust-sponsored fees</span>
         <span class="feature-pill"><span class="fdot"></span>on-chain ownership registration</span>
         <span class="feature-pill"><span class="fdot"></span>batched circuit calls, one tx</span>
-        <span class="feature-pill"><svg class="lock" aria-hidden="true" viewBox="0 0 14 16" xmlns="http://www.w3.org/2000/svg"><path d="M4 7 V5 a3 3 0 0 1 6 0 V7" fill="none"/><rect x="1.8" y="7" width="10.4" height="7.2" rx="2" fill="none"/></svg>zero-knowledge proof, value hidden</span>
+        <span class="feature-pill"><svg class="lock" aria-hidden="true" viewBox="0 0 14 16" xmlns="http://www.w3.org/2000/svg"><path d="M4 7 V5 a3 3 0 0 1 6 0 V7" fill="none"/><rect x="1.8" y="7" width="10.4" height="7.2" rx="2" fill="none"/></svg>zero-knowledge proofs, values hidden</span>
       </div>
       <p class="hero-sub">
         In about five minutes you will create a small battery passport, anchor
-        it on the Midnight blockchain and prove a confidential claim about it,
-        without revealing the number.
+        it on the Midnight blockchain and prove up to four confidential claims
+        about it, without revealing a single number.
       </p>
       <div class="cta-row">
         <button id="btnStart" class="btn-primary" disabled>Start the demo</button>
@@ -79,8 +79,8 @@
           <div class="fact-v">on-chain operations per Passport, 3 of them batched into a single transaction</div>
         </div>
         <div class="fact">
-          <div class="fact-k">1</div>
-          <div class="fact-v"><svg class="lock" aria-hidden="true" viewBox="0 0 14 16" xmlns="http://www.w3.org/2000/svg"><path d="M4 7 V5 a3 3 0 0 1 6 0 V7" fill="none"/><rect x="1.8" y="7" width="10.4" height="7.2" rx="2" fill="none"/></svg>secret value (CO2 emissions): prove it stays under a threshold, without ever revealing the clear value</div>
+          <div class="fact-k">4</div>
+          <div class="fact-v"><svg class="lock" aria-hidden="true" viewBox="0 0 14 16" xmlns="http://www.w3.org/2000/svg"><path d="M4 7 V5 a3 3 0 0 1 6 0 V7" fill="none"/><rect x="1.8" y="7" width="10.4" height="7.2" rx="2" fill="none"/></svg>secret values you can prove (CO2, capacity, cycle life, recycled content): each stays within a public bound, proven together in one transaction, without ever revealing the clear values</div>
         </div>
       </div>
     </section>
@@ -129,6 +129,14 @@
             <input id="fThreshold" required type="number" min="1" max="200000" step="1" value="4000" />
             <span class="hint">The claim everyone can verify, without learning the real value.</span>
           </label>
+          <div class="claim-cart" id="claimCart">
+            <div class="claim-cart-head">
+              <span class="claim-cart-title">Prove more, in the same transaction</span>
+              <span class="claim-cart-count" id="claimCount"></span>
+            </div>
+            <p class="hint claim-cart-intro">Each extra claim adds another confidential value to your passport and one more public statement about it. They are proven together in ONE transaction, so any number of claims costs one wait and one fee.</p>
+            <div id="claimList"></div>
+          </div>
           <label class="second-life">
             <input id="fSecondLife" type="checkbox" />
             Give it a second life

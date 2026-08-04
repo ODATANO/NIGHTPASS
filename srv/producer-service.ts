@@ -7,7 +7,7 @@ import {
 import {
     hashPayload, blake2b256Hex, encryptPayload, anchorPassport, waitForJob, waitForJobResult,
     detachedFromRequest, sendDetached,
-    buildContentRoot, fieldKeyHex, BATTERY_PROVABLE_FIELDS,
+    buildContentRoot, fieldKeyHex, BATTERY_PROVABLE_FIELDS, runChainStep,
     effectiveNetwork, explorerTxUrl
 } from './lib/passport-anchor';
 import { defaultGuideAttributes, hashableAttributes } from './lib/guide-attribute-defaults';
@@ -1493,10 +1493,22 @@ export default class ProducerService extends cds.ApplicationService {
                 this.serverPrewarmJobs.delete(args.sessionId);
                 await waitForJobResult(nightgate, prewarmJob, args.sessionId, user);
             }
-            res = await sendDetached(nightgate, 'issueFieldPredicateAttestationBatch', args, user);
-            const jobResult: any = await waitForJobResult(
-                nightgate, res.jobId, args.sessionId, user, { requireChainSuccess: true }
-            );
+            // Same bounded 1014 retry the anchor steps use: a proof batch is
+            // submitted right after the anchor from the same wallet, so it can
+            // race that tx's dust-state settlement and be rejected outright by
+            // the pool (seen live with a 4-claim cart). 1014 is provably
+            // pre-mempool, so a rebuild-and-resend can never double-apply.
+            // One ZK proof per claim, so the wait budget scales with the cart.
+            // In-process (wasm) proving is minutes per claim; the default 10
+            // minutes covers an anchor batch but not a four-claim cart.
+            const proofTimeoutMs = (10 + 8 * Math.max(0, claimMeta.length - 1)) * 60_000;
+            const jobResult: any = await runChainStep('proof cart', async () => {
+                res = await sendDetached(nightgate, 'issueFieldPredicateAttestationBatch', args, user);
+                return waitForJobResult(
+                    nightgate, res.jobId, args.sessionId, user,
+                    { requireChainSuccess: true, timeoutMs: proofTimeoutMs }
+                );
+            });
             const txHash = String(jobResult?.proof?.proofValue ?? jobResult?.txHash ?? '');
             const paByKey = this.batchClaimIdsByKey(res, jobResult);
             await this.runDetached(async () => {
@@ -1599,10 +1611,14 @@ export default class ProducerService extends cds.ApplicationService {
                 this.serverPrewarmJobs.delete(args.sessionId);
                 await waitForJobResult(nightgate, prewarmJob, args.sessionId, user);
             }
-            const res: any = await sendDetached(nightgate, 'issueFieldPredicateAttestation', args, user);
-            const jobResult: any = await waitForJobResult(
-                nightgate, res.jobId, args.sessionId, user, { requireChainSuccess: true }
-            );
+            // Same 1014 retry as the anchor steps and the cart (see there).
+            let res: any = null;
+            const jobResult: any = await runChainStep('proof', async () => {
+                res = await sendDetached(nightgate, 'issueFieldPredicateAttestation', args, user);
+                return waitForJobResult(
+                    nightgate, res.jobId, args.sessionId, user, { requireChainSuccess: true }
+                );
+            });
             const txHash = String(jobResult?.proof?.proofValue ?? jobResult?.txHash ?? '');
             const paId = String(res.predicateAttestationId ?? jobResult?.predicateAttestationId ?? '');
             const rootTx = await this.contentRootTxOf(args.sessionId, args.contractAddress, startedAt);

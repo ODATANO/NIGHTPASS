@@ -379,12 +379,18 @@ export async function waitForJobResult(
     jobId: string,
     sessionId: string,
     user?: unknown,
-    options: { requireChainSuccess?: boolean; pollIntervalMs?: number } = {}
+    options: { requireChainSuccess?: boolean; pollIntervalMs?: number; timeoutMs?: number } = {}
 ): Promise<any> {
     const pollIntervalMs = options.pollIntervalMs ?? 5000;
+    // 10 minutes by default, which covers an anchor batch. Proving is the leg
+    // that outgrows it: a multi-claim proof cart runs one ZK proof per claim,
+    // and in-process (wasm) proving is several minutes each, so those callers
+    // pass a budget scaled to the claim count.
+    const timeoutMs = options.timeoutMs ?? 600_000;
+    const attempts = Math.max(1, Math.ceil(timeoutMs / pollIntervalMs));
     // Only wait on chainStatus when NIGHTGATE can actually advance it.
     const enforceChain = options.requireChainSuccess === true && chainConfirmationAvailable();
-    for (let i = 0; i < 120; i++) {
+    for (let i = 0; i < attempts; i++) {
         const job: any = await sendDetached(nightgate, 'getJobStatus', { jobId, sessionId }, user);
         if (job.status === 'succeeded') {
             if (enforceChain) {
@@ -431,7 +437,9 @@ export async function waitForJob(nightgate: cds.Service, jobId: string, sessionI
 }
 
 /**
- * Run one anchor step (send + poll) with a bounded retry on Substrate 1014.
+ * Run one chain step (send + poll) with a bounded retry on Substrate 1014.
+ * Used by the anchor sequence below AND by the proof paths in
+ * ProducerService: both submit back-to-back calls from the same wallet.
  *
  * Back-to-back contract calls from the same wallet can race the wallet's own
  * dust-state update: the next tx balances against a dust note the previous tx
@@ -441,7 +449,7 @@ export async function waitForJob(nightgate: cds.Service, jobId: string, sessionI
  * retried: that code means the pool rejected the tx outright, so a retry can
  * never double-anchor.
  */
-async function runStep(kind: string, fn: () => Promise<string>): Promise<string> {
+export async function runChainStep<T>(kind: string, fn: () => Promise<T>): Promise<T> {
     let lastErr: unknown;
     for (let attempt = 0; attempt < 3; attempt++) {
         if (attempt > 0) await new Promise(r => setTimeout(r, 15_000));
@@ -459,7 +467,7 @@ async function runStep(kind: string, fn: () => Promise<string>): Promise<string>
             // happen AFTER the node accepted the tx; retrying on it could
             // rebuild and resubmit a tx that is already in the mempool.
             if (!/\b1014\b|database is locked/i.test(msg)) break;
-            cds.log('producer').warn(`anchor step ${kind} hit a retryable error (${msg.slice(0, 60)}), retrying...`);
+            cds.log('producer').warn(`${kind} hit a retryable error (${msg.slice(0, 60)}), retrying...`);
         }
     }
     throw new Error(`${kind}: ${String((lastErr as Error)?.message ?? lastErr)}`);
@@ -561,7 +569,7 @@ export async function anchorPassport(nightgate: cds.Service, opts: AnchorOpts): 
             ...(contentRoot ? { contentRoot } : {})
         });
         let jobId = '';
-        const txHash = await runStep(calls.map(c => c.circuit).join('+'), async () => {
+        const txHash = await runChainStep(calls.map(c => c.circuit).join('+'), async () => {
             const batch: any = await sendDetached(nightgate, 'submitContractCallBatch', {
                 contractAddress,
                 compiledArtifactRef: CONTRACT_REF,
@@ -579,7 +587,7 @@ export async function anchorPassport(nightgate: cds.Service, opts: AnchorOpts): 
     }
 
     let attestJobId = '';
-    const attestationTxHash = await runStep('attest', async () => {
+    const attestationTxHash = await runChainStep('attest', async () => {
         const anchor: any = await sendDetached(nightgate, 'anchorDocument', {
             sha256:              payloadHash,
             storageRef:          `passport://${passportId}`,
@@ -600,7 +608,7 @@ export async function anchorPassport(nightgate: cds.Service, opts: AnchorOpts): 
         // so both calls assert only already-on-chain state and any apply
         // order inside the merged tx is valid.
         let batchJobId = '';
-        const batchTxHash = await runStep('bindPassport+anchorContentRoot', async () => {
+        const batchTxHash = await runChainStep('bindPassport+anchorContentRoot', async () => {
             const batch: any = await sendDetached(nightgate, 'submitContractCallBatch', {
                 contractAddress,
                 compiledArtifactRef: CONTRACT_REF,
@@ -620,7 +628,7 @@ export async function anchorPassport(nightgate: cds.Service, opts: AnchorOpts): 
     }
 
     let bindJobId = '';
-    const bindTxHash = await runStep('bindPassport', async () => {
+    const bindTxHash = await runChainStep('bindPassport', async () => {
         const bind: any = await sendDetached(nightgate, 'submitContractCall', {
             contractAddress,
             circuit:             'bindPassport',
@@ -636,7 +644,7 @@ export async function anchorPassport(nightgate: cds.Service, opts: AnchorOpts): 
 
     if (contentRoot) {
         let rootJobId = '';
-        const rootTxHash = await runStep('anchorContentRoot', async () => {
+        const rootTxHash = await runChainStep('anchorContentRoot', async () => {
             const root: any = await sendDetached(nightgate, 'submitContractCall', {
                 contractAddress,
                 circuit:             'anchorContentRoot',

@@ -161,6 +161,29 @@ label.second-life .hint { display: block; margin-top: 4px; }
 }
 .lock path, .lock rect { stroke: var(--warning); stroke-width: 1.6; stroke-linecap: round; }
 
+/* ---------- Extra claims (proven in the same transaction) ---------- */
+/* Spans both grid columns: the cart is a section, not a field. */
+.claim-cart { grid-column: 1 / -1; border-top: 1px solid var(--border); padding-top: 14px; }
+.claim-cart-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.claim-cart-title { font-weight: 600; }
+.claim-cart-count { color: var(--accent); font-size: 12px; letter-spacing: .04em; }
+.claim-cart-intro { margin: 4px 0 10px; }
+.claim-item { display: block; margin-bottom: 10px; }
+.claim-line { display: flex; align-items: center; gap: 8px; }
+.claim-line input[type="checkbox"] {
+  display: inline-block; width: auto; margin: 0; accent-color: var(--accent);
+}
+.claim-label { font-weight: 500; }
+.claim-inputs { display: flex; gap: 12px; margin: 8px 0 0 24px; flex-wrap: wrap; }
+/* An author `display` beats the UA rule behind [hidden], so restate it here:
+   without this the value inputs show before the claim is even ticked. */
+.claim-inputs[hidden] { display: none; }
+.claim-input { display: block; font-size: 12px; color: var(--ink-2); }
+.claim-input input { margin-top: 3px; width: 130px; }
+.claim-hint { margin-left: 24px; }
+.claim-hint.err { color: var(--critical); }
+@media (max-width: 640px) { .claim-inputs { margin-left: 0; } .claim-hint { margin-left: 0; } }
+
 /* ---------- Timeline ---------- */
 
 .timeline { list-style: none; margin: 18px 0; padding: 0; }
