@@ -46,6 +46,23 @@ const PRIVATE_STATE_ID = 'attestationVaultPrivateState';
 // server to be running.
 const LOCAL_PROVER_URL = 'http://localhost:6300';
 
+/**
+ * Opt-in switch for wallet-delegated proving (NIGHTGATE 0.12.1 `proving: 'wallet'`).
+ *
+ * Set `localStorage['nightpass:wallet-prover'] = '1'` in the cockpit tab and contract circuits are
+ * proved INSIDE the connected wallet — no docker proof server needed at all. Off by default
+ * because it trades seconds (docker prover) for MINUTES of the user's own CPU per circuit, which
+ * is the wrong default for a demo. Reading localStorage is wrapped: it throws in some privacy
+ * modes, and a wallet-proving toggle must never be able to break the normal path.
+ */
+function walletProvingRequested() {
+    try {
+        return typeof localStorage !== 'undefined' && localStorage.getItem('nightpass:wallet-prover') === '1';
+    } catch {
+        return false;
+    }
+}
+
 // Network + indexer come from the SERVER at runtime (issue #2): the browser
 // wallet must anchor to the same chain as the server worker, so the single
 // source of truth is the server's effective NIGHTGATE config, exposed at
@@ -362,7 +379,18 @@ async function prepareSdkContext(api, witnesses, log) {
 
     log('assembling providers (zk-config from /zk-config, indexer from wallet)…');
     const { createNightgateConnectorProviders } = await loadBrowserSdk();
-    const providers = await createNightgateConnectorProviders({ connector: api, manifest, contract: CONTRACT });
+    const providers = await createNightgateConnectorProviders({
+        connector: api,
+        manifest,
+        contract: CONTRACT,
+        // 'wallet' delegates contract proving to the connected wallet's own prover — no local
+        // proof server at all (NIGHTGATE 0.12.1). Opt-in per browser via
+        //   localStorage['nightpass:wallet-prover'] = '1'
+        // because it costs MINUTES of the user's CPU per circuit, versus seconds against the
+        // docker prover. 'wallet' THROWS on a wallet that cannot prove rather than silently
+        // sending the preimage to a server, which is exactly why this is not 'auto'.
+        proving: walletProvingRequested() ? 'wallet' : 'server'
+    });
     _lastIndexerUri = providers.config?.indexerUri || _lastIndexerUri;
     log(`indexer: ${providers.config?.indexerUri} (ws ${providers.config?.indexerWsUri})`);
     log(`prover: ${providers.config?.proverServerUri ?? '(none, wallet-delegated)'}`);
@@ -386,10 +414,17 @@ async function prepareSdkContext(api, witnesses, log) {
     networkIdMod.setNetworkId(networkId);
     log(`network id set: ${networkId}`);
 
-    // Self-prove against the local proof server (CORS-clean), overriding the
-    // hosted one the connector reported (see LOCAL_PROVER_URL note).
-    const proofProvider = proofMod.httpClientProofProvider(LOCAL_PROVER_URL, providers.zkConfigProvider);
-    log(`prover override: ${LOCAL_PROVER_URL}`);
+    // Wallet modality: the provider assembled above already proves in the wallet, so nothing is
+    // overridden. Server modality: keep pointing at the LOCAL proof server rather than the hosted
+    // one the connector reported (see LOCAL_PROVER_URL note — the hosted one is CORS-unusable).
+    let proofProvider;
+    if (providers.provingModality === 'wallet') {
+        proofProvider = providers.proofProvider;
+        log('prover: WALLET-DELEGATED (in-wallet WASM prover — expect minutes per circuit)');
+    } else {
+        proofProvider = proofMod.httpClientProofProvider(LOCAL_PROVER_URL, providers.zkConfigProvider);
+        log(`prover override: ${LOCAL_PROVER_URL}`);
+    }
 
     const walletAdapter = makeConnectorWalletAdapter(api, providers.walletKeys, ledger, log);
     const fullProviders = {

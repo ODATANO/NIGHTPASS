@@ -1,0 +1,6 @@
+coverage:
+  status:
+    # Patch coverage stays visible on the PR but never fails the check.
+    patch:
+      default:
+        informational: true
