@@ -263,22 +263,22 @@
         '<input type="checkbox" id="' + idBase + '_on" data-field="' + esc(spec.field) + '">' +
         '<span class="claim-label">' + esc(spec.label) + '</span>' +
         '<span class="chip-conf">confidential</span>' +
-      '</span>' +
-      '<span class="claim-inputs" hidden>' +
-        '<span class="claim-input">Value (' + esc(spec.unit) + ')' +
-          '<input type="number" id="' + idBase + '_v" min="' + spec.min + '" max="' + spec.max +
-            '" step="1" value="' + spec.defaultValue + '">' +
-        '</span>' +
-        '<span class="claim-input">Prove: ' + rel +
-          '<input type="number" id="' + idBase + '_t" min="' + spec.min + '" max="' + (spec.max * 2) +
-            '" step="1" value="' + spec.defaultThreshold + '">' +
+        '<span class="claim-inputs">' +
+          '<span class="claim-input">Value (' + esc(spec.unit) + ')' +
+            '<input type="number" id="' + idBase + '_v" min="' + spec.min + '" max="' + spec.max +
+              '" step="1" value="' + spec.defaultValue + '" disabled>' +
+          '</span>' +
+          '<span class="claim-input">Prove: ' + rel +
+            '<input type="number" id="' + idBase + '_t" min="' + spec.min + '" max="' + (spec.max * 2) +
+              '" step="1" value="' + spec.defaultThreshold + '" disabled>' +
+          '</span>' +
         '</span>' +
       '</span>' +
       '<span class="hint claim-hint"></span>';
     var box = wrap.querySelector('#' + idBase + '_on');
-    var inputs = wrap.querySelector('.claim-inputs');
     box.addEventListener('change', function () {
-      inputs.hidden = !box.checked;
+      wrap.classList.toggle('on', box.checked);
+      wrap.querySelectorAll('.claim-inputs input').forEach(function (i) { i.disabled = !box.checked; });
       updateClaimState();
     });
     wrap.querySelector('#' + idBase + '_v').addEventListener('input', updateClaimState);
@@ -370,7 +370,6 @@
         performanceClass: $('fPerf').value,
         co2Kg: co2,
         proveThreshold: thr,
-        secondLife: $('fSecondLife').checked,
         claimsJson: JSON.stringify(extra.map(function (c) {
           return { field: c.field, value: c.value, threshold: c.threshold };
         }))
@@ -593,6 +592,16 @@
     $('donePassportId').textContent = pid;
     const links = [];
     const published = steps.some((s) => s.kind === 'publish' && s.status === 'succeeded');
+    // The QR encodes the passport's public /p/<id> link: the published one on
+    // zkpassport.eu, or this instance's own resolver when publish was skipped
+    // (local dev). A load error just keeps the block hidden.
+    const qrImg = $('doneQrImg');
+    if (qrImg && pid) {
+      const qrHost = published ? 'https://zkpassport.eu' : '';
+      qrImg.onload = () => { $('doneQr').hidden = false; };
+      qrImg.onerror = () => { $('doneQr').hidden = true; };
+      qrImg.src = `${qrHost}/qr/${encodeURIComponent(pid)}.png`;
+    }
     if (published) {
       links.push(`<a href="https://zkpassport.eu/p/${encodeURIComponent(pid)}" target="_blank" rel="noopener">View it on the public explorer (zkpassport.eu)</a>`);
     }

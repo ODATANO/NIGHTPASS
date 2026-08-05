@@ -144,12 +144,6 @@ a:hover { text-decoration: underline; }
 .hint { display: block; color: var(--ink-3); font-size: 12px; margin-top: 4px; }
 
 label.confidential { position: relative; }
-/* The second-life opt-in is a checkbox row, not a full-width field. */
-label.second-life input[type="checkbox"] {
-  display: inline-block; width: auto; margin: 0 8px 0 0; vertical-align: -2px;
-  accent-color: var(--accent);
-}
-label.second-life .hint { display: block; margin-top: 4px; }
 .chip-conf {
   display: inline-block; margin-left: 6px; padding: 1px 8px;
   border: 1px solid var(--warning); color: var(--warning);
@@ -169,18 +163,19 @@ label.second-life .hint { display: block; margin-top: 4px; }
 .claim-cart-count { color: var(--accent); font-size: 12px; letter-spacing: .04em; }
 .claim-cart-intro { margin: 4px 0 10px; }
 .claim-item { display: block; margin-bottom: 10px; }
-.claim-line { display: flex; align-items: center; gap: 8px; }
+.claim-line { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .claim-line input[type="checkbox"] {
   display: inline-block; width: auto; margin: 0; accent-color: var(--accent);
 }
 .claim-label { font-weight: 500; }
-.claim-inputs { display: flex; gap: 12px; margin: 8px 0 0 24px; flex-wrap: wrap; }
-/* An author `display` beats the UA rule behind [hidden], so restate it here:
-   without this the value inputs show before the claim is even ticked. */
-.claim-inputs[hidden] { display: none; }
-.claim-input { display: block; font-size: 12px; color: var(--ink-2); }
-.claim-input input { margin-top: 3px; width: 130px; }
+.claim-inputs { display: flex; gap: 14px; margin-left: auto; flex-wrap: wrap; opacity: .45; transition: opacity .15s ease; }
+.claim-item.on .claim-inputs { opacity: 1; }
+.claim-input { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--ink-2); white-space: nowrap; }
+.claim-input input { margin-top: 0; width: 110px; }
 .claim-hint { margin-left: 24px; }
+.done-qr { display: flex; align-items: center; gap: 14px; margin: 10px 0 14px; }
+.done-qr img { border-radius: 8px; background: #fff; padding: 6px; }
+.done-qr .hint { max-width: 320px; }
 .claim-hint.err { color: var(--critical); }
 @media (max-width: 640px) { .claim-inputs { margin-left: 0; } .claim-hint { margin-left: 0; } }
 

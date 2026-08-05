@@ -71,8 +71,8 @@
       </div>
       <div class="fact-row">
         <div class="fact">
-          <div class="fact-k">5</div>
-          <div class="fact-v">custom fields per Passport</div>
+          <div class="fact-k">8</div>
+          <div class="fact-v">custom fields per Passport, 3 of them optional claim values</div>
         </div>
         <div class="fact">
           <div class="fact-k">5</div>
@@ -137,11 +137,6 @@
             <p class="hint claim-cart-intro">Each extra claim adds another confidential value to your passport and one more public statement about it. They are proven together in ONE transaction, so any number of claims costs one wait and one fee.</p>
             <div id="claimList"></div>
           </div>
-          <label class="second-life">
-            <input id="fSecondLife" type="checkbox" />
-            Give it a second life
-            <span class="hint">Bonus act: your battery ages (telemetry) and gets repurposed, which anchors a second on-chain version. Adds one transaction and a minute or two; the explorer then shows its anchor history.</span>
-          </label>
         </div>
         <div class="cta-row">
           <button type="submit" class="btn-primary" id="btnCreate">Anchor it on Midnight</button>
@@ -176,6 +171,10 @@
       <h2>Done. Your passport is on-chain.</h2>
       <div class="panel done-panel">
         <p><code id="donePassportId" class="hash big"></code></p>
+        <div id="doneQr" class="done-qr" hidden>
+          <img id="doneQrImg" alt="QR code linking to this passport" width="150" height="150" />
+          <span class="hint">Scan it: this QR is the passport's public link, like the one printed on a real battery.</span>
+        </div>
         <div id="doneLinks" class="done-links"></div>
         <p class="muted">Your confidential CO2 value never left the server. What is on-chain is the
           passport's anchor and a zero-knowledge proof of the claim, verifiable by anyone.</p>

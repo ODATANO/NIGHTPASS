@@ -239,8 +239,13 @@ export default class ProducerService extends cds.ApplicationService {
             // that read cannot see it (404 Session not found). Detaching
             // commits the session row before the signing call looks it up.
             // The user must ride along explicitly (sessions are userId-bound
-            // and the detached scope drops the ambient context).
-            const user = (cds.context as any)?.user;
+            // and the detached scope drops the ambient context). Callers
+            // reached via srv.send() have no ALS context at all, so an absent
+            // ambient user falls back to the technical 'producer' principal:
+            // every server-wallet session is owned by that principal anyway
+            // (cockpit basic auth and the demo executor both resolve to it).
+            const ambient = (cds.context as any)?.user;
+            const user = ambient?.id ? ambient : new (cds.User as any)({ id: 'producer', roles: ['producer'] });
             const conn: any = await sendDetached(nightgate, 'connectWallet', { viewingKey }, user);
             const sessionId = String(conn.sessionId);
             const signing: any = await sendDetached(nightgate, 'connectWalletForSigning', {
@@ -441,6 +446,25 @@ export default class ProducerService extends cds.ApplicationService {
      * user, which for the demo path is the same technical principal that opened
      * the sponsor sessions (NIGHTGATE binds sessions to the userId).
      */
+    /**
+     * Whether the prewarm job recorded for this session is still pending or
+     * running. Used to tell "facade not built YET" (serial prewarm queue,
+     * NIGHTGATE >= 0.13.0) apart from a genuinely dead session. Unknown job
+     * or read failure counts as not running, which falls through to the
+     * self-heal path.
+     */
+    private async prewarmStillRunning(nightgate: cds.Service, sessionId: string, user: unknown): Promise<boolean> {
+        const jobId = this.serverPrewarmJobs.get(sessionId);
+        if (!jobId) return false;
+        try {
+            const j: any = await sendDetached(nightgate, 'getJobStatus', { jobId }, user);
+            const s = String(j?.status ?? '');
+            return s === 'pending' || s === 'running';
+        } catch {
+            return false;
+        }
+    }
+
     private sponsorPoolStatus = async (req: cds.Request) => {
         const pool = feeSponsorWalletIds();
         if (!pool.length) return [];
@@ -491,6 +515,12 @@ export default class ProducerService extends cds.ApplicationService {
                 // 503 WALLET_SYNCING = retryable per the 0.10.2 contract; a
                 // SUPERSEDED prewarm just means a fresh one took over.
                 if (/WALLET_SYNCING|SUPERSEDED/i.test(msg)) {
+                    out.push(cold(secrets.id, label, 'warming', ''));
+                } else if (/No facade/i.test(msg) && await this.prewarmStillRunning(nightgate, sessionId, req.user)) {
+                    // NIGHTGATE >= 0.13.0 warms wallets ONE at a time, so a
+                    // freshly opened session has no facade until its queued
+                    // prewarm job actually runs. That is warming, not death;
+                    // reconnecting here would just requeue another prewarm.
                     out.push(cold(secrets.id, label, 'warming', ''));
                 } else if (/No facade|Session not found|Session expired/i.test(msg)) {
                     // SELF-HEAL, two known death modes of a cached session:
