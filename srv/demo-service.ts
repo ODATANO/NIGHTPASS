@@ -86,7 +86,7 @@ export default class DemoService extends cds.ApplicationService {
         return process.env.DEMO_ENABLED === 'true' && this.encryptionKeyOk();
     }
     private maxPerDay(): number { return Number(process.env.DEMO_MAX_PER_DAY || 50); }
-    private maxPerIpPerDay(): number { return Number(process.env.DEMO_MAX_PER_IP_PER_DAY || 3); }
+    private maxPerIpPerDay(): number { return Number(process.env.DEMO_MAX_PER_IP_PER_DAY || 5); }
     private maxPerTester(): number { return Number(process.env.DEMO_MAX_PER_TESTER || 1); }
     private maxQueue(): number { return Number(process.env.DEMO_MAX_QUEUE || 5); }
     private queueDepth(): number { return this.queue.length + this.running.size; }

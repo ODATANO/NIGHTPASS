@@ -33,7 +33,7 @@ Grant or revoke a disclosure tier to a registered partner. Pick the partner and 
 
 ## Predicate
 
-Prove a field value against a threshold without revealing it. Pick a source field (the dropdown auto-fills a sensible operator, threshold and unit), then Prove. The proof recomputes the field's Merkle leaf and binds it to the anchored content root, so the proven value provably comes from this passport and not an arbitrary number. The proof log shows the claim, the result (proven or false) and the transaction. A value that fails the predicate is rejected in-circuit and recorded as a failed proof.
+Prove a field value against a threshold without revealing it. Pick a source field (the dropdown auto-fills a sensible operator, threshold and unit), then Prove. The proof recomputes the field's Merkle leaf and binds it to the anchored content root, so the proven value provably comes from this passport and not an arbitrary number. The proof log shows the claim, the result (proven or false) and the transaction. A value that fails the predicate is rejected in-circuit and recorded as a failed proof. Add to cart batches several claims: ONE transaction, one approval, each claim still verifies independently.
 
 ![Predicate](predicate.png)
 

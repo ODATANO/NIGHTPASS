@@ -193,6 +193,10 @@ passport's actual field so a verifier knows it came from this passport.
   leaf from witnessed value plus inclusion path, folds it to a root, asserts the
   root equals the anchored content root, then asserts the predicate. The tx only
   lands if both hold, so a successful tx is the proof. The value stays a witness.
+- Claims batch: up to 8 predicate proofs in ONE transaction (browser
+  `proveFieldPredicateBatch`, one approval; server `provePassportValuesBatch`;
+  both share one pure claim plan). A false predicate aborts the batch at local
+  proving, nothing lands; after submit every claim is verified individually.
 
 Provable fields cover carbon footprint, capacity, recycled content (overall and
 per material for cobalt / lithium / nickel), cycle life, round-trip efficiency, and

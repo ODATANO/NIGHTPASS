@@ -65,12 +65,10 @@ A second container (`nightpass-demo` + an internal `proof-server`) lets
 visitors anchor their OWN sponsored passport on `demo.<your-domain>`.
 Prepared but NOT part of the default stack. Rollout:
 
-Since 2026-07-24 the demo runs on PREPROD with the 0.10.x feature set:
-ownership pre-registration (registrar step), the whole anchor as ONE batched
-transaction, and the instance's own passport explorer
-(`PASSPORT_PUBLIC_SURFACE=demo,explorer`; the done view links
-`/explorer/#/p/<id>`). Publishing to zkpassport.eu (a preview instance) is
-off.
+Since 2026-07-24 the demo runs on PREPROD: ownership pre-registration
+(registrar step), ONE batched anchor transaction, up to four visitor claims
+in one proof transaction (`PASSPORT_PUBLIC_SURFACE=demo,explorer`). Finished
+passports publish to zkpassport.eu; the done view shows QR + explorer link.
 
 1. **DNS**: A record for `demo.<your-domain>` (the wildcard already covers it
    on zkpassport.eu).
@@ -106,9 +104,9 @@ off.
    Then check `https://demo.<your-domain>/api/v1/demo/demoInfo()` shows
    `"enabled": true` and the landing's battery gauge fills up as the pool
    reports ready.
-7. **Smoke**: run one visitor flow from a phone. Expect the register step
-   with its own tx, ONE batched anchor tx, the proof tx, and a working
-   explorer link on the done view (auto-verify green on the detail page).
+7. **Smoke**: run one visitor flow from a phone. Expect the register tx,
+   ONE batched anchor tx, ONE proof tx for all picked claims, and on the
+   done view the QR plus a zkpassport.eu link that auto-verifies green.
 
 Ops notes: the demo DB volume is disposable (visitor data only); caps are
 env-tunable in `.env.demo`; the sponsor wallet is intentionally small, and

@@ -29,7 +29,7 @@ NIGHTPASS implements the EU Battery Regulation 2023/1542 Digital Battery Passpor
 
 ## Public demo and explorer (Midnight preprod)
 
-**Try it yourself: [demo.zkpassport.eu](https://demo.zkpassport.eu)** an interactive live demo on Midnight preprod. Create a simple battery passport, get its id registered to your (generated, forever-empty) wallet on-chain, watch the whole anchor land as ONE batched transaction, and prove a confidential number with zero-knowledge, all in about five minutes.
+**Try it yourself: [demo.zkpassport.eu](https://demo.zkpassport.eu)** an interactive live demo on Midnight preprod. Create a simple battery passport, get its id registered to your (generated, forever-empty) wallet on-chain, watch the whole anchor land as ONE batched transaction, and prove up to four confidential numbers in ONE proof transaction, all in about five minutes. The done screen hands you the passport's QR code.
 
 **Explorer: [zkpassport.eu](https://zkpassport.eu)** a public, block-explorer-style view (Midnight preprod) where anyone can inspect the anchored passports, see the proven ZK claims (values stay hidden) and verify them live against Midnight, no account needed. Every passport finished on the demo below shows up here automatically.
 

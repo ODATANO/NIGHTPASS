@@ -53,11 +53,11 @@ plugin, which owns the wallet, indexing and contract calls for the
 
 - **Public demo: [demo.zkpassport.eu](https://demo.zkpassport.eu)**. Anyone
   creates a battery passport on a zero-funded wallet in about five minutes:
-  id registered on-chain, the whole anchor lands as ONE batched transaction,
-  one confidential value proven with zero knowledge.
-- **Public explorer: [zkpassport.eu](https://zkpassport.eu)**. 55+ verifiable
-  passports: every anchor and ZK claim verifiable live against Midnight by
-  anyone, no account.
+  id registered on-chain, ONE batched anchor transaction, up to four
+  confidential values proven in one ZK transaction.
+- **Public explorer: [zkpassport.eu](https://zkpassport.eu)**. 75+ verifiable
+  passports with 85+ proven ZK claims: every anchor and claim verifiable
+  live against Midnight by anyone, no account.
 - **EU DPP Registry enrolled · 11/11 interoperability scenarios · 0
   validation errors**: enrolled as a verified economic operator in the
   Commission's official registry test environment one week after its launch
