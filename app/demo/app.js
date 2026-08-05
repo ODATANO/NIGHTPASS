@@ -216,7 +216,6 @@
 
   function enterForm() {
     $('idNight').textContent = store.get('night') || '';
-    $('idShielded').textContent = store.get('shielded') || '';
     randomizeForm();
     show('viewForm');
   }
@@ -319,8 +318,9 @@
       if (!c) { hint.textContent = ''; hint.classList.remove('err'); return; }
       var rel = spec.predicate === 'lessOrEqual' ? 'at most' : 'at least';
       if (claimTrue(c)) {
-        hint.textContent = 'Public: ' + spec.label.toLowerCase() + ' is ' + rel + ' ' + c.threshold + ' ' + spec.unit +
-          '. The real value stays hidden.';
+        // No informational hint: ticked rows stay one line. Only an untrue
+        // claim gets an inline explanation (it blocks submit).
+        hint.textContent = '';
         hint.classList.remove('err');
       } else {
         hint.textContent = 'This claim is not true, so it cannot be proven: ' + c.value + ' is not ' + rel + ' ' + c.threshold + '.';
@@ -413,16 +413,6 @@
     pollTimer = setInterval(poll, 4000);
   }
 
-  // One-line explanation per timeline step, shown under the label.
-  const STEP_INFO = {
-    sync: 'Creates your producer identity and connects it to Midnight. The passport is issued under it.',
-    registerPassport: 'The registrar locks your passport id to YOUR identity on-chain, before anything else happens. Nobody else can ever claim or re-bind this id.',
-    attest: 'Writes a fingerprint (hash) of your passport data to the blockchain. The data itself stays off-chain.',
-    bindPassport: 'Links your passport id (hashed with blake2b-256) to that fingerprint on-chain, so anyone can look the passport up later.',
-    anchorContentRoot: 'Anchors a Merkle root over the passport fields. This is what single values can be proven against.',
-    provePredicate: 'Proves your CO2 claim in zero-knowledge: the chain verifies it without ever seeing the number.',
-    publish: 'Puts the passport’s public data on the explorer, together with the proven claim.'
-  };
 
   // Honest waiting label: with a leased slot only the start stagger ticks
   // (countdown), otherwise the run really waits for a free slot. Countdown is
@@ -443,8 +433,51 @@
   // The three anchor circuits ride in ONE batched Midnight transaction
   // (NIGHTGATE 0.10.x deterministic batch order). Rendered as one grouped
   // timeline entry so the batching is visible, not just implied by three
-  // identical tx links.
+  // identical tx links. Multi-claim proofs (kind "prove:<field>") get the
+  // same treatment: one group, one shared proof tx.
   const BATCH_KINDS = ['attest', 'bindPassport', 'anchorContentRoot'];
+  const isProveKind = (k) => String(k || '').indexOf('prove:') === 0;
+
+  const ANCHOR_GROUP = {
+    title: 'Anchor passport on-chain',
+    badge: (n) => n + ' circuits · 1 batched transaction',
+    info: '',
+    txLabel: 'batched tx '
+  };
+  const PROVE_GROUP = {
+    title: 'ZK-prove your claims',
+    badge: (n) => n + ' ZK proofs · 1 batched transaction',
+    info: '',
+    txLabel: 'proof tx '
+  };
+
+  // Right-side status area: a drawn checkmark when done, text otherwise. The
+  // check replaces the word so finished rows read at a glance.
+  function stateNode(status, waitLabel) {
+    const state = document.createElement('span');
+    state.className = 'step-state';
+    if (status === 'succeeded') {
+      state.innerHTML = '<svg class="step-check" viewBox="0 0 16 16" aria-label="done" role="img">'
+        + '<path d="M3 8.5 6.5 12 13 4.5" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+    } else {
+      state.textContent = waitLabel || status;
+    }
+    return state;
+  }
+
+  // Every step reserves its tx line from the start so the timeline never
+  // shifts down when a hash lands mid-run; the link just fills in.
+  function txNode(s, prefix) {
+    const tx = document.createElement('div');
+    tx.className = 'step-tx';
+    if (s && s.txHash) {
+      const a = document.createElement('a');
+      a.href = s.explorerUrl || '#'; a.target = '_blank'; a.rel = 'noopener';
+      a.textContent = (prefix || 'tx ') + s.txHash.slice(0, 20) + '…';
+      tx.append(a);
+    }
+    return tx;
+  }
 
   function groupStatus(subs) {
     if (subs.some((s) => s.status === 'failed')) return 'failed';
@@ -454,23 +487,27 @@
     return 'pending';
   }
 
-  function renderBatchGroup(subs, st) {
+  function renderBatchGroup(subs, st, opts) {
     const li = document.createElement('li');
     const status = groupStatus(subs);
     li.className = status + ' batch-group';
     const dot = document.createElement('span'); dot.className = 'step-dot';
     const main = document.createElement('span'); main.className = 'step-main';
     const label = document.createElement('span'); label.className = 'step-label';
-    label.textContent = 'Anchor passport on-chain';
+    label.textContent = opts.title;
     const badge = document.createElement('span'); badge.className = 'batch-badge';
-    badge.textContent = subs.length + ' circuits · 1 batched transaction';
-    const state = document.createElement('span'); state.className = 'step-state';
-    state.textContent = status === 'pending' && st && st.state === 'queued' ? waitingText(st) : status;
-    main.append(label, badge, state);
-    const info = document.createElement('div');
-    info.className = 'step-info';
-    info.textContent = 'All three anchor circuits are merged into a SINGLE Midnight transaction: the data fingerprint, your passport id binding and the provable-field root land together, atomically.';
-    main.append(info);
+    badge.textContent = opts.badge(subs.length);
+    const state = stateNode(status,
+      status === 'pending' && st && st.state === 'queued' ? waitingText(st) : '');
+    const head = document.createElement('div'); head.className = 'step-head';
+    head.append(label, badge, state);
+    main.append(head);
+    if (opts.info) {
+      const info = document.createElement('div');
+      info.className = 'step-info';
+      info.textContent = opts.info;
+      main.append(info);
+    }
 
     const sub = document.createElement('ul'); sub.className = 'batch-sub';
     for (const s of subs) {
@@ -483,24 +520,16 @@
     }
     main.append(sub);
 
-    // One shared tx link; per-substep links only if the server ever anchors
-    // in separate transactions (older plugin fallback).
+    // One shared tx link on a line reserved from the start; per-substep links
+    // only if the server ever anchors in separate transactions (older plugin
+    // fallback).
     const txs = [...new Set(subs.filter((s) => s.txHash).map((s) => s.txHash))];
-    if (txs.length === 1) {
-      const s = subs.find((x) => x.txHash);
-      const tx = document.createElement('div'); tx.className = 'step-tx';
-      const a = document.createElement('a');
-      a.href = s.explorerUrl || '#'; a.target = '_blank'; a.rel = 'noopener';
-      a.textContent = 'batched tx ' + s.txHash.slice(0, 20) + '…';
-      tx.append(a); main.append(tx);
-    } else if (txs.length > 1) {
+    if (txs.length > 1) {
       for (const s of subs.filter((x) => x.txHash)) {
-        const tx = document.createElement('div'); tx.className = 'step-tx';
-        const a = document.createElement('a');
-        a.href = s.explorerUrl || '#'; a.target = '_blank'; a.rel = 'noopener';
-        a.textContent = (s.label || s.kind) + ': tx ' + s.txHash.slice(0, 20) + '…';
-        tx.append(a); main.append(tx);
+        main.append(txNode(s, (s.label || s.kind) + ': tx '));
       }
+    } else {
+      main.append(txNode(subs.find((x) => x.txHash), opts.txLabel));
     }
     li.append(dot, main);
     return li;
@@ -510,11 +539,19 @@
     const ol = $('timeline');
     ol.innerHTML = '';
     let batchSubs = null;
+    let proveSubs = null;
     for (const s of steps) {
       if (BATCH_KINDS.includes(s.kind)) {
         if (!batchSubs) {
           batchSubs = steps.filter((x) => BATCH_KINDS.includes(x.kind));
-          ol.append(renderBatchGroup(batchSubs, st));
+          ol.append(renderBatchGroup(batchSubs, st, ANCHOR_GROUP));
+        }
+        continue; // rendered inside the group
+      }
+      if (isProveKind(s.kind)) {
+        if (!proveSubs) {
+          proveSubs = steps.filter((x) => isProveKind(x.kind));
+          ol.append(renderBatchGroup(proveSubs, st, PROVE_GROUP));
         }
         continue; // rendered inside the group
       }
@@ -523,23 +560,22 @@
       const dot = document.createElement('span'); dot.className = 'step-dot';
       const main = document.createElement('span'); main.className = 'step-main';
       const label = document.createElement('span'); label.className = 'step-label'; label.textContent = s.label || s.kind;
-      const state = document.createElement('span'); state.className = 'step-state';
-      state.textContent = s.status === 'pending' && st && st.state === 'queued'
-        ? waitingText(st) : s.status;
-      main.append(label, state);
-      if (STEP_INFO[s.kind]) {
-        const info = document.createElement('div');
-        info.className = 'step-info';
-        info.textContent = STEP_INFO[s.kind];
-        main.append(info);
-      }
+      const state = stateNode(s.status,
+        s.status === 'pending' && st && st.state === 'queued' ? waitingText(st) : '');
+      // Single steps stay ONE line: the tx link (if any) sits inline on the
+      // right next to the check instead of expanding the tile.
+      const head = document.createElement('div'); head.className = 'step-head slim';
+      head.append(label);
       if (s.txHash) {
-        const tx = document.createElement('div'); tx.className = 'step-tx';
+        const tx = document.createElement('span'); tx.className = 'step-tx-inline';
         const a = document.createElement('a');
         a.href = s.explorerUrl || '#'; a.target = '_blank'; a.rel = 'noopener';
-        a.textContent = 'tx ' + s.txHash.slice(0, 20) + '…';
-        tx.append(a); main.append(tx);
+        a.textContent = 'tx ' + s.txHash.slice(0, 12) + '…';
+        tx.append(a);
+        head.append(tx);
       }
+      head.append(state);
+      main.append(head);
       li.append(dot, main);
       ol.append(li);
     }
@@ -605,10 +641,9 @@
     if (published) {
       links.push(`<a href="https://zkpassport.eu/p/${encodeURIComponent(pid)}" target="_blank" rel="noopener">View it on the public explorer (zkpassport.eu)</a>`);
     }
-    // This instance's own passport explorer (with auto-verify on open). The
-    // deployed demo host serves it too: PASSPORT_PUBLIC_SURFACE=demo,explorer.
-    links.push(`<a href="/explorer/#/p/${encodeURIComponent(pid)}" target="_blank" rel="noopener">View your passport in the explorer (with live on-chain verification)</a>`);
-    const proof = steps.find((s) => s.kind === 'provePredicate' && s.txHash);
+    // No separate link to this instance's explorer: the QR IS the passport
+    // link (public explorer when published, local resolver otherwise).
+    const proof = steps.find((s) => (s.kind === 'provePredicate' || isProveKind(s.kind)) && s.txHash);
     if (proof) {
       links.push(`<a href="${proof.explorerUrl}" target="_blank" rel="noopener">View the proof predicate transaction on the Midnight explorer</a>`);
     }

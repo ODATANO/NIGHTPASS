@@ -292,7 +292,7 @@ export default class DemoService extends cds.ApplicationService {
                     tester_ID: tester.ID,
                     passportId,
                     state: 'queued',
-                    stepsJson: JSON.stringify(this.initialSteps(input.secondLife, demoClaimList(input).length)),
+                    stepsJson: JSON.stringify(this.initialSteps(input.secondLife, demoClaimList(input))),
                     threshold: thresholdScaled,
                     clientKey
                 } as any);
@@ -414,7 +414,16 @@ export default class DemoService extends cds.ApplicationService {
         return /^(true|1|yes|on)$/i.test(String(process.env.DEMO_REGISTER_OWNERSHIP ?? ''));
     }
 
-    private initialSteps(secondLife = false, claimCount = 1) {
+    private initialSteps(secondLife = false, claims: Array<{ field: string; label: string }> = []) {
+        // More than one claim renders like the anchor batch above: one step
+        // per claim, grouped by the UI, all sharing the single proof tx.
+        const claimSteps = claims.length > 1
+            ? claims.map((c) => ({
+                kind: `prove:${c.field}`,
+                label: `${c.label} (value hidden)`,
+                status: 'pending'
+            }))
+            : [{ kind: 'provePredicate', label: 'ZK-prove CO2 claim (value hidden)', status: 'pending' }];
         return [
             { kind: 'sync', label: 'Create passport & sync wallet', status: 'pending' },
             ...(this.registerOwnershipEnabled()
@@ -423,13 +432,7 @@ export default class DemoService extends cds.ApplicationService {
             { kind: 'attest', label: 'Anchor payload hash (attest)', status: 'pending' },
             { kind: 'bindPassport', label: 'Bind passport id on-chain', status: 'pending' },
             { kind: 'anchorContentRoot', label: 'Anchor field Merkle root', status: 'pending' },
-            {
-                kind: 'provePredicate',
-                label: claimCount > 1
-                    ? `ZK-prove ${claimCount} claims in one transaction (values hidden)`
-                    : 'ZK-prove CO2 claim (value hidden)',
-                status: 'pending'
-            },
+            ...claimSteps,
             ...(secondLife
                 ? [{ kind: 'secondLife', label: 'Second life: age & repurpose (version 2)', status: 'pending' }]
                 : []),
@@ -488,20 +491,23 @@ export default class DemoService extends cds.ApplicationService {
         const user = this.techUser();
         const nightgate: any = await cds.connect.to('NightgateService');
         const producer: any = await cds.connect.to('ProducerService');
-        const steps = this.initialSteps(input.secondLife, demoClaimList(input).length);
+        const steps = this.initialSteps(input.secondLife, demoClaimList(input));
         // BEST-EFFORT: the timeline is cosmetic. A stepsJson UPDATE that hits
         // write-lock contention (facade saves) must never fail a run whose
         // on-chain work succeeded; the next setStep re-writes the full array
         // anyway, so a dropped intermediate write self-heals.
-        const setStep = async (kind: string, patch: Record<string, unknown>) => {
-            const s: any = steps.find(x => x.kind === kind);
-            if (s) Object.assign(s, patch);
+        const setSteps = async (patches: Array<[string, Record<string, unknown>]>) => {
+            for (const [kind, patch] of patches) {
+                const s: any = steps.find(x => x.kind === kind);
+                if (s) Object.assign(s, patch);
+            }
             try {
                 await this.patchRun(runId, { stepsJson: JSON.stringify(steps) });
             } catch (e) {
                 log.warn(`run ${runId}: timeline write failed (continuing):`, (e as Error)?.message);
             }
         };
+        const setStep = (kind: string, patch: Record<string, unknown>) => setSteps([[kind, patch]]);
 
         // 0. Make sure the LEASED sponsor's session exists BEFORE the anchor:
         //    without this, a failed boot prewarm would let ProducerService
@@ -626,8 +632,10 @@ export default class DemoService extends cds.ApplicationService {
             //    always there; the visitor can add more. ALL of them ride in
             //    ONE transaction, so N claims cost one wait and one fee.
             await this.patchRun(runId, { state: 'proving' });
-            await setStep('provePredicate', { status: 'running' });
             const claims = demoClaimList(input);
+            const multiClaim = claims.length > 1;
+            const proveKind = (field: string) => multiClaim ? `prove:${field}` : 'provePredicate';
+            await setSteps(claims.map((c) => [proveKind(c.field), { status: 'running' }] as [string, Record<string, unknown>]));
             const prove: any = await producer.tx({ user }, (tx: any) => tx.send('provePassportValuesBatch', {
                 passportId,
                 claimsJson: JSON.stringify(claims.map((c) => ({
@@ -648,13 +656,22 @@ export default class DemoService extends cds.ApplicationService {
             const proofs = await Promise.all(proofIds.map((id) => this.pollProof(id, proofTimeoutMs)));
             const okProofs = proofs.filter((p) => p.status === 'succeeded');
             if (!okProofs.length) throw new Error('predicate proofs failed');
-            await setStep('provePredicate', {
-                status: okProofs.length === proofs.length ? 'succeeded' : 'partial',
-                ...(proofs.length > 1
-                    ? { label: `ZK-proved ${okProofs.length} of ${proofs.length} claims in one transaction (values hidden)` }
-                    : {}),
-                txHash: okProofs[0].txHash, explorerUrl: explorerTxUrl(okProofs[0].txHash)
-            });
+            if (multiClaim) {
+                // One step per claim (grouped in the UI like the anchor
+                // batch); each reports its own outcome, all share the tx.
+                await setSteps(claims.map((c, i) => {
+                    const p = proofs.find((x) => x.sourceField === c.field) ?? proofs[i];
+                    return [proveKind(c.field), {
+                        status: p?.status === 'succeeded' ? 'succeeded' : 'failed',
+                        ...(p?.txHash ? { txHash: p.txHash, explorerUrl: explorerTxUrl(p.txHash) } : {})
+                    }] as [string, Record<string, unknown>];
+                }));
+            } else {
+                await setStep('provePredicate', {
+                    status: 'succeeded',
+                    txHash: okProofs[0].txHash, explorerUrl: explorerTxUrl(okProofs[0].txHash)
+                });
+            }
 
             // 3b. Optional second act: age the battery and repurpose it. Two
             //     simulated telemetry ticks (DB-only, deliberately no tx) and
@@ -788,12 +805,12 @@ export default class DemoService extends cds.ApplicationService {
     }
 
     /** Poll the PredicateProofLog row to completion (10 min cap). */
-    private async pollProof(proofLogId: string, timeoutMs = 10 * 60_000): Promise<{ status: string; txHash?: string }> {
+    private async pollProof(proofLogId: string, timeoutMs = 10 * 60_000): Promise<{ status: string; txHash?: string; sourceField?: string }> {
         const deadline = Date.now() + timeoutMs;
         for (;;) {
             await new Promise(r => setTimeout(r, 5000));
             const row: any = await SELECT.one.from(PredicateProofLog)
-                .columns('status', 'txHash').where({ ID: proofLogId });
+                .columns('status', 'txHash', 'sourceField').where({ ID: proofLogId });
             if (row && row.status !== 'pending') return row;
             if (Date.now() > deadline) throw new Error('proof timed out');
         }

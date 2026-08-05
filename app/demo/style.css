@@ -198,12 +198,20 @@ label.confidential { position: relative; }
 @keyframes pulse { 0%,100% { box-shadow: 0 0 0 0 rgba(122,162,255,.5);} 50% { box-shadow: 0 0 0 6px rgba(122,162,255,0);} }
 .step-main { flex: 1 1 auto; }
 .step-label { color: var(--ink); }
+.step-head { display: flex; align-items: center; gap: 8px; }
+.step-head .step-state { margin-left: auto; }
+.step-head.slim .step-label { flex: 1 1 auto; }
+.step-head.slim .step-state { margin-left: 0; }
+.step-tx-inline { font-size: 12px; white-space: nowrap; }
 .step-state { font-size: 12px; color: var(--ink-3); margin-left: 8px; }
 .timeline li.succeeded .step-state { color: var(--good); }
 .timeline li.failed .step-state { color: var(--critical); }
 .timeline li.running .step-state { color: var(--accent); }
 .step-info { font-size: 12px; color: var(--ink-3); margin-top: 2px; max-width: 560px; }
-.step-tx { font-size: 12px; }
+/* The tx line is reserved from the start (empty until a hash lands) so the
+   timeline keeps its height while the run progresses. */
+.step-tx { font-size: 12px; min-height: 18px; }
+.step-check { width: 15px; height: 15px; vertical-align: -3px; }
 .err-panel { border-color: var(--critical); color: var(--critical); margin-top: 14px; }
 
 .done-panel p:first-child { margin-top: 2px; }
