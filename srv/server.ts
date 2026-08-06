@@ -236,6 +236,9 @@ cds.on('bootstrap', (app: any) => {
             explorerLinks: explorerLinks(),
             surface,
             viewerBase,
+            // Public try-it demo of this deployment (PASSPORT_DEMO_LINK);
+            // the explorer header renders it as a "Try it live" button.
+            demoLink: process.env.PASSPORT_DEMO_LINK?.trim() || null,
             // The attestation vault the server anchors against. The cockpit's
             // browser-wallet flow signs against the SAME vault, so it must come
             // from here rather than a constant baked into the UI.

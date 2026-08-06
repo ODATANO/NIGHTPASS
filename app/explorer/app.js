@@ -265,6 +265,12 @@ var API = "/api/v1/passport";
           return '<a class="net-badge alt" href="' + esc(state.explorerLinks[n]) + '">' + esc(n) + " &#8599;</a>";
         }).join("");
       }
+      // "Try it live" -> the public demo of this deployment (PASSPORT_DEMO_LINK).
+      var tl = document.getElementById("tryLive");
+      if (tl && res[0].demoLink) {
+        tl.href = res[0].demoLink;
+        tl.hidden = false;
+      }
     });
   }
 

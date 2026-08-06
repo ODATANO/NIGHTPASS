@@ -183,6 +183,15 @@ a:hover { text-decoration: underline; }
 .net-badge.alt { color: var(--ink-2); border-color: var(--border); }
 .net-badge.alt:hover { color: var(--accent); border-color: var(--accent-2); text-decoration: none; }
 
+/* Header button to the public try-it demo (shown when the server exposes
+   demoLink in runtime-config). */
+.try-live {
+  font-size: 13px; font-weight: 600; white-space: nowrap;
+  color: #fff; background: var(--accent-2);
+  border-radius: 999px; padding: 5px 14px;
+}
+.try-live:hover { background: var(--accent); color: #0e0f13; text-decoration: none; }
+
 .table-wrap { overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; font-size: 14px; }
 th, td { text-align: left; padding: 10px 14px; white-space: nowrap; }
