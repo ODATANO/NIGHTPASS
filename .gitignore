@@ -79,6 +79,7 @@ app/connector/lib/
 # Personal/local-only notes (not for GitHub)
 app/connector/ERKLAERUNG.md
 docs/dev-hangout-ablauf.md
+docs/PITCHDECK-notes.md
 
 # Error-117 diagnosis scripts (decrypt persisted dust states, replay indexer
 # events, reproduce SDK balancing offline). Local evidence toolkit, not app code.
