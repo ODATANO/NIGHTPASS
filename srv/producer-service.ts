@@ -7,20 +7,27 @@ import {
 import {
     hashPayload, blake2b256Hex, encryptPayload, anchorPassport, waitForJob, waitForJobResult,
     detachedFromRequest, sendDetached,
-    buildContentRoot, fieldKeyHex, BATTERY_PROVABLE_FIELDS, runChainStep,
+    buildContentRoot, newSaltSeed, decryptPayload, fieldKeyHex, BATTERY_PROVABLE_FIELDS, BATTERY_STRING_FIELDS,
+    DYNAMIC_PROVABLE_FIELDS, runChainStep,
     effectiveNetwork, explorerTxUrl
 } from './lib/passport-anchor';
+import { CLAIM_SETS, claimSetById } from './lib/claim-sets';
+import {
+    allowedMaskFor, fieldsFromMask, describeMask, firstUnmaskedDifference, countChangedSlots,
+    provableValuesFromPayload, SLOT_COUNT
+} from './lib/version-integrity';
+import { buildMembershipSet } from './lib/membership-set';
 import { defaultGuideAttributes, hashableAttributes } from './lib/guide-attribute-defaults';
-import { DYNAMIC_ATTRIBUTES, encodeDynamicValue, dedupeUpdates, type DynamicUpdate } from './lib/attribute-update';
+import { DYNAMIC_ATTRIBUTES, encodeDynamicValue, decodeDynamicValue, dedupeUpdates, type DynamicUpdate } from './lib/attribute-update';
 import { payloadFromDb, readPayloadInputs } from './lib/passport-payload';
 import { validateTransition, parseBatteryStatus, encodeBatteryStatus, type BatteryStatus } from './lib/battery-lifecycle';
 import { validateDiligenceUpload, decodeUpload, sha256Hex } from './lib/diligence-upload';
-import { proofCartPlan, type ProofClaim } from './lib/proof-plan';
+import { proofCartPlan, claimKey, responseClaimKey, type ProofClaim } from './lib/proof-plan';
 import { listProducerWallets, producerWalletSecrets, feeSponsorWalletId, feeSponsorWalletIds } from './lib/producer-wallets';
 import { s4ConfigFromEnv, fetchMaterialDocuments, enrichMaster, loadProductMaster } from './lib/s4-client';
 import { buildReceiptRows } from './lib/s4-material-document';
 import { verifyContractTx, type ChainVerdict } from './lib/chain-verify';
-import { verifyAttestState, verifyGrantState, verifyPredicateState } from './lib/state-verify';
+import { verifyAttestState, attestRootState, verifyGrantState, verifyPredicateState, verifyCrossRootState } from './lib/state-verify';
 import { sweepAction, verdictToStatus } from './lib/stuck-rows';
 
 const CONTRACT_REF = 'attestation-vault';
@@ -100,7 +107,10 @@ export default class ProducerService extends cds.ApplicationService {
         this.on('recordWalletAttest', this.recordWalletAttest);
         this.on('recordWalletDisclosure', this.recordWalletDisclosure);
         this.on('recordWalletPredicate', this.recordWalletPredicate);
+        this.on('recordWalletMembership', this.recordWalletMembership);
         this.on('passportFieldValue', this.passportFieldValue);
+        this.on('passportMembershipProof', this.passportMembershipProof);
+        this.on('claimSetCatalog', this.claimSetCatalog);
         this.on('validatePassportConformance', this.validatePassportConformance);
         this.on('publishPassport', this.publishPassport);
         this.on('passportAspectJson', this.passportAspectJson);
@@ -109,6 +119,7 @@ export default class ProducerService extends cds.ApplicationService {
         this.on('revokePassportDisclosure', this.revokePassportDisclosure);
         this.on('provePassportValue', this.provePassportValue);
         this.on('provePassportValuesBatch', this.provePassportValuesBatch);
+        this.on('proveVersionIntegrity', this.proveVersionIntegrity);
         this.on('uploadDiligenceDoc', this.uploadDiligenceDoc);
         this.on('diligenceFile', this.diligenceFile);
         this.on('updateDynamicAttributes', this.updateDynamicAttributes);
@@ -577,11 +588,12 @@ export default class ProducerService extends cds.ApplicationService {
      */
     private async fieldValuesFor(passportRowId: string): Promise<Record<string, number | string>> {
         const out: Record<string, number | string> = {};
-        // Battery scalar fields (actual Batteries columns).
+        // Battery scalar + string fields (actual Batteries columns).
         const bat: any = await SELECT.one.from(Batteries)
-            .columns(...(BATTERY_PROVABLE_FIELDS as readonly string[]))
+            .columns(...(BATTERY_PROVABLE_FIELDS as readonly string[]), ...(BATTERY_STRING_FIELDS as readonly string[]))
             .where({ passport_ID: passportRowId });
         for (const f of BATTERY_PROVABLE_FIELDS) if (bat?.[f] != null) out[f] = bat[f];
+        for (const f of BATTERY_STRING_FIELDS) if (bat?.[f] != null && bat[f] !== '') out[f] = String(bat[f]);
         // Per-material recycled content (RecycledMaterials rows) → recycled<Material>Pct.
         const recs: any[] = await SELECT.from(RecycledMaterials)
             .columns('material', 'recycledPercentage')
@@ -589,7 +601,77 @@ export default class ProducerService extends cds.ApplicationService {
         for (const r of recs || []) {
             if (r?.material && r.recycledPercentage != null) out[`recycled${r.material}Pct`] = r.recycledPercentage;
         }
+        // Dynamic (measured) slots come from the guide attribute rows, decoded
+        // back to their scalar. Absent attributes simply leave their slot
+        // absent; a category that does not carry them (e.g. a battery without
+        // a BMS) is not a special case here.
+        const dyn: any[] = await SELECT.from(PassportAttributes)
+            .columns('attribute', 'valueJson')
+            .where({ passport_ID: passportRowId, attribute: { in: [...DYNAMIC_PROVABLE_FIELDS] } });
+        for (const a of dyn || []) {
+            const n = decodeDynamicValue(String(a?.attribute), a?.valueJson);
+            if (n != null) out[String(a.attribute)] = n;
+        }
         return out;
+    }
+
+    /**
+     * The persisted salt seed of a passport's ANCHORED content tree, read from
+     * the base entity: both service projections exclude the column on purpose
+     * (it is witness material), so `passportRef` can never carry it.
+     *
+     * Null for rows anchored before 0.16.0 or never anchored at all. A null
+     * seed on an ANCHORED row means the tree is unreproducible and every claim
+     * would abort at local proving; callers surface that as "re-anchor first"
+     * rather than burning minutes of proving.
+     */
+    private async contentSaltSeedOf(passportRowId: string): Promise<string | null> {
+        const row: any = await SELECT.one.from('passport.Passports')
+            .columns('contentSaltSeed').where({ ID: passportRowId });
+        const seed = String(row?.contentSaltSeed ?? '');
+        return /^[0-9a-f]{64}$/i.test(seed) ? seed.toLowerCase() : null;
+    }
+
+    /**
+     * Rebuild a passport's content tree the way it was ANCHORED: same field
+     * values, same salt seed. The single entry point for every proof path.
+     *
+     * Since NIGHTGATE 0.16.0 the leaves are salted, so "rebuild the tree" is no
+     * longer a pure function of the values: without the anchored seed the root
+     * differs and every claim fails at local proving. A missing seed therefore
+     * yields a tree built from a FRESH seed, which is correct only for a
+     * passport that has not been anchored yet (create path); anchored rows are
+     * gated by the caller via `contentSaltSeedOf`.
+     */
+    private async contentTreeFor(passportRowId: string, values?: Record<string, number | string>) {
+        const vals = values ?? await this.fieldValuesFor(passportRowId);
+        const stored = await this.contentSaltSeedOf(passportRowId);
+        const tree = await buildContentRoot(vals, { saltSeed: stored });
+        // Lazy materialisation: a passport without a seed gets one on FIRST use
+        // and keeps it. Without this, every caller would build a tree under a
+        // fresh random seed, and the browser wallet lane (which anchors a root
+        // it read from a plain function response) would anchor a root whose
+        // opening never existed anywhere but in that one response. The seed is
+        // independent of the field values, so fixing it early costs nothing;
+        // a re-anchor deliberately rotates it (see anchorRow).
+        if (!stored) await this.persistContentTree(passportRowId, tree);
+        // `saltSeed` reports what was STORED before this call: callers use it to
+        // tell "anchored under a seed we still have" from "anchored before the
+        // salted-leaf release", which a freshly materialised seed would mask.
+        return { values: vals, saltSeed: stored, tree };
+    }
+
+    /**
+     * Persist the coordinates of a content tree that is ABOUT TO BE anchored.
+     * Always before the submission, never after: a seed that reached the chain
+     * but not the database leaves an anchored root nobody can rebuild.
+     */
+    private async persistContentTree(passportRowId: string, tree: { contentRoot: string; schemaId: string; saltSeed: string }) {
+        await UPDATE.entity('passport.Passports').set({
+            contentRoot: tree.contentRoot,
+            contentSchemaId: tree.schemaId,
+            contentSaltSeed: tree.saltSeed
+        } as any).where({ ID: passportRowId });
     }
 
     // --- create + submit -----------------------------------------------------
@@ -789,25 +871,120 @@ export default class ProducerService extends cds.ApplicationService {
         const field = sourceField || 'carbonFootprintKgCO2';
         const values = await this.fieldValuesFor(row.ID);
         const v = values[field];
-        const base = { value: v == null ? '' : String(v), scaledValue: '', found: v != null, fieldKey: fieldKeyHex(field), contentRoot: '', siblingsJson: '[]', dirsJson: '[]' };
+        const base = {
+            value: v == null ? '' : String(v), scaledValue: '', found: v != null,
+            fieldKey: fieldKeyHex(field), contentRoot: '', schemaId: '', fieldSalt: '',
+            siblingsJson: '[]', dirsJson: '[]', rootDrift: false
+        };
         if (v == null) return base;
 
         // Build the content root + inclusion proof from the passport's provable
-        // fields. Degrade gracefully (value still returned for display) if the
-        // plugin's pure circuits aren't available.
+        // fields, with the ANCHORED salt seed. Degrade gracefully (value still
+        // returned for display) if the plugin's pure circuits aren't available.
         try {
-            const tree = await buildContentRoot(values);
+            const { tree } = await this.contentTreeFor(row.ID, values);
             const proof = tree.proofFor(field);
             base.contentRoot = tree.contentRoot;
-            if (proof) {
+            base.schemaId = tree.schemaId;
+            // Numeric fields only: string fields travel through
+            // passportMembershipProof (digest, set path), never as a scaled value.
+            if (proof?.kind === 'numeric') {
                 base.scaledValue = proof.value;
+                base.fieldSalt = proof.salt;
                 base.siblingsJson = JSON.stringify(proof.siblings);
                 base.dirsJson = JSON.stringify(proof.dirs);
+            }
+            // Drift warning for the wallet lane: proofs under a rebuilt tree
+            // whose root differs from the ANCHORED one fail every claim at
+            // local proving (minutes of wasted proving plus an opaque abort).
+            // Additive return field; deployed callers ignore it.
+            if (await this.contentRootAnchored(row.ID)) {
+                const verdict = await attestRootState({
+                    contractAddress: this.contractAddress() ?? row.contractAddress,
+                    payloadHash: row.payloadHash, contentRoot: tree.contentRoot, schemaId: tree.schemaId
+                });
+                base.rootDrift = verdict === 'mismatch';
             }
         } catch (e) {
             cds.log('producer').warn('content-root/proof build skipped:', (e as Error)?.message);
         }
         return base;
+    };
+
+    /**
+     * Everything the browser wallet lane needs for ONE membership claim:
+     * the content-root inclusion proof of the string field (digest form, the
+     * raw value never leaves the server response), the canonical set root of
+     * the named allow-list, and the depth-6 set inclusion path. `member:false`
+     * lets the cockpit refuse honestly BEFORE any wallet popup; `rootDrift`
+     * warns when the anchored root predates the current provable-field layout
+     * (every claim would fail at local proving until a re-anchor).
+     */
+    private passportMembershipProof = async (req: cds.Request) => {
+        const { passportId, sourceField, setId } = req.data as
+            { passportId?: string; sourceField?: string; setId?: string };
+        const row: any = await this.passportRef(String(passportId ?? ''));
+        if (!row) return req.reject(404, `passport '${passportId}' not found`);
+        const field = String(sourceField ?? '');
+        const set = claimSetById(String(setId ?? ''));
+        if (!set) return req.reject(400, `unknown claim set '${setId}'`);
+        if (set.sourceField !== field) {
+            return req.reject(400, `claim set '${set.id}' applies to '${set.sourceField}', not '${field}'`);
+        }
+        const values = await this.fieldValuesFor(row.ID);
+        const v = values[field];
+        const base = {
+            found: v != null, member: false, rootDrift: false,
+            fieldKey: fieldKeyHex(field), fieldDigest: '', contentRoot: '',
+            schemaId: '', fieldSalt: '',
+            siblingsJson: '[]', dirsJson: '[]',
+            setId: set.id, setLabel: set.label, setRoot: '', memberCount: 0,
+            setSiblingsJson: '[]', setDirsJson: '[]'
+        };
+        if (v == null) return base;
+
+        const memberSet = await buildMembershipSet(set.values);
+        base.setRoot = memberSet.setRoot;
+        base.memberCount = memberSet.memberCount;
+        const setProof = memberSet.proofFor(String(v));
+        if (!setProof) return base; // member stays false; UI refuses pre-wallet
+        base.member = true;
+        base.setSiblingsJson = JSON.stringify(setProof.setSiblings);
+        base.setDirsJson = JSON.stringify(setProof.setDirs);
+
+        const { tree } = await this.contentTreeFor(row.ID, values);
+        const proof = tree.proofFor(field);
+        base.contentRoot = tree.contentRoot;
+        base.schemaId = tree.schemaId;
+        if (proof?.kind === 'string') {
+            base.fieldDigest = proof.valueDigest;
+            base.fieldSalt = proof.salt;
+            base.siblingsJson = JSON.stringify(proof.siblings);
+            base.dirsJson = JSON.stringify(proof.dirs);
+        } else {
+            return req.reject(400, `field '${field}' is not a string provable field`);
+        }
+        // Drift check only when a root is anchored; 'unknown' (unreachable
+        // indexer) keeps rootDrift=false and the circuit aborts honestly.
+        if (await this.contentRootAnchored(row.ID)) {
+            const contractAddress = this.contractAddress() ?? row.contractAddress;
+            const verdict = await attestRootState({
+                contractAddress, payloadHash: row.payloadHash, contentRoot: tree.contentRoot, schemaId: tree.schemaId
+            });
+            base.rootDrift = verdict === 'mismatch';
+        }
+        return base;
+    };
+
+    /** The named allow-list catalog for the cockpit picker (values included:
+     *  they are public by design; verifiers recompute the root from them). */
+    private claimSetCatalog = async () => {
+        return {
+            setsJson: JSON.stringify(CLAIM_SETS.map((s) => ({
+                id: s.id, label: s.label, sourceField: s.sourceField,
+                memberCount: s.values.length, values: s.values
+            })))
+        };
     };
 
     /** Official BatteryPass-Ready conformance check (server-proxied, key hidden). */
@@ -847,18 +1024,30 @@ export default class ProducerService extends cds.ApplicationService {
         // proof tx are public by design; the underlying value never leaves).
         const rowId: any = await SELECT.one.from(Passports).columns('ID').where({ passportId });
         const proofs: any[] = await SELECT.from(PredicateProofLog)
-            .columns('sourceField', 'predicate', 'threshold', 'unit', 'txHash', 'createdAt', 'payloadHash')
+            .columns('sourceField', 'predicate', 'threshold', 'unit', 'txHash', 'createdAt', 'payloadHash', 'setRoot', 'setId')
             .where({ passport_ID: rowId.ID, status: 'succeeded', result: true })
             .orderBy('createdAt');
-        const claims = proofs.map((c) => ({
-            sourceField: c.sourceField, predicate: c.predicate,
-            threshold: Number(c.threshold) / 1000, unit: c.unit ?? '',
-            txHash: c.txHash ?? '', provenAt: c.createdAt ?? null,
-            // The version hash the claim was proven under, so the public
-            // instance verifies against the right version directly instead of
-            // probing the anchor history.
-            payloadHash: c.payloadHash ?? null,
-        }));
+        const claims = proofs.map((c) => {
+            const common = {
+                sourceField: c.sourceField, predicate: c.predicate,
+                txHash: c.txHash ?? '', provenAt: c.createdAt ?? null,
+                // The version hash the claim was proven under, so the public
+                // instance verifies against the right version directly instead
+                // of probing the anchor history.
+                payloadHash: c.payloadHash ?? null,
+            };
+            if (c.predicate === 'setMembership') {
+                // The allow-list travels with the claim: it is public by
+                // design, and publishing the values lets ANY verifier
+                // recompute the set root from the list alone.
+                const set = claimSetById(c.setId ?? '');
+                return {
+                    ...common, setRoot: c.setRoot ?? '', setId: c.setId ?? '',
+                    setLabel: set?.label ?? c.setId ?? '', allowedValues: set?.values ?? null,
+                };
+            }
+            return { ...common, threshold: Number(c.threshold) / 1000, unit: c.unit ?? '' };
+        });
         // Superseded anchor versions travel too (public anchor metadata only,
         // never the archived payloadCipher), so the public explorer can show
         // the anchor history and live-verify each version.
@@ -995,18 +1184,74 @@ export default class ProducerService extends cds.ApplicationService {
     private recordWalletPredicate = async (req: cds.Request) => {
         const { passportId, sourceField, predicate, threshold, unit, txHash, result } = req.data as
             { passportId?: string; sourceField?: string; predicate?: string; threshold?: number; unit?: string; txHash?: string; result?: boolean };
-        const row: any = await this.passportRef(String(passportId ?? ''));
-        if (!row) return req.reject(404, `passport '${passportId}' not found`);
         const pred = predicate === 'greaterOrEqual' ? 'greaterOrEqual' : 'lessOrEqual';
-        const hash = norm(txHash);
+        return this.recordWalletProofRow(req, {
+            passportId, sourceField, txHash, result,
+            logColumns: { predicate: pred, threshold: Number(threshold ?? 0), unit },
+            // Crawler-free: confirm the vault recorded a true result for this
+            // field-bound claim. The cockpit sends the already-scaled
+            // threshold the proof hashed, so it is passed straight through.
+            stateCheckFor: (contract, payloadHash) => verifyPredicateState({
+                contractAddress: contract, payloadHash,
+                fieldKey: fieldKeyHex(String(sourceField)), predicate: pred, threshold: Number(threshold ?? 0)
+            })
+        });
+    };
+
+    /**
+     * Record a browser-wallet membership proof (membership rows carry a
+     * setRoot instead of a threshold). Settles crawler-free against the
+     * vault's field_membership_results map.
+     */
+    private recordWalletMembership = async (req: cds.Request) => {
+        const { passportId, sourceField, setId, setRoot, txHash, result } = req.data as
+            { passportId?: string; sourceField?: string; setId?: string; setRoot?: string; txHash?: string; result?: boolean };
+        const root = norm(setRoot).toLowerCase();
+        if (!/^[0-9a-f]{64}$/.test(root)) return req.reject(400, 'setRoot must be 32-byte hex (64 chars)');
+        return this.recordWalletProofRow(req, {
+            passportId, sourceField, txHash, result,
+            logColumns: {
+                predicate: 'setMembership', threshold: null, unit: null,
+                setRoot: root, setId: String(setId ?? '').slice(0, 60) || null
+            },
+            stateCheckFor: (contract, payloadHash) => verifyPredicateState({
+                contractAddress: contract, payloadHash,
+                fieldKey: fieldKeyHex(String(sourceField)), predicate: 'setMembership', setRoot: root
+            })
+        });
+    };
+
+    /**
+     * Shared choreography of the wallet-driven proof records: one
+     * PredicateProofLog row + one PassportTransactions row, an immediate
+     * failed pair when the circuit rejected locally (result:false), else a
+     * pending pair settled via the claim-kind-specific crawler-free state
+     * check. The claim kinds differ only in their log columns and the state
+     * check; everything else stays one implementation.
+     */
+    private async recordWalletProofRow(req: cds.Request, o: {
+        passportId?: string; sourceField?: string; txHash?: string; result?: boolean;
+        logColumns: Record<string, unknown>;
+        stateCheckFor: (contract: string, payloadHash: string) => Promise<ChainVerdict>;
+    }) {
+        const row: any = await this.passportRef(String(o.passportId ?? ''));
+        if (!row) return req.reject(404, `passport '${o.passportId}' not found`);
+        // The state check keys the vault map by blake2b(sourceField); an
+        // absent field would probe blake2b('') and silently degrade the
+        // verification to tx-shape checking.
+        if (!String(o.sourceField ?? '').trim()) return req.reject(400, 'sourceField is required');
+        const hash = norm(o.txHash);
         const contract = row.contractAddress || this.contractAddress();
         const proofLogId = cds.utils.uuid();
         const txRowId = cds.utils.uuid();
+        const logRow = {
+            passport_ID: row.ID, sourceField: o.sourceField, ...o.logColumns,
+            payloadHash: row.payloadHash ?? null
+        };
 
-        if (result === false) {
+        if (o.result === false) {
             await INSERT.into(PredicateProofLog).entries({
-                ID: proofLogId, passport_ID: row.ID, sourceField, predicate: pred, threshold: Number(threshold ?? 0),
-                unit, txHash: hash || null, status: 'failed', result: false, payloadHash: row.payloadHash ?? null
+                ID: proofLogId, ...logRow, txHash: hash || null, status: 'failed', result: false
             } as any);
             await INSERT.into(PassportTransactions).entries({
                 ID: txRowId, passport_ID: row.ID, kind: 'provePredicate', txHash: hash || null,
@@ -1016,8 +1261,7 @@ export default class ProducerService extends cds.ApplicationService {
         }
 
         await INSERT.into(PredicateProofLog).entries({
-            ID: proofLogId, passport_ID: row.ID, sourceField, predicate: pred, threshold: Number(threshold ?? 0),
-            unit, txHash: hash || null, status: 'pending', result: true, payloadHash: row.payloadHash ?? null
+            ID: proofLogId, ...logRow, txHash: hash || null, status: 'pending', result: true
         } as any);
         await INSERT.into(PassportTransactions).entries({
             ID: txRowId, passport_ID: row.ID, kind: 'provePredicate', txHash: hash || null,
@@ -1026,13 +1270,7 @@ export default class ProducerService extends cds.ApplicationService {
 
         const verdict = await this.settleWalletTx({
             txHash: hash, contractAddress: contract,
-            // Crawler-free: confirm the vault recorded a true result
-            // for this field-bound claim. The cockpit sends the already-scaled
-            // threshold that the proof hashed, so it is passed straight through.
-            stateCheck: () => verifyPredicateState({
-                contractAddress: contract, payloadHash: row.payloadHash,
-                fieldKey: fieldKeyHex(String(sourceField ?? '')), predicate: pred, threshold: Number(threshold ?? 0)
-            }),
+            stateCheck: () => o.stateCheckFor(contract, row.payloadHash),
             onConfirmed: async () => {
                 await UPDATE.entity(PredicateProofLog).set({ status: 'succeeded' }).where({ ID: proofLogId });
                 await UPDATE.entity(PassportTransactions).set({ status: 'succeeded' }).where({ ID: txRowId });
@@ -1043,7 +1281,7 @@ export default class ProducerService extends cds.ApplicationService {
             }
         });
         return { ok: verdict !== 'failed', txHash: hash, status: walletStatus(verdict) };
-    };
+    }
 
     // --- wallet-tx settlement -------------------------------------------------
 
@@ -1147,10 +1385,23 @@ export default class ProducerService extends cds.ApplicationService {
         await DELETE.from(PassportTransactions).where({ passport_ID: ID, kind: 'attest', status: 'offline' });
         // Content-root inputs must be read HERE: the row's children may still be
         // uncommitted in this request's tx and invisible to a detached reader.
+        //
+        // The tree is SALTED (NIGHTGATE 0.16.0): this version gets a fresh seed,
+        // and that seed plus the schema id are persisted with the row in THIS
+        // transaction, before any chain work starts. Order matters: a seed that
+        // reached the chain but not the database would leave an anchored root
+        // nobody can ever rebuild, and every later claim on this passport would
+        // abort at local proving with no way back except a re-anchor.
         let contentRoot: string | undefined;
+        let schemaId: string | undefined;
         try {
             const values = await this.fieldValuesFor(ID);
-            if (Object.keys(values).length) contentRoot = (await buildContentRoot(values)).contentRoot;
+            if (Object.keys(values).length) {
+                const tree = await buildContentRoot(values, { saltSeed: newSaltSeed() });
+                contentRoot = tree.contentRoot;
+                schemaId = tree.schemaId;
+                await this.persistContentTree(ID, tree);
+            }
         } catch (e) {
             cds.log('producer').warn('content-root build skipped:', (e as Error)?.message);
         }
@@ -1165,7 +1416,7 @@ export default class ProducerService extends cds.ApplicationService {
         const user = req.user;
         (req as any).on('succeeded', () => {
             void detachedFromRequest(() =>
-                this.runAnchorDetached(ID, passportId, payloadHash, passportIdHash, contractAddress, sessionId, user, contentRoot, sponsorSessionId)
+                this.runAnchorDetached(ID, passportId, payloadHash, passportIdHash, contractAddress, sessionId, user, contentRoot, sponsorSessionId, schemaId)
             ).catch((e: unknown) =>
                 cds.log('producer').error(`detached anchor runner crashed for ${passportId}:`, e));
         });
@@ -1183,7 +1434,7 @@ export default class ProducerService extends cds.ApplicationService {
     private async runAnchorDetached(
         ID: string, passportId: string, payloadHash: string, passportIdHash: string,
         contractAddress: string, sessionId: string, user: unknown, contentRoot?: string,
-        sponsorSessionId?: string
+        sponsorSessionId?: string, schemaId?: string
     ): Promise<void> {
         const log = cds.log('producer');
         try {
@@ -1201,7 +1452,7 @@ export default class ProducerService extends cds.ApplicationService {
             }
             if (sponsorSessionId) log.info(`anchor fees for ${passportId} sponsored by session ${sponsorSessionId.slice(0, 8)}...`);
             const { attestationTxHash } = await anchorPassport(nightgate, {
-                payloadHash, passportId, passportIdHash, contractAddress, sessionId, user, contentRoot, sponsorSessionId,
+                payloadHash, passportId, passportIdHash, contractAddress, sessionId, user, contentRoot, schemaId, sponsorSessionId,
                 onStep: async (s) => {
                     await this.runDetached(async () => {
                         await INSERT.into(PassportTransactions).entries({
@@ -1328,6 +1579,9 @@ export default class ProducerService extends cds.ApplicationService {
         // Resolve the value from the passport's battery. carbonFootprintKgCO2 is
         // the canonical predicate field. Scale ×1000 to an integer (milli-units)
         // for the Uint<64> circuit; threshold is scaled the same way.
+        if (predicate === 'setMembership') {
+            return req.reject(400, 'membership claims go through provePassportValuesBatch (the proof cart)');
+        }
         const field = sourceField || 'carbonFootprintKgCO2';
         const values = await this.fieldValuesFor(row.ID);
         const rawValue = values[field];
@@ -1350,9 +1604,14 @@ export default class ProducerService extends cds.ApplicationService {
         // Build the field-bound inclusion proof + content root. The proven value
         // is thus cryptographically tied to THIS passport's field, not a free
         // witness. Only PROVABLE_FIELDS are supported. (`values` already resolved.)
-        const tree = await buildContentRoot(values);
+        // Rebuilt with the ANCHORED salt seed; without it the root would differ
+        // from the ledger's and the circuit would abort after minutes of proving.
+        const { tree, saltSeed } = await this.contentTreeFor(row.ID, values);
         const proof = tree.proofFor(field);
         if (!proof) return req.reject(400, `field '${field}' is not a provable field`);
+        if (proof.kind !== 'numeric') {
+            return req.reject(400, `field '${field}' is a string field; prove it via a membership claim in the proof cart`);
+        }
 
         // Detached like anchorRow: the ZK proof takes tens of seconds; holding
         // the request (and the UI) open for it is pointless and its request tx
@@ -1370,10 +1629,19 @@ export default class ProducerService extends cds.ApplicationService {
         // anchorContentRoot tx (fee, ~20s, a confusing duplicate row). Supply
         // it only when no anchored root exists yet for this passport.
         const rootAnchored = await this.contentRootAnchored(row.ID);
+        if (rootAnchored && !saltSeed) {
+            return req.reject(409, `the anchored content root of '${row.passportId}' has no stored salt seed ` +
+                '(anchored before the salted-leaf release); re-anchor the passport before proving');
+        }
+        // This call is about to anchor the root itself (no root on-chain yet),
+        // so the seed it was built from becomes THE opening of that anchor and
+        // must be persisted before the chain sees it.
+        if (!rootAnchored) await this.persistContentTree(row.ID, tree);
         const sponsorSessionId = await this.sponsorSessionIdFor(String(session), sponsorWalletId);
         const args = {
             payloadHash: row.payloadHash, fieldKey: proof.fieldKey, value: proof.value,
-            ...(rootAnchored ? {} : { contentRoot: tree.contentRoot }),
+            fieldSalt: proof.salt,
+            ...(rootAnchored ? {} : { contentRoot: tree.contentRoot, schemaId: tree.schemaId }),
             siblingsJson: JSON.stringify(proof.siblings), dirsJson: JSON.stringify(proof.dirs),
             predicate: pred, threshold: thresholdScaled, unit: useUnit,
             sessionId: session, contractAddress, compiledArtifactRef: CONTRACT_REF,
@@ -1406,87 +1674,155 @@ export default class ProducerService extends cds.ApplicationService {
         try { items = JSON.parse(String(claimsJson ?? '')); } catch { items = null as any; }
         if (!Array.isArray(items) || !items.length) return req.reject(400, 'claimsJson must be a non-empty JSON array');
 
-        const values = await this.fieldValuesFor(row.ID);
-        const tree = await buildContentRoot(values);
-        type CartEntry = {
-            field: string; pred: 'lessOrEqual' | 'greaterOrEqual'; thresholdScaled: number; unit: string;
-            proof: NonNullable<ReturnType<typeof tree.proofFor>>;
-        };
+        const { values, tree, saltSeed } = await this.contentTreeFor(row.ID);
+        type CartEntry =
+            | {
+                kind: 'predicate'; field: string; pred: 'lessOrEqual' | 'greaterOrEqual';
+                thresholdScaled: number; unit: string;
+                proof: Extract<NonNullable<ReturnType<typeof tree.proofFor>>, { kind: 'numeric' }>;
+            }
+            | {
+                kind: 'membership'; field: string; setId: string; setLabel: string;
+                setRoot: string; allowedValues: readonly string[];
+                proof: Extract<NonNullable<ReturnType<typeof tree.proofFor>>, { kind: 'string' }>;
+            };
         const entries: CartEntry[] = [];
         for (const it of items) {
             const field = String(it?.sourceField ?? '');
             if (values[field] == null) return req.reject(400, `value for '${field}' not found on this passport`);
             const proof = tree.proofFor(field);
             if (!proof) return req.reject(400, `field '${field}' is not a provable field`);
-            entries.push({
-                field,
-                pred: it?.predicate === 'greaterOrEqual' ? 'greaterOrEqual' : 'lessOrEqual',
-                thresholdScaled: Math.round(Number(it?.threshold ?? 0) * 1000),
-                unit: String(it?.unit ?? ''),
-                proof
-            });
+            if (it?.predicate === 'setMembership') {
+                const setId = String(it?.setId ?? '');
+                const set = claimSetById(setId);
+                if (!set) return req.reject(400, `unknown claim set '${setId}'`);
+                if (set.sourceField !== field) {
+                    return req.reject(400, `claim set '${setId}' applies to '${set.sourceField}', not '${field}'`);
+                }
+                if (proof.kind !== 'string') return req.reject(400, `field '${field}' is not a string provable field`);
+                // Member check BEFORE any session/proving work, mirroring
+                // NIGHTGATE's non-member 400 before rate spend.
+                if (!set.values.includes(String(values[field]))) {
+                    return req.reject(400, `'${field}' value is not in set '${set.label}'`);
+                }
+                const memberSet = await buildMembershipSet(set.values);
+                entries.push({
+                    kind: 'membership', field, setId, setLabel: set.label,
+                    setRoot: memberSet.setRoot, allowedValues: set.values, proof
+                });
+            } else {
+                if (proof.kind !== 'numeric') {
+                    return req.reject(400, `field '${field}' is a string field; prove it via a setMembership claim`);
+                }
+                entries.push({
+                    kind: 'predicate', field,
+                    pred: it?.predicate === 'greaterOrEqual' ? 'greaterOrEqual' : 'lessOrEqual',
+                    thresholdScaled: Math.round(Number(it?.threshold ?? 0) * 1000),
+                    unit: String(it?.unit ?? ''),
+                    proof
+                });
+            }
         }
         // Shared plan: validates and drops exact duplicates the same way the
         // browser cart does (claim keys are idempotent on-chain anyway).
+        const planClaimOf = (e: CartEntry): ProofClaim => e.kind === 'membership'
+            ? { kind: 'membership', fieldKey: e.proof.fieldKey, setRoot: e.setRoot }
+            : { fieldKey: e.proof.fieldKey, threshold: e.thresholdScaled, op: e.pred === 'greaterOrEqual' ? 1 : 0 };
         let plan;
         try {
-            plan = proofCartPlan({
-                payloadHash: row.payloadHash,
-                claims: entries.map((e): ProofClaim => ({
-                    fieldKey: e.proof.fieldKey, threshold: e.thresholdScaled,
-                    op: e.pred === 'greaterOrEqual' ? 1 : 0
-                }))
-            });
+            plan = proofCartPlan({ payloadHash: row.payloadHash, claims: entries.map(planClaimOf) });
         } catch (e: any) {
             return req.reject(400, String(e?.message ?? e));
         }
-        const byKey = new Map(entries.map((e) => [
-            `${e.proof.fieldKey.toLowerCase()}|${e.thresholdScaled}|${e.pred === 'greaterOrEqual' ? 1 : 0}`, e
-        ]));
-        const kept = plan.claims.map((c) => byKey.get(`${c.fieldKey}|${c.threshold}|${c.op}`)!);
+        const byKey = new Map(entries.map((e) => [claimKey(planClaimOf(e)), e]));
+        const kept = plan.claims.map((c) => byKey.get(claimKey(c))!);
+
+        const logRowOf = (e: CartEntry) => e.kind === 'membership'
+            ? {
+                sourceField: e.field, predicate: 'setMembership', threshold: null, unit: null,
+                setRoot: e.setRoot, setId: e.setId
+            }
+            : { sourceField: e.field, predicate: e.pred, threshold: e.thresholdScaled, unit: e.unit };
 
         const session = await this.effectiveSession(sessionId, walletId);
         const contractAddress = this.contractAddress() ?? row.contractAddress;
         if (!session || !contractAddress) {
-            await INSERT.into(PredicateProofLog).entries(kept.map((e) => ({
-                passport_ID: row.ID, sourceField: e.field, predicate: e.pred,
-                threshold: e.thresholdScaled, unit: e.unit, status: 'offline', payloadHash: row.payloadHash ?? null
-            })) as any);
+            // Own short root tx: the tree/set builds above can take seconds
+            // (first WASM load), long enough for a worker facade save to
+            // stale this request tx's snapshot (BUSY_SNAPSHOT rule, 07-15).
+            await this.runDetached(async () => {
+                await INSERT.into(PredicateProofLog).entries(kept.map((e) => ({
+                    passport_ID: row.ID, ...logRowOf(e), status: 'offline', payloadHash: row.payloadHash ?? null
+                })) as any);
+            });
             return { mode: 'offline', proofLogIds: '[]', dropped: plan.dropped.length };
         }
 
         // In-batch root anchor only when none exists yet (same rule as the
         // single action); it occupies one of the 8 call slots.
         const rootAnchored = await this.contentRootAnchored(row.ID);
+        if (rootAnchored && !saltSeed) {
+            return req.reject(409, `the anchored content root of '${row.passportId}' has no stored salt seed ` +
+                '(anchored before the salted-leaf release); re-anchor the passport before proving');
+        }
         const maxClaims = rootAnchored ? 8 : 7;
         if (kept.length > maxClaims) {
             return req.reject(400, `at most ${maxClaims} claims per cart` +
                 (rootAnchored ? '' : ' (the content-root anchor occupies one of the 8 call slots)'));
         }
+        // Root-drift pre-flight: an anchored root that no longer matches the
+        // freshly built tree (the provable-field registry changed since the
+        // anchor) fails EVERY claim at local proving. Reject with the fix
+        // instead; an unreachable indexer degrades to the honest in-circuit
+        // abort (verdict 'unknown' proceeds).
+        if (rootAnchored) {
+            const rootVerdict = await attestRootState({
+                contractAddress, payloadHash: row.payloadHash, contentRoot: tree.contentRoot, schemaId: tree.schemaId
+            });
+            if (rootVerdict === 'mismatch') {
+                return req.reject(409, `the anchored content root of '${row.passportId}' predates the current ` +
+                    'provable-field layout; re-anchor (re-attest) the passport before proving');
+            }
+        }
 
+        // Own short root tx (see the offline branch): the drift pre-flight
+        // above is a live indexer read that can hold this request open long
+        // enough for worker commits to stale its snapshot.
         const proofLogIds = kept.map(() => cds.utils.uuid());
-        await INSERT.into(PredicateProofLog).entries(kept.map((e, i) => ({
-            ID: proofLogIds[i], passport_ID: row.ID, sourceField: e.field, predicate: e.pred,
-            threshold: e.thresholdScaled, unit: e.unit, status: 'pending', payloadHash: row.payloadHash ?? null
-        })) as any);
+        await this.runDetached(async () => {
+            await INSERT.into(PredicateProofLog).entries(kept.map((e, i) => ({
+                ID: proofLogIds[i], passport_ID: row.ID, ...logRowOf(e),
+                status: 'pending', payloadHash: row.payloadHash ?? null
+            })) as any);
+        });
 
+        if (!rootAnchored) await this.persistContentTree(row.ID, tree);
         const sponsorSessionId = await this.sponsorSessionIdFor(String(session), sponsorWalletId);
         const args = {
             payloadHash: row.payloadHash,
-            ...(rootAnchored ? {} : { contentRoot: tree.contentRoot }),
-            claimsJson: JSON.stringify(kept.map((e) => ({
-                fieldKey: e.proof.fieldKey, value: e.proof.value,
-                siblings: e.proof.siblings, dirs: e.proof.dirs,
-                predicate: e.pred, threshold: e.thresholdScaled,
-                ...(e.unit ? { unit: e.unit } : {})
-            }))),
+            ...(rootAnchored ? {} : { contentRoot: tree.contentRoot, schemaId: tree.schemaId }),
+            claimsJson: JSON.stringify(kept.map((e) => (e.kind === 'membership'
+                ? {
+                    fieldKey: e.proof.fieldKey, value: String(values[e.field]),
+                    allowedValues: e.allowedValues, salt: e.proof.salt,
+                    siblings: e.proof.siblings, dirs: e.proof.dirs,
+                    predicate: 'setMembership'
+                }
+                : {
+                    fieldKey: e.proof.fieldKey, value: e.proof.value, salt: e.proof.salt,
+                    siblings: e.proof.siblings, dirs: e.proof.dirs,
+                    predicate: e.pred, threshold: e.thresholdScaled,
+                    ...(e.unit ? { unit: e.unit } : {})
+                }))),
             sessionId: session, contractAddress, compiledArtifactRef: CONTRACT_REF,
             ...(sponsorSessionId ? { sponsorSessionId } : {})
         };
         const user = req.user;
         const claimMeta = kept.map((e, i) => ({
             proofLogId: proofLogIds[i],
-            key: `${e.proof.fieldKey.toLowerCase()}|${e.thresholdScaled}|${e.pred}`
+            key: responseClaimKey(e.kind === 'membership'
+                ? { fieldKey: e.proof.fieldKey, predicate: 'setMembership', setRoot: e.setRoot }
+                : { fieldKey: e.proof.fieldKey, predicate: e.pred, threshold: e.thresholdScaled })!
         }));
         (req as any).on('succeeded', () => {
             void detachedFromRequest(() =>
@@ -1602,16 +1938,315 @@ export default class ProducerService extends cds.ApplicationService {
         }
     }
 
+    /**
+     * Version integrity: prove that the current version differs from an
+     * archived one ONLY in the fields the mask frees (values hidden).
+     *
+     * Everything that can be decided off-chain is decided off-chain first:
+     * both openings must still exist, both rebuilt roots must equal what was
+     * anchored, both versions must sit on the SAME vault under the SAME
+     * schema, and no unmasked slot may differ. Each of those would otherwise
+     * surface as an opaque circuit abort minutes into proving.
+     */
+    private proveVersionIntegrity = async (req: cds.Request) => {
+        const { passportId, fromVersion, allowedFieldsJson, minChangedSlots, sessionId, walletId, sponsorWalletId } = req.data as {
+            passportId?: string; fromVersion?: number; allowedFieldsJson?: string; minChangedSlots?: number;
+            sessionId?: string; walletId?: string; sponsorWalletId?: string;
+        };
+        const row: any = await SELECT.one.from(Passports)
+            .columns('ID', 'passportId', 'owner', 'payloadHash', 'status', 'contractAddress',
+                'contentRoot', 'contentSchemaId', 'contentSaltSeed')
+            .where({ passportId: String(passportId ?? '') });
+        if (!row) return req.reject(404, `passport '${passportId}' not found`);
+        if (row.status !== 'anchored') {
+            return req.reject(400, `passport '${row.passportId}' is '${row.status}'; a version comparison needs two anchored versions`);
+        }
+
+        // The mask IS the claim, so it is parsed and validated before anything
+        // else: an unknown field name or a vacuous mask is a plain 400.
+        let fields: string[] = [];
+        if (allowedFieldsJson) {
+            try { fields = JSON.parse(String(allowedFieldsJson)); } catch { return req.reject(400, 'allowedFieldsJson must be valid JSON'); }
+            if (!Array.isArray(fields) || fields.some((f) => typeof f !== 'string')) {
+                return req.reject(400, 'allowedFieldsJson must be a JSON array of field names');
+            }
+        }
+        let mask: number;
+        try { mask = allowedMaskFor(fields); } catch (e: any) { return req.reject(400, String(e?.message ?? e)); }
+
+        // Document A: an archived anchor version (default the newest).
+        const versions: any[] = await SELECT.from(PassportAnchorVersions)
+            .columns('version', 'payloadHash', 'payloadCipher', 'contentRoot', 'contentSchemaId',
+                'contentSaltSeed', 'contractAddress')
+            .where({ passport_ID: row.ID });
+        if (!versions?.length) {
+            return req.reject(400, `passport '${row.passportId}' has no archived version yet; re-anchor it once to compare against`);
+        }
+        const wanted = Number(fromVersion ?? 0);
+        const prior = wanted > 0
+            ? versions.find((v) => Number(v.version) === wanted)
+            : versions.reduce((a, b) => (Number(a.version) > Number(b.version) ? a : b));
+        if (!prior) return req.reject(404, `version ${wanted} not found for '${row.passportId}'`);
+
+        // Both documents must be comparable AT ALL: same vault (the circuit
+        // reads both anchors from one contract), same schema, distinct hashes,
+        // and both openings still stored.
+        if (String(prior.contractAddress ?? '').toLowerCase() !== String(row.contractAddress ?? '').toLowerCase()) {
+            return req.reject(409, `version ${prior.version} of '${row.passportId}' is anchored on a different vault ` +
+                '(a vault redeploy sits between the two versions); only versions on the same vault can be compared');
+        }
+        if (!prior.contentSaltSeed || !prior.contentRoot || !prior.contentSchemaId) {
+            return req.reject(409, `version ${prior.version} of '${row.passportId}' predates the salted-leaf release ` +
+                '(no stored opening), so its content root can no longer be rebuilt');
+        }
+        if (!row.contentSaltSeed || !row.contentRoot) {
+            return req.reject(409, `the current version of '${row.passportId}' has no stored opening; re-anchor it first`);
+        }
+        if (String(prior.contentSchemaId).toLowerCase() !== String(row.contentSchemaId ?? '').toLowerCase()) {
+            return req.reject(409, 'the two versions were anchored under DIFFERENT provable-field schemas; ' +
+                're-anchor the older one under the current layout before comparing');
+        }
+        if (String(prior.payloadHash).toLowerCase() === String(row.payloadHash).toLowerCase()) {
+            return req.reject(400, 'both versions carry the same payload hash; a document cannot be compared with itself');
+        }
+
+        // Rebuild document A from its archived payload + stored seed, and
+        // check it against the root that was actually anchored back then.
+        let treeA;
+        try {
+            // LargeBinary arrives as Buffer, base64 string OR a stream,
+            // depending on the database adapter (same trap the diligence
+            // download hit), so it goes through the shared normalizer.
+            const cipherA = await toBuffer(prior.payloadCipher);
+            if (!cipherA?.length) throw new Error('archived payload cipher is empty');
+            const payloadA = JSON.parse(decryptPayload(cipherA, String(row.passportId)));
+            treeA = await buildContentRoot(provableValuesFromPayload(payloadA), { saltSeed: prior.contentSaltSeed });
+        } catch (e: any) {
+            return req.reject(409, `version ${prior.version} of '${row.passportId}' cannot be reopened: ${String(e?.message ?? e)}`);
+        }
+        if (treeA.contentRoot.toLowerCase() !== String(prior.contentRoot).toLowerCase()) {
+            return req.reject(409, `the stored opening of version ${prior.version} does not reproduce its anchored ` +
+                'content root, so it cannot serve as proof material');
+        }
+        const { tree: treeB } = await this.contentTreeFor(row.ID);
+        if (treeB.contentRoot.toLowerCase() !== String(row.contentRoot).toLowerCase()) {
+            return req.reject(409, `the current values of '${row.passportId}' no longer produce its anchored content ` +
+                'root (drift); re-anchor before proving version integrity');
+        }
+
+        // Off-chain pre-flight of the very statement the circuit will check.
+        const broken = firstUnmaskedDifference(treeA.opening.slots, treeB.opening.slots, mask);
+        if (broken) {
+            return req.reject(400, `'${broken}' changed between version ${prior.version} and the current version, ` +
+                `but the mask does not allow it (${describeMask(mask)})`);
+        }
+
+        // The complementary LOWER bound. The mask says what may change, k says
+        // how much did change; a periodic measurement update needs both to be
+        // checkable ("specification untouched" alone is also true of a
+        // re-timestamp that measured nothing).
+        const changedSlots = countChangedSlots(treeA.opening.slots, treeB.opening.slots);
+        const k = Math.max(0, Math.trunc(Number(minChangedSlots ?? 0)));
+        if (k > SLOT_COUNT) return req.reject(400, `minChangedSlots must be at most ${SLOT_COUNT}`);
+        if (k > changedSlots) {
+            return req.reject(400, `only ${changedSlots} slot(s) differ between version ${prior.version} and the ` +
+                `current version, so "at least ${k} changed" cannot be proven` +
+                (changedSlots === 0 ? ' (this re-anchor changed no provable value at all)' : ''));
+        }
+
+        const session = await this.effectiveSession(sessionId, walletId);
+        const contractAddress = this.contractAddress() ?? row.contractAddress;
+        const claim = `versus version ${prior.version}: ${describeMask(mask)}`
+            + (k > 0 ? `, and at least ${k} slot(s) did change` : '');
+        const base = {
+            fromVersion: Number(prior.version), allowedMask: mask,
+            allowedFields: JSON.stringify(fieldsFromMask(mask)),
+            minChangedSlots: k, changedSlots, claim,
+            payloadHashA: String(prior.payloadHash), payloadHashB: String(row.payloadHash)
+        };
+        const logRowBase = {
+            passport_ID: row.ID, sourceField: '', threshold: null, unit: null,
+            payloadHash: String(prior.payloadHash), payloadHashB: String(row.payloadHash)
+        };
+        const integrityRow = { ...logRowBase, predicate: 'documentIntegrity', allowedMask: mask };
+        // The diff claim's k rides in `allowedMask`: same column, different
+        // predicate, and the claim kinds never share a row. Keeps the log
+        // narrow instead of growing a column per cross-root variant.
+        const changeRow = { ...logRowBase, predicate: 'documentDiff', allowedMask: k };
+        if (!session || !contractAddress) {
+            await this.runDetached(async () => {
+                await INSERT.into(PredicateProofLog).entries([
+                    { ...integrityRow, status: 'offline' },
+                    ...(k > 0 ? [{ ...changeRow, status: 'offline' }] : [])
+                ] as any);
+            });
+            return { mode: 'offline', proofLogId: '', changeProofLogId: '', ...base };
+        }
+
+        const proofLogId = cds.utils.uuid();
+        const changeProofLogId = k > 0 ? cds.utils.uuid() : '';
+        await this.runDetached(async () => {
+            await INSERT.into(PredicateProofLog).entries([
+                { ID: proofLogId, ...integrityRow, status: 'pending' },
+                ...(k > 0 ? [{ ID: changeProofLogId, ...changeRow, status: 'pending' }] : [])
+            ] as any);
+        });
+        const sponsorSessionId = await this.sponsorSessionIdFor(String(session), sponsorWalletId);
+        // Both roots are already anchored, so no contentRootA/B rides along:
+        // anchoring is insert-once and a re-anchor of the same root is at best
+        // a no-op tx.
+        const shared = {
+            schema: JSON.parse(JSON.stringify(treeA.schema)),
+            openingA: treeA.opening,
+            openingB: treeB.opening,
+            payloadHashB: String(row.payloadHash)
+        };
+        const claims = [
+            { predicate: 'documentIntegrity', allowedMask: mask, ...shared },
+            ...(k > 0 ? [{ predicate: 'documentDiff', k, ...shared }] : [])
+        ];
+        const args = {
+            // Document A is the batch's payloadHash; every claim names B itself.
+            payloadHash: String(prior.payloadHash),
+            claimsJson: JSON.stringify(claims),
+            sessionId: session, contractAddress, compiledArtifactRef: CONTRACT_REF,
+            ...(sponsorSessionId ? { sponsorSessionId } : {})
+        };
+        const user = req.user;
+        const rows = [
+            { logId: proofLogId, kind: 'documentIntegrity' as const, bound: mask },
+            ...(k > 0 ? [{ logId: changeProofLogId, kind: 'documentDiff' as const, bound: k }] : [])
+        ];
+        (req as any).on('succeeded', () => {
+            void detachedFromRequest(() => this.runIntegrityDetached(rows, String(row.ID), args, user, {
+                contractAddress, payloadHashA: String(prior.payloadHash), payloadHashB: String(row.payloadHash)
+            })).catch((e: unknown) =>
+                cds.log('producer').error(`detached integrity runner crashed for ${row.passportId}:`, e));
+        });
+        return { mode: 'proving', proofLogId, changeProofLogId, ...base };
+    };
+
+    /**
+     * The long-running leg of proveVersionIntegrity: one or two cross-root
+     * proofs in ONE transaction (upper bound, and the optional lower bound).
+     * The cross-root circuit is the vault's largest (38.5 MB of prover key),
+     * so this is the slowest proof in the system and a second claim doubles
+     * the proving time even though it shares the transaction; a proof server
+     * beats in-process wasm noticeably here.
+     */
+    private async runIntegrityDetached(
+        rows: Array<{ logId: string; kind: 'documentIntegrity' | 'documentDiff'; bound: number }>,
+        passportRowId: string,
+        args: Record<string, unknown> & { sessionId: string; contractAddress: string },
+        user: unknown,
+        pair: { contractAddress: string; payloadHashA: string; payloadHashB: string }
+    ): Promise<void> {
+        const log = cds.log('producer');
+        const logIds = rows.map((r) => r.logId);
+        try {
+            const nightgate = await cds.connect.to('NightgateService');
+            const prewarmJob = this.serverPrewarmJobs.get(args.sessionId);
+            if (prewarmJob) {
+                this.serverPrewarmJobs.delete(args.sessionId);
+                await waitForJobResult(nightgate, prewarmJob, args.sessionId, user);
+            }
+            let res: any = null;
+            const jobResult: any = await runChainStep('integrity proof', async () => {
+                // The batch action carries both cross-root kinds, so the pair
+                // of claims shares one balancing round, one submit and one fee.
+                res = await sendDetached(nightgate, 'issueFieldPredicateAttestationBatch', args, user);
+                // The cross-root circuit is the vault's largest (38.5 MB prover
+                // key). In-process wasm proving plus submit plus confirmation
+                // ran past the 10 minute default here, and the wait timing out
+                // is NOT the proof failing: the transaction landed anyway
+                // (measured live, tx 7698bd13…). Give it a real budget, and
+                // treat a timeout as "unknown", never as "failed" (see below).
+                return waitForJobResult(nightgate, res.jobId, args.sessionId, user, {
+                    requireChainSuccess: true, timeoutMs: 40 * 60_000
+                });
+            });
+            const txHash = String(jobResult?.proof?.proofValue ?? jobResult?.txHash ?? '');
+            // Per-claim attestation ids from the batch response, joined by
+            // claim kind (cross-root claims carry no fieldKey, so the field
+            // claim join key does not apply here).
+            const idByKind = new Map<string, string>();
+            const collect = (c: any) => {
+                const kind = String(c?.predicate ?? c?.claim?.predicate ?? '');
+                if (kind && c?.predicateAttestationId) idByKind.set(kind, String(c.predicateAttestationId));
+            };
+            try { for (const c of JSON.parse(String(res?.claims ?? '[]'))) collect(c); } catch { /* job result below */ }
+            for (const c of (Array.isArray(jobResult?.claims) ? jobResult.claims : [])) collect(c);
+            await this.runDetached(async () => {
+                for (const r of rows) {
+                    await UPDATE.entity(PredicateProofLog).set({
+                        status: 'succeeded', result: true, txHash,
+                        predicateAttestationId: idByKind.get(r.kind) ?? ''
+                    }).where({ ID: r.logId });
+                }
+                await INSERT.into(PassportTransactions).entries({
+                    passport_ID: passportRowId, kind: 'provePredicate', jobId: res.jobId, txHash,
+                    status: 'succeeded', explorerUrl: txExplorerUrl(txHash)
+                } as any);
+            });
+            log.info(`version transition proven (${rows.map((r) => r.kind).join('+')}) for ${logIds.join(',')}: ${txHash}`);
+        } catch (e) {
+            // A version that changed outside the mask also lands here (the
+            // circuit rejects at local proving; nothing was submitted).
+            const msg = String((e as Error)?.message ?? e).slice(0, 500);
+            // ... but so does a wait that simply ran out while the proof was
+            // still being proven or confirmed. Marking that 'failed' would lie
+            // red about a claim that IS on-chain, so ask the ledger PER CLAIM
+            // before writing the verdict: each claim key is fully determined by
+            // the two payload hashes plus its own bound. Asking per claim also
+            // covers the ledger's PARTIAL_SUCCESS case, where one of the two
+            // landed and the other did not.
+            const verdicts = await Promise.all(rows.map((r) =>
+                verifyCrossRootState({
+                    contractAddress: pair.contractAddress,
+                    payloadHashA: pair.payloadHashA,
+                    payloadHashB: pair.payloadHashB,
+                    kind: r.kind,
+                    bound: r.bound
+                }).catch(() => 'unknown' as const)));
+            const proven = rows.filter((_, i) => verdicts[i] === 'confirmed');
+            const open = rows.filter((_, i) => verdicts[i] !== 'confirmed');
+            if (proven.length) {
+                log.warn(`version transition wait ended for ${logIds.join(',')} (${msg.slice(0, 80)}), ` +
+                    `but ${proven.length} of ${rows.length} claim(s) verify on-chain; recording those as proven`);
+                await this.runDetached(async () => {
+                    for (const r of proven) {
+                        await UPDATE.entity(PredicateProofLog).set({ status: 'succeeded', result: true })
+                            .where({ ID: r.logId });
+                    }
+                });
+            }
+            if (!open.length) return;
+            log.warn(`version transition proof failed for ${open.map((r) => r.logId).join(',')}:`, e);
+            await this.runDetached(async () => {
+                for (const r of open) {
+                    await UPDATE.entity(PredicateProofLog).set({ status: 'failed', result: false }).where({ ID: r.logId });
+                }
+                await INSERT.into(PassportTransactions).entries({
+                    passport_ID: passportRowId, kind: 'provePredicate', status: 'failed', errorMessage: msg
+                } as any);
+            });
+        }
+    }
+
     /** Claim key -> predicateAttestationId from the batch action response
-     *  (res.claims, JSON string) or the job result (claims array). */
+     *  (res.claims, JSON string) or the job result (claims array). Both sides
+     *  of the join key through proof-plan's responseClaimKey. */
     private batchClaimIdsByKey(res: any, jobResult: any): Map<string, string> {
         const out = new Map<string, string>();
         const add = (c: any) => {
-            const pred = c?.predicate ?? c?.claim?.predicate;
-            const thr = c?.threshold ?? c?.claim?.threshold;
-            if (c?.predicateAttestationId && c?.fieldKey && pred != null && thr != null) {
-                out.set(`${String(c.fieldKey).toLowerCase()}|${thr}|${pred}`, String(c.predicateAttestationId));
-            }
+            if (!c?.predicateAttestationId) return;
+            const key = responseClaimKey({
+                fieldKey: c?.fieldKey,
+                predicate: c?.predicate ?? c?.claim?.predicate,
+                threshold: c?.threshold ?? c?.claim?.threshold,
+                setRoot: c?.setRoot ?? c?.claim?.setRoot
+            });
+            if (key) out.set(key, String(c.predicateAttestationId));
         };
         try { for (const c of JSON.parse(String(res?.claims ?? '[]'))) add(c); } catch { /* job result below */ }
         for (const c of (Array.isArray(jobResult?.claims) ? jobResult.claims : [])) add(c);
@@ -1894,9 +2529,19 @@ export default class ProducerService extends cds.ApplicationService {
                 .columns('createdAt').where({ passport_ID: row.ID, kind: 'attest', status: 'succeeded' })
                 .orderBy('createdAt desc' as any);
             archivedVersion = maxVersion + 1;
+            // Read the outgoing version's content-tree coordinates HERE rather
+            // than trusting the caller's column list: the salt seed is what
+            // keeps this version usable in a cross-root comparison later. Lose
+            // it on archive and the version can still be verified as anchored,
+            // but never compared against its successor again.
+            const live: any = await SELECT.one.from(Passports)
+                .columns('contentRoot', 'contentSchemaId', 'contentSaltSeed').where({ ID: row.ID });
             await INSERT.into(PassportAnchorVersions).entries({
                 passport_ID: row.ID, version: archivedVersion,
                 payloadHash: row.payloadHash, payloadCipher: row.payloadCipher,
+                contentRoot: live?.contentRoot ?? null,
+                contentSchemaId: live?.contentSchemaId ?? null,
+                contentSaltSeed: live?.contentSaltSeed ?? null,
                 contractAddress: row.contractAddress, anchorNetwork: row.anchorNetwork,
                 attestationTxHash: row.attestationTxHash,
                 anchoredAt: lastAttest?.createdAt ?? null, reason: why

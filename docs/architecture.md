@@ -111,8 +111,53 @@ database state (projection v2, `srv/lib/passport-payload.ts`: versioned
 current anchor as a `PassportAnchorVersions` row (including its cipher), and
 runs the standard anchor flow: attest of the new hash, `bindPassport` RE-BIND
 of the same passportIdHash (the vault explicitly allows same-owner rebinding),
-and a fresh content root, batched in one transaction. The re-anchor must run
-with the same wallet that holds the current binding.
+and a fresh content root. It takes TWO transactions: `attest` alone, then
+`anchorContentRoot` + `bindPassport` together. `attest` records an attestation
+SEQUENCE since NIGHTGATE 0.16.0, which updates a shared ledger cell, and the
+ledger's sequencing check rejects a batch whose cell update is followed by a
+later intent on populated contract state (measured: the first two three-call
+batches on a fresh vault land, every later one fails 1010/188, isolated retry
+included). The re-anchor must run with the same wallet that holds the current
+binding.
+
+**Version transitions (NIGHTGATE 0.16.0 cross-root proofs).** A re-anchor alone
+does not say WHAT changed: each version carries its own payload hash and its
+own salted content root, so from outside the two anchors look unrelated.
+`ProducerService.proveVersionIntegrity` closes that gap with
+`proveDocumentComparison`, which witnesses both versions' openings plus the
+shared schema, recomputes both content roots in-circuit and asserts them
+against the anchors. Values stay hidden; every statement is per-slot
+"changed / unchanged", never a value.
+
+Two complementary bounds, provable in ONE transaction:
+
+| Bound | Mode | Statement |
+|---|---|---|
+| Upper (`allowedFieldsJson`) | integrity | nothing outside the named fields changed; the empty list is the strongest form, "no provable field changed at all" |
+| Lower (`minChangedSlots`, k) | diff | at least k of the 16 slots DID change |
+
+Alone, each is weak. The upper bound is also satisfied by a re-anchor that
+measured nothing; the lower bound is satisfied by noise. Together they pin a
+transition from both sides, which is what the regulation's "keep the dynamic
+data current" duty needs: **the specification is untouched AND the measured
+values really moved**, so a genuine re-measurement is distinguishable from a
+re-timestamp of unchanged numbers. That is why the measured fields
+(`CapacityFade`, `RemainingCapacity`,
+`NumberOfFullChargingAndDischargingCycles`) sit in the provable panel at all.
+
+Anyone re-checks both crawler-free and without a wallet:
+`PassportService.verifyVersionIntegrityOnChain(passportId, payloadHashA,
+payloadHashB, allowedMask)` and
+`verifyVersionChangeOnChain(passportId, payloadHashA, payloadHashB,
+minChangedSlots)`.
+
+Honest limits: k counts slots, not magnitudes, so a change in the third
+decimal counts like a halving; and under the circuit's absence policy a field
+present in one version and absent in the other counts as changed, so the
+lower bound is only meaningful together with the upper bound that fixes which
+slots may move at all. Both proofs need BOTH versions' openings, so only a
+party holding both documents can prove; the counterparty verifies the
+statement, not the data.
 
 Old versions stay verifiable forever: the vault never forgets an attested
 hash. `PassportService.anchorHistory` lists all versions,
@@ -183,25 +228,59 @@ A reveal-or-hide credential cannot prove "the value is below the limit" without
 showing the value. NIGHTPASS proves exactly that, and binds the proven value to the
 passport's actual field so a verifier knows it came from this passport.
 
-- At attest time the producer builds a Merkle tree over the passport's provable
-  fields, each leaf `persistentHash(fieldKey, scaledValue)`, and anchors its root
-  with `anchorContentRoot`. The off-chain tree is built with the contract's
-  exported `pureCircuits` (`leafHash` / `nodeHash`), so it hashes identically to
-  the circuit. Builder: `srv/lib/passport-anchor.ts` (`buildContentRoot`,
-  `PROVABLE_FIELDS`).
+- At attest time the producer builds a depth-4 Merkle tree over the passport's
+  provable fields and anchors its root plus a SCHEMA ID with
+  `anchorContentRoot(payloadHash, contentRoot, schemaId)`. The schema id is the
+  root over the 16 slot descriptors (field key, kind, scale); it binds how a
+  slot is to be read, so the same leaf value under a different scale is a
+  different schema and cannot be compared across versions.
+- Leaves are SALTED (NIGHTGATE 0.16.0): each leaf carries
+  `slotSalt(seed, slotIndex)` from a per-version 32-byte seed, absent slots
+  included. That matters here because inclusion paths are handed to the
+  browser: a sibling on the leaf level is a neighbouring field's leaf hash,
+  whose field key is publicly derivable and whose value domain is small, so
+  unsalted leaves were guessable. The seed is the anchor's OPENING: it is
+  stored server-side (`Passports.contentSaltSeed`, archived per version),
+  excluded from every service projection, and never published. Losing it makes
+  the anchored root unprovable; publishing it undoes the salting.
+- The off-chain tree is built with the contract's exported `pureCircuits`
+  (`leafHash` / `bytesLeafHash` / `absentLeafHash` / `nodeHash` /
+  `descriptorLeafHash` / `slotSalt`), so root and schema id are byte-identical
+  to the in-circuit recompute. Builder: `srv/lib/passport-anchor.ts`
+  (`buildContentRoot`, `PROVABLE_FIELDS`), pinned against NIGHTGATE's own
+  document-proof builder by a parity test.
 - `proveFieldPredicate(payloadHash, fieldKey, threshold, op)` recomputes the field
   leaf from witnessed value plus inclusion path, folds it to a root, asserts the
   root equals the anchored content root, then asserts the predicate. The tx only
   lands if both hold, so a successful tx is the proof. The value stays a witness.
-- Claims batch: up to 8 predicate proofs in ONE transaction (browser
-  `proveFieldPredicateBatch`, one approval; server `provePassportValuesBatch`;
-  both share one pure claim plan). A false predicate aborts the batch at local
-  proving, nothing lands; after submit every claim is verified individually.
+- Set membership on STRING fields (NIGHTGATE 0.15.0): a hidden value is proven
+  to be ONE of a public allow-list of up to 64 values without revealing which.
+  String leaves enter the content tree as `bytesLeafHash(fieldKey,
+  blake2b256(exact string))`; `proveFieldMembership(payloadHash, fieldKey,
+  setRoot)` folds the witnessed digest into BOTH the anchored content root and
+  the canonical allow-list tree (digest, dedupe, sort, pad to 64 with the last
+  member, `setLeafHash` leaves, depth 6). The allow-list itself is published
+  with the claim, so any verifier recomputes the set root from the list alone.
+  Named lists live in `srv/lib/claim-sets.ts` (flagship: cell chemistry in the
+  recognized-chemistries list; chemistry is legitimate-interest tier, so the
+  claim discloses membership, never the chemistry). Local root builder:
+  `srv/lib/membership-set.ts`, pinned to the platform implementation by a
+  golden-vector test.
+- Cross-root claims relate TWO anchored versions instead of one field:
+  version integrity (see section 2) and, available from the platform but not
+  yet surfaced here, distinctness ("at least k of the 16 slots differ", the
+  "provably not the same document" claim).
+- Claims batch: up to 8 claims in ONE transaction, numeric and membership
+  kinds mixed freely (browser `proveFieldPredicateBatch`, one approval; server
+  `provePassportValuesBatch`; both share one pure claim plan). A false claim
+  aborts the batch at local proving, nothing lands; after submit every claim
+  is verified individually.
 
 Provable fields cover carbon footprint, capacity, recycled content (overall and
-per material for cobalt / lithium / nickel), cycle life, round-trip efficiency, and
-lead content. Each pairs with a regulatory or buyer-relevant bound (for example
-recycled cobalt at least the Article 8 minimum).
+per material for cobalt / lithium / nickel), cycle life, round-trip efficiency,
+lead content, and cell chemistry (membership). Each numeric field pairs with a
+regulatory or buyer-relevant bound (for example recycled cobalt at least the
+Article 8 minimum).
 
 Honest limitation: the content root corresponds to the payload hash because the
 same attester builds both from the same canonical content at anchor time. A fully
@@ -268,6 +347,6 @@ offline path (hash, encrypt, persist, QR, local log rows) still runs.
 
 - Services: `ProducerService` (`/api/v1/producer`), `PassportService` (`/api/v1/passport`), `NightgateService` (`/api/v1/nightgate`).
 - Contract: one `attestation-vault` (plugin-shipped): tiered disclosure, passport binding, numeric predicate, and field-bound predicate.
-- Crypto: blake2b-256 integrity hash, AES-256-GCM + HKDF-SHA256 payload encryption, persistentHash Merkle content root, ZK-proof authorization.
+- Crypto: blake2b-256 integrity hash, AES-256-GCM + HKDF-SHA256 payload encryption, salted Merkle content root (the contract's transient hash), ZK-proof authorization.
 - UI: producer cockpit (with in-app Lace wallet flow), consumer viewer (three tiers), QR resolver at `/p/:passportId`.
 - Chain: Midnight (preprod): public metadata, hash, binding, content root, disclosure and predicate results only.

@@ -2,17 +2,27 @@
  * The confidential battery values a demo visitor can prove, and the rules for
  * a valid claim (pure, unit-tested).
  *
- * Each entry is one battery column the demo writes into the passport and can
- * then prove a predicate over. The value itself stays confidential: it lives
- * in the encrypted payload and in the Merkle content root, never in the public
- * explorer row. Only the predicate ("at most 4000", "at least 2000") becomes
- * public, bound to that field of that passport.
+ * Two claim kinds:
+ *   - numeric: one battery column the demo writes into the passport and then
+ *     proves a predicate over ("at most 4000", "at least 2000"). Direction is
+ *     per field and not a visitor choice: for a footprint, lower is the good
+ *     claim; for capacity, cycle life and efficiency, higher is.
+ *   - membership: a string column (cell chemistry) whose hidden value is
+ *     proven to be ONE of a published allow-list, without revealing which.
+ *     The visitor picks the value from the list itself, so the claim is true
+ *     by construction (a false claim would abort the whole batch at local
+ *     proving).
  *
- * Direction is per field and not a visitor choice: for a footprint, lower is
- * the good claim; for capacity, cycle life and efficiency, higher is.
+ * The value itself stays confidential either way: it lives in the encrypted
+ * payload and in the Merkle content root, never in the public explorer row.
+ * Only the claim (predicate + threshold, or membership + allow-list) becomes
+ * public, bound to that field of that passport.
  */
 
+import { claimSetById, type ClaimSet } from './claim-sets';
+
 export interface ClaimField {
+    kind?: 'numeric';
     /** Battery column, must be in passport-anchor's BATTERY_PROVABLE_FIELDS. */
     field: string;
     label: string;
@@ -26,7 +36,20 @@ export interface ClaimField {
     defaultThreshold: number;
 }
 
-export const CLAIM_FIELDS: readonly ClaimField[] = [
+export interface MembershipClaimField {
+    kind: 'membership';
+    /** Battery column, must be in passport-anchor's STRING_PROVABLE_FIELDS. */
+    field: string;
+    label: string;
+    /** Named allow-list from claim-sets.ts; the picker options ARE the set. */
+    setId: string;
+    /** The visitor's default pick (must be a member). */
+    defaultValue: string;
+}
+
+export type DemoClaimField = ClaimField | MembershipClaimField;
+
+export const CLAIM_FIELDS: readonly DemoClaimField[] = [
     {
         field: 'carbonFootprintKgCO2', label: 'Carbon footprint', unit: 'kg CO2e',
         predicate: 'lessOrEqual', min: 1, max: 100000, defaultValue: 3500, defaultThreshold: 4000,
@@ -43,6 +66,10 @@ export const CLAIM_FIELDS: readonly ClaimField[] = [
         field: 'recycledContentPct', label: 'Recycled content', unit: '%',
         predicate: 'greaterOrEqual', min: 0, max: 100, defaultValue: 16, defaultThreshold: 10,
     },
+    {
+        kind: 'membership', field: 'cellChemistry', label: 'Cell chemistry',
+        setId: 'chemistry-known', defaultValue: 'Li-ion NMC',
+    },
 ] as const;
 
 /** The one claim every run proves; visitors add the rest. */
@@ -51,29 +78,46 @@ export const PRIMARY_CLAIM_FIELD = 'carbonFootprintKgCO2';
 /** How many claims one run may prove. They ride in ONE transaction. */
 export const MAX_DEMO_CLAIMS = CLAIM_FIELDS.length;
 
-export interface DemoClaim {
-    field: string;
-    /** Confidential value written into the passport. */
-    value: number;
-    /** Public threshold the predicate is proven against. */
-    threshold: number;
-}
+export type DemoClaim =
+    | {
+        field: string;
+        /** Confidential numeric value written into the passport. */
+        value: number;
+        /** Public threshold the predicate is proven against. */
+        threshold: number;
+    }
+    | {
+        field: string;
+        /** Confidential string value (a member of the field's allow-list). */
+        member: string;
+    };
 
-export function claimFieldByName(field: string): ClaimField | undefined {
+export function claimFieldByName(field: string): DemoClaimField | undefined {
     return CLAIM_FIELDS.find((c) => c.field === field);
 }
 
-/** Whether a claim actually holds. A false one aborts during local proving. */
+/** The allow-list behind a membership claim field. */
+export function membershipSetFor(spec: MembershipClaimField): ClaimSet | undefined {
+    return claimSetById(spec.setId);
+}
+
+/** Whether a numeric claim actually holds. A false one aborts during local proving. */
 export function claimHolds(spec: ClaimField, value: number, threshold: number): boolean {
     return spec.predicate === 'lessOrEqual' ? value <= threshold : value >= threshold;
 }
 
 /** A claim resolved to everything the prove action needs. */
-export interface ResolvedClaim extends DemoClaim {
-    predicate: 'lessOrEqual' | 'greaterOrEqual';
-    unit: string;
-    label: string;
-}
+export type ResolvedClaim =
+    | {
+        field: string; value: number; threshold: number;
+        predicate: 'lessOrEqual' | 'greaterOrEqual';
+        unit: string; label: string;
+    }
+    | {
+        field: string; member: string;
+        predicate: 'setMembership';
+        setId: string; setLabel: string; label: string;
+    };
 
 /**
  * The full claim list of one run: the carbon footprint (always proven, built
@@ -90,27 +134,42 @@ export function demoClaimList(input: {
     for (const c of input.extraClaims ?? []) {
         if (c.field !== PRIMARY_CLAIM_FIELD) byField.set(c.field, c);
     }
-    return CLAIM_FIELDS.filter((spec) => byField.has(spec.field)).map((spec) => {
-        const c = byField.get(spec.field)!;
-        return {
-            ...c, predicate: spec.predicate, unit: spec.unit, label: spec.label,
-        };
-    });
+    const out: ResolvedClaim[] = [];
+    for (const spec of CLAIM_FIELDS) {
+        const c = byField.get(spec.field);
+        if (!c) continue;
+        if (spec.kind === 'membership') {
+            if (!('member' in c)) continue;
+            const set = membershipSetFor(spec);
+            out.push({
+                field: spec.field, member: c.member, predicate: 'setMembership',
+                setId: spec.setId, setLabel: set?.label ?? spec.setId, label: spec.label,
+            });
+        } else if ('value' in c) {
+            out.push({
+                field: spec.field, value: c.value, threshold: c.threshold,
+                predicate: spec.predicate, unit: spec.unit, label: spec.label,
+            });
+        }
+    }
+    return out;
 }
 
 /**
  * The battery row the demo writes: every claimed field carries the visitor's
  * confidential value, unclaimed ones keep their demo default so the passport
- * stays a plausible battery either way.
+ * stays a plausible battery either way. The chemistry is ALWAYS emitted (the
+ * membership leaf must be populated for the field to be provable).
  */
 export function demoBatteryValues(input: {
     co2Kg: number; extraClaims?: DemoClaim[];
-}): Record<string, number> {
-    const out: Record<string, number> = {};
+}): Record<string, number | string> {
+    const out: Record<string, number | string> = {};
     for (const spec of CLAIM_FIELDS) out[spec.field] = spec.defaultValue;
     out[PRIMARY_CLAIM_FIELD] = input.co2Kg;
     for (const c of input.extraClaims ?? []) {
-        if (claimFieldByName(c.field)) out[c.field] = c.value;
+        if (!claimFieldByName(c.field)) continue;
+        out[c.field] = 'member' in c ? c.member : c.value;
     }
     return out;
 }
@@ -123,9 +182,10 @@ export interface ClaimValidation {
 
 /**
  * Validate the visitor's claim list: known fields only, no duplicates, values
- * and thresholds in range, and every claim TRUE.
+ * and thresholds in range (numeric) or a member of the allow-list
+ * (membership), and every claim TRUE.
  *
- * The truth requirement is not pedantry. A false predicate fails during LOCAL
+ * The truth requirement is not pedantry. A false claim fails during LOCAL
  * proving, before anything is submitted, so the whole batch aborts and the
  * visitor sees a failure with nothing on chain. Rejecting it up front explains
  * the problem instead.
@@ -147,6 +207,17 @@ export function validateClaims(raw: unknown): ClaimValidation {
         if (!spec) { errors.push(`unknown claim field '${field}'`); continue; }
         if (seen.has(field)) { errors.push(`duplicate claim for '${field}'`); continue; }
         seen.add(field);
+
+        if (spec.kind === 'membership') {
+            const member = String(e.member ?? '').trim();
+            const set = membershipSetFor(spec);
+            if (!member || !set || !set.values.includes(member)) {
+                errors.push(`${field}: '${member}' is not in the ${set?.label ?? spec.setId} list`);
+                continue;
+            }
+            claims.push({ field, member });
+            continue;
+        }
 
         const value = Number(e.value);
         const threshold = Number(e.threshold);

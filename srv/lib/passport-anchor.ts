@@ -1,9 +1,19 @@
 import cds from '@sap/cds';
-import { anchorCallPlan } from './anchor-plan';
-import { blake2b } from '@noble/hashes/blake2b';
-import { bytesToHex } from '@noble/hashes/utils';
-import { createCipheriv, hkdfSync, randomBytes } from 'node:crypto';
+import { anchorTxPlan } from './anchor-plan';
+import { randomBytes } from 'node:crypto';
 import { AsyncResource } from 'node:async_hooks';
+import { sortKeys, canonicalize, blake2b256Hex, hashPayload } from '@odatano/dpp-sdk/hash';
+import {
+    BATTERY_PROVABLE_FIELDS, RECYCLED_MATERIAL_FIELDS, DYNAMIC_PROVABLE_FIELDS,
+    BATTERY_STRING_FIELDS, STRING_PROVABLE_FIELDS, PROVABLE_FIELDS, provableFieldKind,
+    VALUE_SCALE, scaleValue, fieldKeyHex, fromHex32, toHex
+} from '@odatano/dpp-sdk/fields';
+import { MERKLE_DEPTH, LEAF_COUNT, buildTree, proofFor as merkleProofFor } from '@odatano/dpp-sdk/merkle';
+import {
+    encryptPayload as sdkEncryptPayload,
+    decryptPayload as sdkDecryptPayload,
+    masterKeyFromHex
+} from '@odatano/dpp-sdk/cipher';
 
 const detachedRequestScope = new AsyncResource('nightpass.detached-service-call');
 
@@ -117,34 +127,9 @@ export function passportSources(): Record<string, string> {
 }
 
 // --- Canonical JSON + hashing ------------------------------------------------
-
-/** Recursively sort object keys so the same logical payload always hashes equal. */
-export function sortKeys(value: unknown): unknown {
-    if (Array.isArray(value)) return value.map(sortKeys);
-    if (value && typeof value === 'object') {
-        return Object.fromEntries(
-            Object.keys(value as Record<string, unknown>).sort()
-                .map(k => [k, sortKeys((value as Record<string, unknown>)[k])])
-        );
-    }
-    return value;
-}
-
-/** Deterministic canonical JSON string of a payload. */
-export function canonicalize(value: unknown): string {
-    return JSON.stringify(sortKeys(value));
-}
-
-/** blake2b-256 hex of a UTF-8 string (the on-chain hashing scheme). */
-export function blake2b256Hex(input: string): string {
-    return bytesToHex(blake2b(Buffer.from(input, 'utf8'), { dkLen: 32 }));
-}
-
-/** Canonicalize + hash a payload object → { canonicalPayload, payloadHash }. */
-export function hashPayload(payload: unknown): { canonicalPayload: string; payloadHash: string } {
-    const canonicalPayload = canonicalize(payload);
-    return { canonicalPayload, payloadHash: blake2b256Hex(canonicalPayload) };
-}
+// Extracted to @odatano/dpp-sdk (shared with DAYPASS); re-exported so the
+// historical import surface stays stable.
+export { sortKeys, canonicalize, blake2b256Hex, hashPayload };
 
 // --- Content-root Merkle tree (field-bound predicate hardening) --------------
 //
@@ -160,48 +145,37 @@ export function hashPayload(payload: unknown): { canonicalPayload: string; paylo
 // a fixed empty leaf. Values are scaled ×1000 (milli-units) to match the
 // Uint<64> predicate encoding used by provePassportValue.
 
-/** Provable scalar fields read directly from the (first) Battery. */
-export const BATTERY_PROVABLE_FIELDS = [
-    'carbonFootprintKgCO2', 'capacityKwh', 'recycledContentPct',
-    'cycleLife', 'roundTripEfficiencyPct', 'leadContentPpm'
-] as const;
-
-/** Per-material recycled-content fields, sourced from RecycledMaterials rows.
- * Field key convention: `recycled<Material>Pct` (material code Co|Li|Ni|Pb). */
-export const RECYCLED_MATERIAL_FIELDS = ['recycledCoPct', 'recycledLiPct', 'recycledNiPct'] as const;
-
-/** Ordered, versioned provable-field registry. Leaf index = position here.
- * Adding a field changes the content root, so passports must be re-anchored
- * (re-attested) for the new field to become provable. */
-export const PROVABLE_FIELDS = [...BATTERY_PROVABLE_FIELDS, ...RECYCLED_MATERIAL_FIELDS] as const;
-export const MERKLE_DEPTH = 4;
-const LEAF_COUNT = 1 << MERKLE_DEPTH; // 16
-export const VALUE_SCALE = 1000;
-const EMPTY_LEAF_KEY = 'nightpass/content-root/empty-leaf/v1';
-
-function fromHex32(hex: string): Uint8Array {
-    const clean = hex.replace(/^0x/, '');
-    const out = new Uint8Array(32);
-    for (let i = 0; i < 32; i++) out[i] = parseInt(clean.substr(i * 2, 2), 16);
-    return out;
-}
-function toHex(u8: Uint8Array): string {
-    return Buffer.from(u8).toString('hex');
-}
-
-/** Canonical 32-byte field id for a provable field name (public label hash). */
-export function fieldKeyHex(fieldName: string): string {
-    return blake2b256Hex(fieldName);
-}
-
-/** Scale a raw numeric field value to the Uint<64> integer the circuit compares. */
-export function scaleValue(raw: number | string): number {
-    return Math.round(Number(raw) * VALUE_SCALE);
-}
+// The provable-field registry, scaling and hex helpers are extracted to
+// @odatano/dpp-sdk (shared with DAYPASS: same 13-slot panel vocabulary,
+// same x1000 scaling, same field-key derivation). Changing the registry
+// changes the content root AND the schema id, so passports must be
+// re-anchored for a new layout; extend it in ONE batch with a re-anchor
+// round, never field by field.
+export {
+    BATTERY_PROVABLE_FIELDS, RECYCLED_MATERIAL_FIELDS, DYNAMIC_PROVABLE_FIELDS,
+    BATTERY_STRING_FIELDS, STRING_PROVABLE_FIELDS, PROVABLE_FIELDS, provableFieldKind,
+    VALUE_SCALE, scaleValue, fieldKeyHex, fromHex32, toHex, MERKLE_DEPTH
+};
+const HEX32_RE = /^[0-9a-fA-F]{64}$/;
 
 // Memoized dynamic import of the ESM-only compiled contract (from CJS code).
-let _pureCircuitsPromise: Promise<{ leafHash: (k: Uint8Array, v: bigint) => Uint8Array; nodeHash: (l: Uint8Array, r: Uint8Array) => Uint8Array }> | null = null;
-async function loadPureCircuits() {
+// Signatures follow the 0.16.0 artifact (v4 salted leaves): every content-tree
+// leaf takes a per-slot salt, and the descriptor/salt/empty-key circuits back
+// the schema id. Keep this interface in sync with the artifact's PureCircuits
+// type: it is a hand-written cast, so a future arity change compiles here and
+// only fails at run time (as the 0.15 -> 0.16 change did).
+export interface VaultPureCircuits {
+    leafHash: (k: Uint8Array, v: bigint, salt: Uint8Array) => Uint8Array;
+    nodeHash: (l: Uint8Array, r: Uint8Array) => Uint8Array;
+    bytesLeafHash: (k: Uint8Array, valueDigest: Uint8Array, salt: Uint8Array) => Uint8Array;
+    absentLeafHash: (k: Uint8Array, salt: Uint8Array) => Uint8Array;
+    setLeafHash: (valueDigest: Uint8Array) => Uint8Array;
+    descriptorLeafHash: (k: Uint8Array, kind: bigint, scale: bigint) => Uint8Array;
+    slotSalt: (seed: Uint8Array, index: bigint) => Uint8Array;
+    emptyLeafKey: () => Uint8Array;
+}
+let _pureCircuitsPromise: Promise<VaultPureCircuits> | null = null;
+export async function loadPureCircuits(): Promise<VaultPureCircuits> {
     if (!_pureCircuitsPromise) {
         _pureCircuitsPromise = import('@odatano/nightgate/browser/attestation-vault')
             .then((m: any) => m.pureCircuits);
@@ -209,73 +183,191 @@ async function loadPureCircuits() {
     return _pureCircuitsPromise;
 }
 
-export interface FieldMerkleProof {
-    fieldKey: string;   // 64-hex canonical field id
-    value: string;      // decimal string of the scaled Uint<64> value
-    siblings: string[]; // MERKLE_DEPTH × 64-hex
-    dirs: boolean[];     // MERKLE_DEPTH booleans (true = node is LEFT child)
+export type FieldMerkleProof =
+    | {
+        kind: 'numeric';
+        fieldKey: string;   // 64-hex canonical field id
+        value: string;      // decimal string of the scaled Uint<64> value
+        salt: string;       // 64-hex per-slot salt (v4; every proof circuit needs it)
+        siblings: string[]; // MERKLE_DEPTH × 64-hex
+        dirs: boolean[];    // MERKLE_DEPTH booleans (true = node is LEFT child)
+    }
+    | {
+        kind: 'string';
+        fieldKey: string;      // 64-hex canonical field id
+        valueDigest: string;   // 64-hex blake2b-256 of the EXACT string value
+        salt: string;          // 64-hex per-slot salt (v4)
+        siblings: string[];    // MERKLE_DEPTH × 64-hex
+        dirs: boolean[];       // MERKLE_DEPTH booleans (true = node is LEFT child)
+    };
+
+/** One slot of the shared schema (kind: 0 = uint, 1 = bytes, 2 = padding). */
+export interface SchemaDescriptor {
+    fieldKey: string;
+    kind: 0 | 1 | 2;
+    scale: string;
+}
+
+/** One document's opening of one slot (witness material). */
+export interface SlotOpening {
+    present: boolean;
+    /** Decimal string of the scaled Uint<64> value (uint slots). */
+    value?: string;
+    /** 64-hex blake2b-256 of the exact string (bytes slots). */
+    valueDigest?: string;
+}
+
+/**
+ * A version's full cross-root opening. WITNESS MATERIAL: `saltSeed` is the
+ * commitment opening of every leaf. Store it with the anchor (losing it makes
+ * the anchored root unprovable), never publish it (leaking it makes the shared
+ * leaf hashes dictionary-testable again, which is exactly what v4 fixed).
+ */
+export interface DocumentOpening {
+    saltSeed: string;
+    slots: SlotOpening[];
 }
 
 export interface ContentRoot {
-    contentRoot: string; // 64-hex Merkle root
+    contentRoot: string; // 64-hex salted Merkle root
+    /** Depth-4 root over the 16 slot DESCRIPTORS; anchored next to the root and proven in-circuit. */
+    schemaId: string;
+    /** The seed this tree was built from (64-hex). Persist it with the anchor. */
+    saltSeed: string;
+    /** The descriptor list behind `schemaId` (public). */
+    schema: SchemaDescriptor[];
+    /** Cross-root witness bundle for proveDocumentComparison. */
+    opening: DocumentOpening;
     /** Inclusion proof for a provable field, or null if the field is not provable. */
     proofFor(fieldName: string): FieldMerkleProof | null;
 }
 
 /**
+ * The ordered slot descriptors of the provable-field registry: numeric fields
+ * are uint slots at VALUE_SCALE, string fields are bytes slots, and the tail
+ * of the 16-slot tree is canonical padding (the contract's own empty-leaf key,
+ * kind 2, scale 0). Mirrors NIGHTGATE's computeSchemaDescriptors; the padding
+ * shape is asserted IN-CIRCUIT by proveDocumentComparison, so it is not ours
+ * to choose.
+ */
+export function schemaDescriptors(pc: VaultPureCircuits): SchemaDescriptor[] {
+    const emptyKey = toHex(pc.emptyLeafKey());
+    const out: SchemaDescriptor[] = [];
+    for (let i = 0; i < LEAF_COUNT; i++) {
+        const fieldName = PROVABLE_FIELDS[i];
+        if (fieldName == null) out.push({ fieldKey: emptyKey, kind: 2, scale: '0' });
+        else if (provableFieldKind(fieldName) === 'string') out.push({ fieldKey: fieldKeyHex(fieldName), kind: 1, scale: '0' });
+        else out.push({ fieldKey: fieldKeyHex(fieldName), kind: 0, scale: String(VALUE_SCALE) });
+    }
+    return out;
+}
+
+/** Fold the descriptor list into the schema id (depth-4 root). */
+function foldSchemaId(pc: VaultPureCircuits, schema: SchemaDescriptor[]): string {
+    const leaves = schema.map(d => pc.descriptorLeafHash(fromHex32(d.fieldKey), BigInt(d.kind), BigInt(d.scale)));
+    return buildTree(leaves, pc.nodeHash).rootHex;
+}
+
+/**
+ * The schema id of the CURRENT provable-field registry. Deterministic: it
+ * changes only when PROVABLE_FIELDS changes (which already forces a re-anchor).
+ */
+export async function contentSchemaId(): Promise<string> {
+    const pc = await loadPureCircuits();
+    return foldSchemaId(pc, schemaDescriptors(pc));
+}
+
+/** Fresh 32-byte salt seed (64-hex). One per anchored version. */
+export function newSaltSeed(): string {
+    return randomBytes(32).toString('hex');
+}
+
+/**
  * Build the content-root Merkle tree from a field → raw-value map (raw values
  * are scaled ×1000 internally). Only PROVABLE_FIELDS are placed; a field absent
- * from `values` still occupies its leaf as the empty leaf. Returns the root plus
- * a `proofFor(fieldName)` that yields the inclusion path.
+ * from `values` occupies its slot as the SALTED absent leaf. Returns root,
+ * schema id, opening and a `proofFor(fieldName)` that yields the inclusion path.
+ *
+ * v4 (NIGHTGATE 0.16.0): every leaf carries a per-slot salt derived from
+ * `saltSeed` via the artifact's `slotSalt` circuit. Two consequences the
+ * callers must honour:
+ *   - re-building the tree for a PROOF requires the SAME seed the anchor used
+ *     (a fresh seed yields a different root and every claim aborts at local
+ *     proving), so the seed is persisted with the passport/version;
+ *   - the salts remove the dictionary attack on shared leaf hashes: the
+ *     inclusion path we hand to the browser exposes sibling leaves, whose
+ *     field keys are public and whose value domains are small.
  */
-export async function buildContentRoot(values: Record<string, number | string | null | undefined>): Promise<ContentRoot> {
+export async function buildContentRoot(
+    values: Record<string, number | string | null | undefined>,
+    opts: { saltSeed?: string | null } = {}
+): Promise<ContentRoot> {
     const pc = await loadPureCircuits();
-    const emptyLeaf = pc.leafHash(fromHex32(fieldKeyHex(EMPTY_LEAF_KEY)), 0n);
+    const schema = schemaDescriptors(pc);
+    const saltSeedHex = opts.saltSeed && HEX32_RE.test(String(opts.saltSeed))
+        ? String(opts.saltSeed).toLowerCase()
+        : newSaltSeed();
+    const seed = fromHex32(saltSeedHex);
 
-    // Leaf layer (index 0..15).
+    // Leaf layer (index 0..15), salted per slot.
     const leaves: Uint8Array[] = [];
+    const salts: Uint8Array[] = [];
+    const slots: SlotOpening[] = [];
     for (let i = 0; i < LEAF_COUNT; i++) {
+        const salt = pc.slotSalt(seed, BigInt(i));
+        salts.push(salt);
         const fieldName = PROVABLE_FIELDS[i];
         const raw = fieldName != null ? values[fieldName] : undefined;
         if (fieldName != null && raw != null && raw !== '') {
-            leaves.push(pc.leafHash(fromHex32(fieldKeyHex(fieldName)), BigInt(scaleValue(raw))));
+            if (provableFieldKind(fieldName) === 'string') {
+                const digest = blake2b256Hex(String(raw));
+                slots.push({ present: true, valueDigest: digest });
+                leaves.push(pc.bytesLeafHash(fromHex32(fieldKeyHex(fieldName)), fromHex32(digest), salt));
+            } else {
+                const n = Number(raw);
+                if (!Number.isFinite(n)) throw new Error(`field '${fieldName}' value is not numeric`);
+                const scaled = BigInt(scaleValue(raw));
+                slots.push({ present: true, value: String(scaled) });
+                leaves.push(pc.leafHash(fromHex32(fieldKeyHex(fieldName)), scaled, salt));
+            }
         } else {
-            leaves.push(emptyLeaf);
+            slots.push({ present: false });
+            leaves.push(pc.absentLeafHash(fromHex32(schema[i].fieldKey), salt));
         }
     }
 
-    // Build all levels bottom-up so proofFor can read siblings per level.
-    const levels: Uint8Array[][] = [leaves];
-    for (let d = 0; d < MERKLE_DEPTH; d++) {
-        const prev = levels[d];
-        const next: Uint8Array[] = [];
-        for (let i = 0; i < prev.length; i += 2) {
-            next.push(pc.nodeHash(prev[i], prev[i + 1]));
-        }
-        levels.push(next);
-    }
-    const contentRoot = toHex(levels[MERKLE_DEPTH][0]);
+    // Build all levels bottom-up (shared SDK walk) so proofFor can read
+    // siblings per level.
+    const { levels, rootHex: contentRoot } = buildTree(leaves, pc.nodeHash);
 
     return {
         contentRoot,
+        schemaId: foldSchemaId(pc, schema),
+        saltSeed: saltSeedHex,
+        schema,
+        opening: { saltSeed: saltSeedHex, slots },
         proofFor(fieldName: string): FieldMerkleProof | null {
             const idx = PROVABLE_FIELDS.indexOf(fieldName as typeof PROVABLE_FIELDS[number]);
             if (idx < 0) return null;
             const raw = values[fieldName];
             if (raw == null || raw === '') return null;
-            const siblings: string[] = [];
-            const dirs: boolean[] = [];
-            let node = idx;
-            for (let d = 0; d < MERKLE_DEPTH; d++) {
-                const isLeft = node % 2 === 0;
-                const siblingIdx = isLeft ? node + 1 : node - 1;
-                siblings.push(toHex(levels[d][siblingIdx]));
-                dirs.push(isLeft); // true => current node is the LEFT child
-                node = Math.floor(node / 2);
+            const { siblings, dirs } = merkleProofFor(levels, idx);
+            const salt = toHex(salts[idx]);
+            if (provableFieldKind(fieldName) === 'string') {
+                return {
+                    kind: 'string',
+                    fieldKey: fieldKeyHex(fieldName),
+                    valueDigest: blake2b256Hex(String(raw)),
+                    salt,
+                    siblings,
+                    dirs
+                };
             }
             return {
+                kind: 'numeric',
                 fieldKey: fieldKeyHex(fieldName),
                 value: String(scaleValue(raw)),
+                salt,
                 siblings,
                 dirs
             };
@@ -300,7 +392,7 @@ export function encryptionMasterKey(): Buffer {
             'ENCRYPTION_KEY must be 32 bytes of hex (64 characters); refusing to encrypt passport payloads '
             + 'with a default key. Generate one with: openssl rand -hex 32');
     }
-    return Buffer.from(hex, 'hex');
+    return masterKeyFromHex(hex);
 }
 
 /** Boot-time guard so a misconfigured deployment fails loudly, not silently. */
@@ -314,15 +406,22 @@ export function assertEncryptionKey(): void {
  * iv(12) || authTag(16) || ciphertext, as a Buffer for the LargeBinary column.
  */
 export function encryptPayload(plaintext: string, passportId: string): Buffer {
-    const master = encryptionMasterKey();
-    const key = Buffer.from(
-        hkdfSync('sha256', master, Buffer.from(passportId, 'utf8'), Buffer.from('passport-payload'), 32)
-    );
-    const iv = randomBytes(12);
-    const cipher = createCipheriv('aes-256-gcm', key, iv);
-    const ct = Buffer.concat([cipher.update(Buffer.from(plaintext, 'utf8')), cipher.final()]);
-    const tag = cipher.getAuthTag();
-    return Buffer.concat([iv, tag, ct]);
+    return sdkEncryptPayload(plaintext, passportId, encryptionMasterKey());
+}
+
+/**
+ * Inverse of `encryptPayload`. Needed to reconstruct an ARCHIVED anchor
+ * version's field values: the current rows only hold today's values, while a
+ * cross-root comparison witnesses the OPENING of both versions. The archived
+ * canonical payload is the only place the older values survive, so version
+ * integrity is provable exactly as long as this cipher can be opened.
+ *
+ * Throws on a wrong key or tampered bytes (AES-GCM authenticates), which is
+ * the honest outcome: a version whose payload cannot be opened cannot take
+ * part in a comparison either.
+ */
+export function decryptPayload(cipher: Buffer | Uint8Array, passportId: string): string {
+    return sdkDecryptPayload(cipher, passportId, encryptionMasterKey());
 }
 
 // --- NIGHTGATE job polling ---------------------------------------------------
@@ -457,16 +556,24 @@ export async function runChainStep<T>(kind: string, fn: () => Promise<T>): Promi
         catch (e) {
             lastErr = e;
             const msg = String((e as Error)?.message ?? e);
-            // Retryable: ONLY 1014 (pool rejected the tx outright, wallet dust
-            // state settling) and sqlite write contention (a facade-persist of
-            // the multi-MB dust blob can hold the write lock past the busy
-            // timeout). Both are provably pre-mempool, so a retry can never
-            // double-anchor. Upstream HTTP 4xx is deliberately NOT retried:
-            // the 'Received status code 4xx' string is the GraphQL client's
-            // generic error for EVERY indexer call, including reads that
-            // happen AFTER the node accepted the tx; retrying on it could
-            // rebuild and resubmit a tx that is already in the mempool.
-            if (!/\b1014\b|database is locked/i.test(msg)) break;
+            // Retryable, and only these:
+            //   1014      the pool rejected the tx outright (wallet dust state
+            //             settling),
+            //   1010/170  InvalidDustSpendProof: the dust note this tx spends
+            //             moved between build and submit. Hit reliably on the
+            //             SECOND transaction of the split anchor, which is
+            //             built right after the first one spent dust. A retry
+            //             rebuilds against fresh dust state.
+            //   sqlite write contention (a facade-persist of the multi-MB dust
+            //             blob can hold the write lock past the busy timeout).
+            // All three are provably pre-mempool, so a retry can never
+            // double-anchor. Deliberately NOT retried: 1010/188 (the ledger's
+            // sequencing check) is deterministic for a given batch shape, so
+            // retrying only burns proving time; and upstream HTTP 4xx, whose
+            // 'Received status code 4xx' string is the GraphQL client's generic
+            // error for EVERY indexer call, including reads AFTER the node
+            // accepted the tx, so retrying could resubmit a landed tx.
+            if (!/\b1014\b|\b1010\/170\b|database is locked/i.test(msg)) break;
             cds.log('producer').warn(`${kind} hit a retryable error (${msg.slice(0, 60)}), retrying...`);
         }
     }
@@ -493,6 +600,13 @@ export interface AnchorOpts {
      * with `buildContentRoot(...)`. Omit to skip the anchor step.
      */
     contentRoot?: string;
+    /**
+     * Schema id of that root (`buildContentRoot(...).schemaId`). Required
+     * whenever `contentRoot` is set: `anchorContentRoot` takes it as its third
+     * argument since NIGHTGATE 0.16.0 and the cross-root comparison circuit
+     * proves it describes the tree.
+     */
+    schemaId?: string;
     /**
      * The CAP user the NIGHTGATE calls run as (usually the original req.user).
      * Required with detached sends: NIGHTGATE binds wallet sessions to the
@@ -554,36 +668,53 @@ function orderedBatchAvailable(): boolean {
  * the same jobId/txHash.
  */
 export async function anchorPassport(nightgate: cds.Service, opts: AnchorOpts): Promise<{ attestationTxHash: string }> {
-    const { payloadHash, passportId, passportIdHash, contractAddress, sessionId, contentRoot, user, sponsorSessionId, onStep } = opts;
+    const { payloadHash, passportId, passportIdHash, contractAddress, sessionId, contentRoot, schemaId, user, sponsorSessionId, onStep } = opts;
     const sponsored = sponsorSessionId ? { sponsorSessionId } : {};
+    if (contentRoot && !schemaId) {
+        throw new Error('anchorPassport: schemaId is required alongside contentRoot (anchorContentRoot takes it since 0.16.0)');
+    }
 
     if (orderedBatchAvailable()) {
-        // Full anchor as ONE batched transaction (attest -> bind -> root in
-        // guaranteed apply order). The call list comes from the shared plan
-        // (srv/lib/anchor-plan.ts), the same source the browser connector's
+        // The anchor as the shared plan groups it: attest in its own tx, then
+        // the rest as ONE batch (see anchor-plan.ts for why attest can no
+        // longer share a transaction). Same source the browser connector's
         // anchorBatch consumes, so the two submit paths cannot drift.
-        const calls = anchorCallPlan({
+        const txPlan = anchorTxPlan({
             payloadHash,
             metadataHash: blake2b256Hex(`passport://${passportId}`),
             passportIdHash,
-            ...(contentRoot ? { contentRoot } : {})
+            ...(contentRoot ? { contentRoot, schemaId } : {})
         });
-        let jobId = '';
-        const txHash = await runChainStep(calls.map(c => c.circuit).join('+'), async () => {
-            const batch: any = await sendDetached(nightgate, 'submitContractCallBatch', {
-                contractAddress,
-                compiledArtifactRef: CONTRACT_REF,
-                sessionId,
-                calls: JSON.stringify(calls),
-                ...sponsored
-            }, user);
-            jobId = String(batch.jobId ?? '');
-            return waitForJob(nightgate, batch.jobId, sessionId, user);
-        });
-        for (const c of calls) {
-            await onStep?.({ kind: c.circuit as AnchorStep['kind'], jobId, txHash });
+        let attestationTxHash = '';
+        for (const tx of txPlan) {
+            let jobId = '';
+            const txHash = await runChainStep(tx.label, async () => {
+                const single = tx.calls.length === 1 ? tx.calls[0] : null;
+                const res: any = single
+                    ? await sendDetached(nightgate, 'submitContractCall', {
+                        contractAddress,
+                        circuit: single.circuit,
+                        compiledArtifactRef: CONTRACT_REF,
+                        sessionId,
+                        args: JSON.stringify(single.args),
+                        ...sponsored
+                    }, user)
+                    : await sendDetached(nightgate, 'submitContractCallBatch', {
+                        contractAddress,
+                        compiledArtifactRef: CONTRACT_REF,
+                        sessionId,
+                        calls: JSON.stringify(tx.calls),
+                        ...sponsored
+                    }, user);
+                jobId = String(res.jobId ?? '');
+                return waitForJob(nightgate, res.jobId, sessionId, user);
+            });
+            if (!attestationTxHash) attestationTxHash = txHash;
+            for (const c of tx.calls) {
+                await onStep?.({ kind: c.circuit as AnchorStep['kind'], jobId, txHash });
+            }
         }
-        return { attestationTxHash: txHash };
+        return { attestationTxHash };
     }
 
     let attestJobId = '';
@@ -613,9 +744,11 @@ export async function anchorPassport(nightgate: cds.Service, opts: AnchorOpts): 
                 contractAddress,
                 compiledArtifactRef: CONTRACT_REF,
                 sessionId,
+                // Insert-only anchorContentRoot first, the cell-UPDATING
+                // bindPassport last (same sequencing rule as anchorCallPlan).
                 calls: JSON.stringify([
-                    { circuit: 'bindPassport',      args: [passportIdHash, payloadHash] },
-                    { circuit: 'anchorContentRoot', args: [payloadHash, contentRoot] }
+                    { circuit: 'anchorContentRoot', args: [payloadHash, contentRoot, schemaId] },
+                    { circuit: 'bindPassport',      args: [passportIdHash, payloadHash] }
                 ]),
                 ...sponsored
             }, user);
@@ -650,7 +783,7 @@ export async function anchorPassport(nightgate: cds.Service, opts: AnchorOpts): 
                 circuit:             'anchorContentRoot',
                 compiledArtifactRef: CONTRACT_REF,
                 sessionId,
-                args:                JSON.stringify([payloadHash, contentRoot]),
+                args:                JSON.stringify([payloadHash, contentRoot, schemaId]),
                 ...sponsored
             }, user);
             rootJobId = String(root.jobId ?? '');

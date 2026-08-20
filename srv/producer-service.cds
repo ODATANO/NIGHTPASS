@@ -23,7 +23,11 @@ service ProducerService {
     entity Passports            as
         projection on passport.Passports
         excluding {
-            payloadCipher
+            payloadCipher,
+            // Salt seed = the content tree's opening. The cockpit never needs
+            // it (the server rebuilds proofs), so it stays out of the OData
+            // surface entirely, like the payload cipher.
+            contentSaltSeed
         };
 
     entity Batteries            as projection on passport.Batteries;
@@ -42,7 +46,8 @@ service ProducerService {
     entity PassportAnchorVersions   as
         projection on passport.PassportAnchorVersions
         excluding {
-            payloadCipher
+            payloadCipher,
+            contentSaltSeed          // witness material, see Passports above
         };
 
     // Registered dataspace partners (recyclers / authorities) for the grant picker.
@@ -199,8 +204,55 @@ service ProducerService {
         found        : Boolean;
         fieldKey     : String;
         contentRoot  : String;
+        // Schema id anchored next to the root, and the slot's salt. Both are
+        // required circuit/witness inputs since the salted-leaf release: the
+        // proof cannot be built without the salt, and anchoring a root cannot
+        // happen without its schema id.
+        schemaId     : String;
+        fieldSalt    : String;
         siblingsJson : String;
         dirsJson     : String;
+        // The anchored content root differs from the freshly built tree (the
+        // provable-field layout changed since the anchor): every claim would
+        // fail at local proving until a re-anchor. Additive field.
+        rootDrift    : Boolean;
+    };
+
+    /**
+     * Everything the browser wallet lane needs for ONE set-membership claim
+     * (proveFieldMembership): the string field's content-root inclusion proof
+     * in DIGEST form (the raw value never leaves the server response), the
+     * canonical set root of the named allow-list, and the depth-6 set
+     * inclusion path. `member:false` = the passport's value is not in the
+     * set (refuse before any wallet popup); `rootDrift:true` = the anchored
+     * content root predates the current provable-field layout (re-anchor
+     * before proving).
+     */
+    function passportMembershipProof(passportId: String,
+                                     sourceField: String,
+                                     setId: String)                      returns {
+        found           : Boolean;
+        member          : Boolean;
+        rootDrift       : Boolean;
+        fieldKey        : String;
+        fieldDigest     : String; // blake2b-256 of the exact string value (witness)
+        contentRoot     : String;
+        schemaId        : String; // anchored next to the root (0.16.0)
+        fieldSalt       : String; // per-slot salt of this field's leaf (witness)
+        siblingsJson    : String;
+        dirsJson        : String;
+        setId           : String;
+        setLabel        : String;
+        setRoot         : String;
+        memberCount     : Integer;
+        setSiblingsJson : String;
+        setDirsJson     : String;
+    };
+
+    /** The named allow-list catalog for membership claims (public by design:
+     *  verifiers recompute the set root from the published values). */
+    function claimSetCatalog()                                           returns {
+        setsJson : LargeString; // JSON array of { id, label, sourceField, memberCount, values }
     };
 
     /**
@@ -459,6 +511,22 @@ service ProducerService {
     };
 
     /**
+     * Record a wallet-driven (in-app Lace) set-membership proof: logs a
+     * PredicateProofLog row (predicate 'setMembership', setRoot instead of a
+     * threshold) + PassportTransactions row. The value stays hidden.
+     */
+    action   recordWalletMembership(passportId: String,
+                                    sourceField: String,
+                                    setId: String,
+                                    setRoot: String, // 64-hex canonical allow-list root
+                                    txHash: String,
+                                    result: Boolean)                     returns {
+        ok     : Boolean;
+        txHash : String;
+        status : String; // pending until the tx is verified on-chain (then succeeded/failed)
+    };
+
+    /**
      * Grant a disclosure level (0=public, 1=recycler, 2=authority) to a grantee.
      * With a signing session the chain call runs DETACHED: the action returns
      * `mode: 'granting'` immediately with the pending DisclosureGrantLog row id;
@@ -513,11 +581,16 @@ service ProducerService {
     };
 
     /**
-     * Proof cart, server lane: prove N field-bound predicates on ONE passport
+     * Proof cart, server lane: prove N field-bound claims on ONE passport
      * in ONE transaction (NIGHTGATE issueFieldPredicateAttestationBatch,
-     * plugin >= 0.12.0). `claimsJson` is a JSON array of
-     * `{ sourceField, predicate, threshold, unit? }` with the RAW human
-     * threshold (scaled x1000 server-side, same as provePassportValue).
+     * plugin >= 0.15.0 for mixed kinds). `claimsJson` is a JSON array of
+     *   `{ sourceField, predicate: 'lessOrEqual'|'greaterOrEqual', threshold, unit? }`
+     * with the RAW human threshold (scaled x1000 server-side, same as
+     * provePassportValue), or
+     *   `{ sourceField, predicate: 'setMembership', setId }`
+     * for a set-membership claim against a named allow-list from the
+     * claimSetCatalog (the hidden value must be a member; a non-member is a
+     * 400 before any proving).
      * Exact duplicates are dropped (claim keys are idempotent on-chain, the
      * drop only saves proving time). Max 8 claims per cart (7 when the
      * content root still has to be anchored in-batch).
@@ -537,5 +610,56 @@ service ProducerService {
         mode        : String; // 'proving' | 'offline'
         proofLogIds : LargeString; // JSON array of PredicateProofLog row ids to poll
         dropped     : Integer; // duplicate claims removed from the cart
+    };
+
+    /**
+     * Version integrity: prove that the CURRENT anchored version differs from
+     * an ARCHIVED one only in the fields named by `allowedFieldsJson` (a JSON
+     * array of provable field names; omit or `[]` to claim that no provable
+     * field changed at all). Values stay hidden; the proof states per slot
+     * "changed / unchanged", nothing more.
+     *
+     * This is the claim a re-anchor otherwise leaves open. Each version has its
+     * own payload hash and its own salted content root, so two anchors of the
+     * same passport look unrelated from outside: an observer cannot tell a
+     * telemetry append from a quiet rewrite of the carbon footprint. The
+     * cross-root circuit recomputes both roots from the witnessed openings,
+     * asserts them against the anchors and compares slot by slot.
+     *
+     * Requirements, all checked before any proving: both versions anchored on
+     * the SAME vault under the same schema id, both openings (salt seeds)
+     * still stored, and both rebuilt roots equal to what was anchored. A field
+     * that changed outside the mask is a 400 naming the field, not a doomed
+     * proving run.
+     *
+     * `minChangedSlots` (k) adds the COMPLEMENTARY claim in the same batch and
+     * the same transaction: at least k of the 16 slots DO differ. The mask is
+     * an upper bound on change, k a lower bound; together they pin a version
+     * transition from both sides, which is what makes a periodic measurement
+     * update checkable ("the specification is untouched AND the measured
+     * values really moved", instead of a re-timestamp of unchanged numbers).
+     * Omit it or pass 0 for the integrity claim alone.
+     *
+     * `fromVersion` selects the archived version (default: the newest one).
+     */
+    action   proveVersionIntegrity(passportId: String,
+                                   fromVersion: Integer,      // optional: archived version, default newest
+                                   allowedFieldsJson: String, // optional: JSON array of field names
+                                   minChangedSlots: Integer,  // optional: k, adds the lower-bound claim
+                                   sessionId: UUID,
+                                   walletId: String,          // optional: which SERVER wallet signs
+                                   sponsorWalletId: String    // optional: pool member of PASSPORT_FEE_SPONSOR_WALLET
+    )                                                                    returns {
+        mode            : String; // 'proving' | 'offline'
+        proofLogId      : String; // integrity claim row
+        changeProofLogId: String; // lower-bound claim row ('' when k was not asked for)
+        fromVersion     : Integer;
+        allowedMask     : Integer;
+        allowedFields   : String; // JSON array, the human form of the mask
+        minChangedSlots : Integer; // 0 = no lower bound claimed
+        changedSlots    : Integer; // how many slots actually differ (off-chain count, for the operator)
+        claim           : String; // one-line description of what is being proven
+        payloadHashA    : String; // archived version (document A)
+        payloadHashB    : String; // current version (document B)
     };
 }

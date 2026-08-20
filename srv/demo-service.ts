@@ -3,7 +3,7 @@ import { randomBytes, createHash } from 'node:crypto';
 import { Testers, Runs } from '#cds-models/demo';
 import { Passports, PassportTransactions, PredicateProofLog } from '#cds-models/passport';
 import { validateDemoInput, validNickname } from './lib/demo-validation';
-import { demoClaimList, demoBatteryValues, CLAIM_FIELDS, PRIMARY_CLAIM_FIELD } from './lib/demo-claims';
+import { demoClaimList, demoBatteryValues, membershipSetFor, CLAIM_FIELDS, PRIMARY_CLAIM_FIELD } from './lib/demo-claims';
 import { feeSponsorWalletIds, producerWalletSecrets } from './lib/producer-wallets';
 import { encryptSecret, decryptSecret } from './lib/demo-crypto';
 import { sendDetached, waitForJobResult, detachedFromRequest, explorerTxUrl, blake2b256Hex } from './lib/passport-anchor';
@@ -368,11 +368,19 @@ export default class DemoService extends cds.ApplicationService {
     };
 
     /** Claim catalogue for the form (see demo-service.cds). Static, DB-free. */
-    private demoClaimFields = async () => CLAIM_FIELDS.map((c) => ({
-        field: c.field, label: c.label, unit: c.unit, predicate: c.predicate,
-        min: c.min, max: c.max, defaultValue: c.defaultValue, defaultThreshold: c.defaultThreshold,
-        primary: c.field === PRIMARY_CLAIM_FIELD
-    }));
+    private demoClaimFields = async () => CLAIM_FIELDS.map((c) => (c.kind === 'membership'
+        ? {
+            field: c.field, label: c.label, kind: 'membership',
+            setId: c.setId, setLabel: membershipSetFor(c)?.label ?? c.setId,
+            optionsJson: JSON.stringify(membershipSetFor(c)?.values ?? []),
+            defaultOption: c.defaultValue,
+            primary: false
+        }
+        : {
+            field: c.field, label: c.label, kind: 'numeric', unit: c.unit, predicate: c.predicate,
+            min: c.min, max: c.max, defaultValue: c.defaultValue, defaultThreshold: c.defaultThreshold,
+            primary: c.field === PRIMARY_CLAIM_FIELD
+        }));
 
     /**
      * Ops dust monitor: delegate to ProducerService (it owns the sponsor
@@ -607,7 +615,9 @@ export default class DemoService extends cds.ApplicationService {
                 performanceClass: input.performanceClass,
                 batteries: [{
                     serialNumber: `TRY-${randomBytes(4).toString('hex')}`,
-                    cellChemistry: 'Li-ion NMC',
+                    // cellChemistry comes from demoBatteryValues below (the
+                    // visitor's pick or the default; always populated so the
+                    // membership leaf is provable).
                     // Confidential values: whatever the visitor chose to claim,
                     // the rest demo defaults. None of these reach the public
                     // explorer row; only the proven predicates do.
@@ -638,9 +648,9 @@ export default class DemoService extends cds.ApplicationService {
             await setSteps(claims.map((c) => [proveKind(c.field), { status: 'running' }] as [string, Record<string, unknown>]));
             const prove: any = await producer.tx({ user }, (tx: any) => tx.send('provePassportValuesBatch', {
                 passportId,
-                claimsJson: JSON.stringify(claims.map((c) => ({
-                    sourceField: c.field, predicate: c.predicate, threshold: c.threshold, unit: c.unit
-                }))),
+                claimsJson: JSON.stringify(claims.map((c) => (c.predicate === 'setMembership'
+                    ? { sourceField: c.field, predicate: 'setMembership', setId: c.setId }
+                    : { sourceField: c.field, predicate: c.predicate, threshold: c.threshold, unit: c.unit }))),
                 sessionId,
                 ...(sponsorWalletId ? { sponsorWalletId } : {})
             }));
@@ -778,7 +788,9 @@ export default class DemoService extends cds.ApplicationService {
                         status: 'succeeded', txHash: t.txHash, explorerUrl: explorerTxUrl(t.txHash)
                     });
                     // The next pending anchor step is now the running one.
-                    const order = ['attest', 'bindPassport', 'anchorContentRoot'];
+                    // Order follows anchorTxPlan: attest in its own tx, then
+                    // anchorContentRoot + bindPassport together.
+                    const order = ['attest', 'anchorContentRoot', 'bindPassport'];
                     const next = order.find(k => !seen.has(k));
                     if (next) await setStep(next, { status: 'running' });
                 }

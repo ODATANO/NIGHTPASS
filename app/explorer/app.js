@@ -167,13 +167,19 @@ var API = "/api/v1/passport";
     leadContentPpm: "Lead content",
     recycledCoPct: "Recycled cobalt share",
     recycledLiPct: "Recycled lithium share",
-    recycledNiPct: "Recycled nickel share"
+    recycledNiPct: "Recycled nickel share",
+    cellChemistry: "Cell chemistry"
   };
 
   function claimLabel(field) {
     return CLAIM_FIELD_LABELS[field] || field;
   }
   function claimBound(claim) {
+    if (claim.predicate === "setMembership") {
+      // Membership: the hidden value is one of a PUBLISHED allow-list; the
+      // list rides in allowedValues so anyone can recompute the set root.
+      return "∈ " + esc(claim.setLabel || claim.setId || "allowed set");
+    }
     var op = claim.predicate === "greaterOrEqual" ? "≥" : "≤";
     var n = Number(claim.threshold);
     var num = isFinite(n) ? String(+n.toFixed(3)) : esc(String(claim.threshold));
@@ -552,10 +558,13 @@ var API = "/api/v1/passport";
           c.explorerUrl
             ? '<a href="' + esc(c.explorerUrl) + '" target="_blank" rel="noopener" class="mono" title="' + esc(c.txHash) + '">' + esc(shortHash(c.txHash)) + "</a>"
             : '<span class="mono" title="' + esc(c.txHash) + '">' + esc(shortHash(c.txHash)) + "</span>";
+        var boundTitle = c.predicate === "setMembership" && Array.isArray(c.allowedValues) && c.allowedValues.length
+          ? ' title="member of: ' + esc(c.allowedValues.join(", ")) + '"'
+          : "";
         return '<div class="claim">' +
           '<span class="claim-shield">' + shieldSvg() + "</span>" +
           '<span class="claim-field">' + esc(claimLabel(c.sourceField)) + "</span>" +
-          '<span class="claim-bound">' + claimBound(c) + "</span>" +
+          '<span class="claim-bound"' + boundTitle + ">" + claimBound(c) + "</span>" +
           '<span class="claim-proof">proven in ZK' + (tx ? " &middot; tx " + tx : "") + "</span>" +
           '<span class="claim-verify"><button class="btn verify-claim" data-ci="' + i + '"' + (canVerify ? "" : " disabled") + ">Verify</button> " +
             '<span class="vstate" id="cvs-' + i + '"></span></span>' +
@@ -565,6 +574,10 @@ var API = "/api/v1/passport";
 
   function verifyClaimUrl(pid, c) {
     var q = (s) => encodeURIComponent("'" + String(s).replace(/'/g, "''") + "'");
+    if (c.predicate === "setMembership") {
+      return API + "/verifyMembershipClaimOnChain(passportId=" + q(pid) +
+        ",sourceField=" + q(c.sourceField) + ",setRoot=" + q(c.setRoot) + ")";
+    }
     return API + "/verifyClaimOnChain(passportId=" + q(pid) +
       ",sourceField=" + q(c.sourceField) + ",predicate=" + q(c.predicate) +
       ",threshold=" + encodeURIComponent(String(c.threshold)) + ")";

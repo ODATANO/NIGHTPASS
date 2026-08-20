@@ -23,7 +23,11 @@ service PassportService {
     entity Passports         as
         projection on passport.Passports
         excluding {
-            payloadCipher
+            payloadCipher,
+            // Witness material, not a public anchor coordinate: the salt seed
+            // opens every content-tree leaf. Publishing it would undo the
+            // dictionary resistance the salted leaves buy us.
+            contentSaltSeed
         };
 
     @readonly
@@ -188,6 +192,87 @@ service PassportService {
     };
 
     /**
+     * Anonymous LIVE check of one proven ZK set-membership claim (sibling of
+     * verifyClaimOnChain, which keeps its deployed signature): does the vault
+     * record a true result for the claim key (payloadHash, field, setRoot)?
+     * `setRoot` is the canonical allow-list root exactly as
+     * `anchorExplorer().claims[]` serves it; any verifier can recompute it
+     * from the published `allowedValues`. Never the value itself.
+     */
+    function verifyMembershipClaimOnChain(passportId: String,
+                                          sourceField: String,
+                                          setRoot: String // 64-hex canonical allow-list root
+    )                                                returns {
+        passportId     : String;
+        sourceField    : String;
+        predicate      : String;  // always 'setMembership'
+        setRoot        : String;
+        verified       : Boolean; // live ledger read: claim key proven true in the vault
+        anchorNetwork  : String;
+        serverNetwork  : String;
+        checkedNetwork : String;  // network the live read actually ran on (null = read skipped)
+        checkedAt      : String;
+    };
+
+    /**
+     * Anonymous LIVE check of a proven VERSION INTEGRITY claim: does the vault
+     * record a true result for the cross-root claim key (payloadHashA,
+     * payloadHashB, allowedMask)?
+     *
+     * The statement it confirms: version B differs from version A only in the
+     * slots the mask frees, values never disclosed. A verifier needs nothing
+     * but the two public payload hashes and the mask, all of which the anchor
+     * history and the claim list already carry. Order matters: (A, B) is part
+     * of the claim key, so A must be the OLDER version.
+     */
+    function verifyVersionIntegrityOnChain(passportId: String,
+                                           payloadHashA: String, // 64-hex, older version
+                                           payloadHashB: String, // 64-hex, newer version
+                                           allowedMask: Integer  // packed 16-bit mask; 0 = nothing may differ
+    )                                                returns {
+        passportId     : String;
+        payloadHashA   : String;
+        payloadHashB   : String;
+        allowedMask    : Integer;
+        predicate      : String;  // always 'documentIntegrity'
+        verified       : Boolean; // live ledger read: claim key proven true in the vault
+        anchorNetwork  : String;
+        serverNetwork  : String;
+        checkedNetwork : String;  // network the live read actually ran on (null = read skipped)
+        checkedAt      : String;
+    };
+
+    /**
+     * Anonymous LIVE check of the COMPLEMENTARY claim: does the vault record
+     * that at least `minChangedSlots` of the 16 slots differ between the two
+     * versions? Where the integrity claim bounds change from above ("nothing
+     * outside the mask moved"), this bounds it from below ("something really
+     * moved"), which is what tells a genuine measurement update apart from a
+     * re-timestamp of unchanged numbers. Neither says WHICH slots or what
+     * values.
+     *
+     * Separate function rather than a parameter on the integrity check: CAP V4
+     * functions require every declared parameter in the URL, so adding one
+     * would break every deployed caller.
+     */
+    function verifyVersionChangeOnChain(passportId: String,
+                                        payloadHashA: String,    // 64-hex, older version
+                                        payloadHashB: String,    // 64-hex, newer version
+                                        minChangedSlots: Integer // k, 1..16
+    )                                                returns {
+        passportId      : String;
+        payloadHashA    : String;
+        payloadHashB    : String;
+        minChangedSlots : Integer;
+        predicate       : String;  // always 'documentDiff'
+        verified        : Boolean; // live ledger read: claim key proven true in the vault
+        anchorNetwork   : String;
+        serverNetwork   : String;
+        checkedNetwork  : String;  // network the live read actually ran on (null = read skipped)
+        checkedAt       : String;
+    };
+
+    /**
      * Public anchor explorer (showcase): every passport this demo issued and its
      * Midnight anchoring state, anchored rows first. Only Point-1 identity plus
      * the anchor metadata that is public by design (it lives on-chain and is
@@ -211,16 +296,23 @@ service PassportService {
         attestationTxHash : String;
         explorerUrl       : String;
         createdAt         : String;
-        // Successfully proven ZK predicate claims (public by design: the claim,
-        // threshold and proof tx; the underlying value stays confidential).
+        // Successfully proven ZK claims (public by design: the claim,
+        // threshold or allow-list and proof tx; the value stays confidential).
         claims            : array of {
-            sourceField : String;
-            predicate   : String;  // lessOrEqual | greaterOrEqual
-            threshold   : Decimal(14, 3); // RAW units (kg CO2e, kWh, %)
-            unit        : String;
-            txHash      : String;
-            explorerUrl : String;
-            provenAt    : String;
+            sourceField   : String;
+            predicate     : String;  // lessOrEqual | greaterOrEqual | setMembership
+            threshold     : Decimal(14, 3); // numeric kinds: RAW units (kg CO2e, kWh, %)
+            unit          : String;
+            // setMembership kinds: the canonical allow-list root, catalog id,
+            // display label and the published member values (verifiers
+            // recompute the root from the list alone).
+            setRoot       : String;
+            setId         : String;
+            setLabel      : String;
+            allowedValues : array of String;
+            txHash        : String;
+            explorerUrl   : String;
+            provenAt      : String;
         };
     };
 }

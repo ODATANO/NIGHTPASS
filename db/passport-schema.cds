@@ -45,7 +45,10 @@ type TxKind : String enum {
 type TxStatus : String enum { offline; pending; succeeded; failed; }
 
 type DisclosureOp : String enum { grant; revoke; }
-type PredicateOp  : String enum { lessOrEqual; greaterOrEqual; }
+// `documentIntegrity` is the cross-root kind: it relates TWO anchored versions
+// of the same passport instead of one field of one version, so it carries no
+// sourceField/threshold and reads payloadHashB + allowedMask instead.
+type PredicateOp  : String enum { lessOrEqual; greaterOrEqual; setMembership; documentIntegrity; }
 
 /** Dataspace partner role (Catena-X-style). Producers grant these tiers. */
 type PartnerRole : String enum { recycler; authority; }
@@ -93,6 +96,23 @@ entity Passports : cuid, managed {
     // `attest` circuit and bound to `passportId` via `bindPassport`.
     payloadHash       : String(64);          // hex, the on-chain attestationId
     passportIdHash    : String(64);          // hex blake2b-256(passportId); on-chain bindPassport key
+
+    // Content-root anchor (field-bound claims). `contentRoot` is the depth-4
+    // salted Merkle root over the provable fields, `contentSchemaId` the root
+    // over the 16 slot descriptors that `anchorContentRoot` pins next to it.
+    //
+    // `contentSaltSeed` is the OPENING of that tree (NIGHTGATE 0.16.0 salts
+    // every leaf with slotSalt(seed, slotIndex)). It is not decoration:
+    //   - lose it and the anchored root can never be rebuilt, so every future
+    //     claim on this passport fails at local proving;
+    //   - publish it and the shared leaf hashes we hand out with inclusion
+    //     paths become dictionary-testable again (small value domains).
+    // It therefore stays server-side: never in the publish payload, never in
+    // an explorer response, never in a log line.
+    contentRoot       : String(64);
+    contentSchemaId   : String(64);
+    contentSaltSeed   : String(64);
+
     contractAddress   : String(120);         // PassportAttestation deployment
     anchorNetwork     : String(20);          // Midnight network of the anchor (preview/preprod/mainnet)
     attestationTxHash : String(120);         // tx that anchored attest/bindPassport
@@ -249,6 +269,12 @@ entity PassportAnchorVersions : cuid, managed {
     payloadHash       : String(64);
     payloadCipher     : LargeBinary;         // canonical payload of THIS version, AES-encrypted
     contentRoot       : String(64);
+    // Schema id and salt seed of THIS version's content tree. Kept per version
+    // because a cross-root proof (documentIntegrity / documentDiff) witnesses
+    // BOTH versions' full openings: without the archived seed, version N-1 can
+    // never take part in a comparison again.
+    contentSchemaId   : String(64);
+    contentSaltSeed   : String(64);
     contractAddress   : String(120);
     anchorNetwork     : String(20);
     attestationTxHash : String(120);
@@ -307,4 +333,17 @@ entity PredicateProofLog : cuid, managed {
     // version's hash, not the row's current one. Null on rows from before the
     // re-anchoring feature; verification then falls back to probing versions.
     payloadHash            : String(64);
+    // Membership claims only (predicate = setMembership; threshold/unit stay
+    // null): the canonical allow-list Merkle root (on-chain claim-key
+    // component) and the named-set catalog id it was built from. The root is
+    // authoritative; the id is display/republish metadata.
+    setRoot                : String(64);
+    setId                  : String(60);
+    // Cross-root claims only (predicate = documentIntegrity): the SECOND
+    // document of the comparison and the 16-bit mask of slots that were
+    // allowed to differ. `payloadHash` above is document A (the older
+    // version), `payloadHashB` is document B; the (A, B) order is part of the
+    // on-chain claim key, so it is not interchangeable.
+    payloadHashB           : String(64);
+    allowedMask            : Integer;
 }

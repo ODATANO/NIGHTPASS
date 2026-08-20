@@ -56,6 +56,57 @@ export async function verifyAttestState(o: {
 }
 
 /**
+ * Three-way content-root state for the drift pre-flight: does the vault's
+ * anchored root for this payload match the given (freshly built) root?
+ *   - 'match'    the payload is attested and the anchored root equals ours
+ *   - 'mismatch' the payload is attested but the anchored root DIFFERS (the
+ *                provable-field layout changed since the anchor; every claim
+ *                would fail at local proving until a re-anchor)
+ *   - 'unknown'  not attested here, or no live provider (callers proceed and
+ *                let the circuit abort honestly)
+ * Deliberately separate from verifyAttestState: the settlement verdicts must
+ * never say failed on a negative read, but a drift pre-flight needs the
+ * negative signal.
+ */
+export async function attestRootState(o: {
+    contractAddress?: string | null;
+    payloadHash?: string | null;
+    contentRoot?: string | null;
+    /**
+     * Schema id of the provable-field layout (0.16.0). When given, a mismatch
+     * of the ANCHORED schema counts as drift too: the anchor then describes a
+     * different field panel than the one we just rebuilt, and every claim
+     * against it fails in-circuit. Skipped on a plugin without the parameter.
+     */
+    schemaId?: string | null;
+}): Promise<'match' | 'mismatch' | 'unknown'> {
+    const contractAddress = norm(o.contractAddress);
+    const payloadHash = norm(o.payloadHash);
+    const contentRoot = norm(o.contentRoot);
+    const schemaId = norm(o.schemaId);
+    if (!contractAddress || !payloadHash || !contentRoot) return 'unknown';
+    const wantsSchema = !!schemaId && !!(cds.model?.definitions?.['NightgateService.verifyAttestationState'] as any)?.params?.schemaId;
+    try {
+        const nightgate = await cds.connect.to('NightgateService');
+        const res: any = await nightgate.send('verifyAttestationState', {
+            contractAddress, payloadHash, contentRoot,
+            ...(wantsSchema ? { schemaId } : {}),
+            compiledArtifactRef: CONTRACT_REF
+        });
+        // With a contentRoot supplied, NIGHTGATE folds the root check into
+        // `verified` (verified = attested && contentRootOk), so the drift
+        // signal MUST branch on `attested` first: an attested payload whose
+        // anchored root differs is exactly the mismatch this reports.
+        if (res?.attested !== true) return 'unknown';
+        if (res?.contentRootOk === false) return 'mismatch';
+        if (wantsSchema && res?.schemaOk === false) return 'mismatch';
+        return 'match';
+    } catch {
+        return 'unknown';
+    }
+}
+
+/**
  * Confirm a disclosure grant/revoke effect. Reindexes `midnight.DisclosureGrants`
  * from live on-chain state (`reindexDisclosures`), then reads back whether the
  * grant for `(contractAddress, payloadHash, grantee)` is now active (grant) or
@@ -94,24 +145,77 @@ export async function verifyGrantState(o: {
 }
 
 /**
- * Confirm a field-bound predicate proof's effect crawler-free (NIGHTGATE
- * `verifyPredicateState`): the vault recorded a true result for the claim key
- * (payloadHash, fieldKey, predicate, threshold). The wallet flow always proves a
- * field-bound predicate, so `fieldKey` is the canonical field id. `threshold`
+ * Confirm a CROSS-ROOT claim crawler-free: the vault recorded a true result for
+ * the claim key (payloadHashA, payloadHashB, bound). The order of the two
+ * hashes is part of the key, so A must be the older version. Both kinds share
+ * this: integrity binds an allowed mask (upper bound on change), diff binds k
+ * (lower bound).
+ *
+ * Used as the settlement check when the client's wait for the proof job runs
+ * out: the cross-root circuit is the slowest one in the system, and a wait
+ * that expires says nothing about whether the transaction landed. Mapping
+ * present -> confirmed and everything else -> unknown keeps a timeout from
+ * lying red about a claim that is on-chain.
+ */
+export async function verifyCrossRootState(o: {
+    contractAddress?: string | null;
+    payloadHashA?: string | null;
+    payloadHashB?: string | null;
+    /** 'documentIntegrity' reads the mask as its bound, 'documentDiff' reads k. */
+    kind: 'documentIntegrity' | 'documentDiff';
+    bound: number;
+}): Promise<ChainVerdict> {
+    const contractAddress = norm(o.contractAddress);
+    const payloadHash = norm(o.payloadHashA);
+    const payloadHashB = norm(o.payloadHashB);
+    if (!contractAddress || !payloadHash || !payloadHashB) return 'unknown';
+    const params = (cds.model?.definitions?.['NightgateService.verifyPredicateState'] as any)?.params;
+    const needed = o.kind === 'documentDiff' ? params?.k : params?.allowedMask;
+    if (!params?.payloadHashB || !needed) return 'unknown';
+    try {
+        const nightgate = await cds.connect.to('NightgateService');
+        const res: any = await nightgate.send('verifyPredicateState', {
+            contractAddress, payloadHash, payloadHashB,
+            predicate: o.kind,
+            ...(o.kind === 'documentDiff'
+                ? { k: Number(o.bound ?? 0) }
+                : { allowedMask: Number(o.bound ?? 0) }),
+            compiledArtifactRef: CONTRACT_REF
+        });
+        return res?.verified === true ? 'confirmed' : 'unknown';
+    } catch {
+        return 'unknown';
+    }
+}
+
+/**
+ * Confirm a field-bound claim's effect crawler-free (NIGHTGATE
+ * `verifyPredicateState`): the vault recorded a true result for the claim key.
+ * Numeric kinds: (payloadHash, fieldKey, predicate, threshold); `threshold`
  * must be the SAME scaled integer the circuit hashed into the claim key; the
  * cockpit builds the proof and this call from one `raw x1000` value, so it is
- * passed straight through here (do NOT scale again).
+ * passed straight through here (do NOT scale again). Membership kind:
+ * (payloadHash, fieldKey, 'setMembership', setRoot); threshold is not part of
+ * the claim key and is omitted. On a plugin that predates the setMembership
+ * kind (no `setRoot` param in the model), a membership check returns
+ * 'unknown' instead of sending an arg the action would reject.
  */
 export async function verifyPredicateState(o: {
     contractAddress?: string | null;
     payloadHash?: string | null;
     fieldKey?: string | null;
-    predicate: 'lessOrEqual' | 'greaterOrEqual';
-    threshold: number;
+    predicate: 'lessOrEqual' | 'greaterOrEqual' | 'setMembership';
+    threshold?: number;
+    setRoot?: string | null;
 }): Promise<ChainVerdict> {
     const contractAddress = norm(o.contractAddress);
     const payloadHash = norm(o.payloadHash);
     if (!contractAddress || !payloadHash) return 'unknown';
+    const membership = o.predicate === 'setMembership';
+    if (membership) {
+        const hasSetRootParam = !!(cds.model?.definitions?.['NightgateService.verifyPredicateState'] as any)?.params?.setRoot;
+        if (!hasSetRootParam || !norm(o.setRoot)) return 'unknown';
+    }
     try {
         const nightgate = await cds.connect.to('NightgateService');
         const res: any = await nightgate.send('verifyPredicateState', {
@@ -119,7 +223,7 @@ export async function verifyPredicateState(o: {
             payloadHash,
             ...(o.fieldKey ? { fieldKey: norm(o.fieldKey) } : {}),
             predicate: o.predicate,
-            threshold: o.threshold,
+            ...(membership ? { setRoot: norm(o.setRoot) } : { threshold: Number(o.threshold ?? 0) }),
             compiledArtifactRef: CONTRACT_REF
         });
         return res?.verified === true ? 'confirmed' : 'unknown';

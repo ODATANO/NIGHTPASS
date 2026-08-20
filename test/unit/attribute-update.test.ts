@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
     DYNAMIC_ATTRIBUTES,
     encodeDynamicValue,
+    decodeDynamicValue,
     dedupeUpdates,
     attributesAsOf,
     type CurrentRowLike,
@@ -152,5 +153,39 @@ describe('attributesAsOf', () => {
         ];
         const { rows } = attributesAsOf(current, withDates, '2026-03-02T00:00:00Z');
         assert.equal(rows.find((r) => r.attribute === 'CapacityFade')?.valueJson, '{"v":"first"}');
+    });
+});
+
+describe('decodeDynamicValue', () => {
+    // The inverse of encodeDynamicValue. It feeds the content tree, so a wrong
+    // reading does not throw, it silently anchors a different number and every
+    // later comparison of that slot is meaningless. Round-tripping through the
+    // encoder is the only honest pin.
+    it('round-trips every numeric kind through the encoder', () => {
+        const cases: Array<[string, number]> = [
+            ['CapacityFade', 3.5],                                 // pct
+            ['RemainingCapacity', 196],                            // ampereHour (integer)
+            ['NumberOfFullChargingAndDischargingCycles', 39],      // bare count
+            ['TemperatureInformation', 21],                        // celsius (integer)
+        ];
+        for (const [attribute, value] of cases) {
+            const enc = encodeDynamicValue(attribute, value);
+            assert.ok(enc.ok, `${attribute}: ${enc.ok ? '' : enc.error}`);
+            assert.equal(decodeDynamicValue(attribute, enc.valueJson), value, attribute);
+        }
+    });
+
+    it('accepts an already-parsed value object as well as the stored JSON string', () => {
+        assert.equal(decodeDynamicValue('CapacityFade', { percentageValue: 4, percent: '%' }), 4);
+        assert.equal(decodeDynamicValue('NumberOfFullChargingAndDischargingCycles', 7), 7);
+    });
+
+    it('returns null instead of guessing', () => {
+        assert.equal(decodeDynamicValue('NotAnAttribute', '5'), null);
+        assert.equal(decodeDynamicValue('CapacityFade', 'not json'), null);
+        assert.equal(decodeDynamicValue('CapacityFade', '{"nothing":1}'), null);
+        // Kinds with no single number stay out of the tree by design.
+        assert.equal(decodeDynamicValue('RemainingPowerCapability', '{"wattValueAt80SoC":1,"wattValueAt20SoC":2,"watt":"W"}'), null);
+        assert.equal(decodeDynamicValue('InformationOnAccidents', '"minor dent"'), null);
     });
 });

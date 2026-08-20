@@ -2,6 +2,7 @@ import cds from '@sap/cds';
 import { Passport, Passports, PredicateProofLog, Partners } from '#cds-models/passport';
 import { effectiveNetwork, explorerTxUrl, verifyPeers, fieldKeyHex } from './lib/passport-anchor';
 import { granteeIdForDid } from './lib/grantee';
+import { claimSetById, setLabelFor } from './lib/claim-sets';
 import { restrictedProbe } from './lib/query-guard';
 
 const { INSERT, SELECT, UPDATE } = cds.ql;
@@ -18,13 +19,15 @@ const { INSERT, SELECT, UPDATE } = cds.ql;
 //   authority (role 'authority') → everything: supplier identities, carbon
 //                                    footprint, due-diligence docs, on-chain
 //                                    lineage.
-type Tier = 'consumer' | 'recycler' | 'authority';
-
-const TIER_RANK: Record<Tier, number> = { consumer: 0, recycler: 1, authority: 2 };
-function maxTier(a: Tier, b: Tier): Tier { return TIER_RANK[a] >= TIER_RANK[b] ? a : b; }
-function levelToTier(level: number): Tier {
-    return level >= 2 ? 'authority' : level === 1 ? 'recycler' : 'consumer';
-}
+// Tier model + redaction rules are extracted to @odatano/dpp-sdk (shared with
+// DAYPASS); only the CAP wiring (role resolution, on-chain grant lookup, CQN
+// probing guards) and the chain-specific authority field list live here.
+import {
+    maxTier, levelToTier, attributeVisible, strip,
+    redactBattery, redactRecycled,
+    BATTERY_AUTHORITY_FIELDS, RECYCLED_AUTHORITY_FIELDS,
+    redactPassport as redactPassportShared, type Tier
+} from '@odatano/dpp-sdk/tier';
 
 /** Tier from the requester's configured CAP roles (the dev/mocked-auth path). */
 function localTierOf(req: cds.Request): Tier {
@@ -116,56 +119,9 @@ const PASSPORT_AUTHORITY_FIELDS = [
     'payloadHash', 'passportIdHash', 'contractAddress', 'attestationTxHash', 'attestation', 'attestation_ID', 'owner'
 ] as const;
 
-/** Delete a set of keys from a row in place. */
-function strip(row: Record<string, unknown>, keys: readonly string[]): void {
-    for (const k of keys) delete row[k];
-}
-
 /** Redact one Passports row (and any expanded children) for the given tier. */
 function redactPassport(row: Record<string, unknown>, tier: Tier): void {
-    if (tier !== 'authority') strip(row, PASSPORT_AUTHORITY_FIELDS);
-
-    // Child compositions are restricted/legitimate-interest. A consumer sees
-    // none of them; recycler/authority see them, redacted per-entity below.
-    for (const child of ['batteries', 'recycledMaterials', 'diligenceDocs'] as const) {
-        const val = row[child];
-        if (!Array.isArray(val)) continue;
-        if (tier === 'consumer') { row[child] = []; continue; }
-    }
-    if (Array.isArray(row.batteries)) row.batteries.forEach((b) => redactBattery(b, tier));
-    if (Array.isArray(row.recycledMaterials)) row.recycledMaterials.forEach((m) => redactRecycled(m, tier));
-    if (tier !== 'authority') row.diligenceDocs = [];
-    // Guide-format attributes carry their own longlist access class per row.
-    // Fail closed: a row whose accessClass was not selected ($expand with a
-    // narrow $select) cannot be classified and is only served to authority.
-    if (Array.isArray(row.attributes)) {
-        row.attributes = row.attributes.filter((a) => {
-            const cls = (a as Record<string, unknown>)?.accessClass;
-            return typeof cls === 'string' ? attributeVisible(cls, tier) : tier === 'authority';
-        });
-    }
-}
-
-/** Authority-only columns on the child entities (supplier identity, CO2). */
-const BATTERY_AUTHORITY_FIELDS = ['carbonFootprintKgCO2', 'supplierName'] as const;
-const RECYCLED_AUTHORITY_FIELDS = ['sourceSupplierName'] as const;
-
-/**
- * carbonFootprint + supplierName are authority-only; the rest is legitimate
- * interest, so a consumer sees nothing at all. That matters on DIRECT child
- * reads (GET /Batteries): via a Passports $expand the consumer's children are
- * already emptied, but the direct read must not leak Points 2/3 fields to
- * anonymous callers on a public host.
- */
-function redactBattery(row: Record<string, unknown>, tier: Tier): void {
-    if (tier === 'consumer') { strip(row, Object.keys(row)); return; }
-    if (tier !== 'authority') strip(row, BATTERY_AUTHORITY_FIELDS);
-}
-
-/** sourceSupplierName (supplier identity) is authority-only; consumers see nothing. */
-function redactRecycled(row: Record<string, unknown>, tier: Tier): void {
-    if (tier === 'consumer') { strip(row, Object.keys(row)); return; }
-    if (tier !== 'authority') strip(row, RECYCLED_AUTHORITY_FIELDS);
+    redactPassportShared(row, tier, PASSPORT_AUTHORITY_FIELDS);
 }
 
 /**
@@ -190,13 +146,6 @@ function restrictToNothing(req: cds.Request): void {
     (req.query as any).where({ ID: null });
 }
 
-/** Which longlist access classes a tier may read (guide-format attribute rows). */
-function attributeVisible(accessClass: unknown, tier: Tier): boolean {
-    if (accessClass === 'authority') return tier === 'authority';
-    if (accessClass === 'legitimateInterest') return tier !== 'consumer';
-    return true; // public (also rows with no class yet)
-}
-
 function asRows(data: unknown): Record<string, unknown>[] {
     if (Array.isArray(data)) return data as Record<string, unknown>[];
     if (data && typeof data === 'object') return [data as Record<string, unknown>];
@@ -216,6 +165,9 @@ export default class PassportService extends cds.ApplicationService {
         this.on('verifyOnChain', this.verifyOnChain);
         this.on('verifyAnchorVersion', this.verifyAnchorVersion);
         this.on('verifyClaimOnChain', this.verifyClaimOnChain);
+        this.on('verifyMembershipClaimOnChain', this.verifyMembershipClaimOnChain);
+        this.on('verifyVersionIntegrityOnChain', this.verifyVersionIntegrityOnChain);
+        this.on('verifyVersionChangeOnChain', this.verifyVersionChangeOnChain);
         this.on('anchorHistory', this.anchorHistory);
         this.on('anchorExplorer', this.anchorExplorer);
 
@@ -550,57 +502,234 @@ export default class PassportService extends cds.ApplicationService {
         const { passportId, sourceField, predicate, threshold } = req.data as {
             passportId?: string; sourceField?: string; predicate?: string; threshold?: number;
         };
-        const pid = String(passportId ?? '').trim();
-        if (!pid) return req.reject(400, 'passportId is required');
-        if (!sourceField) return req.reject(400, 'sourceField is required');
         const pred = predicate === 'greaterOrEqual' ? 'greaterOrEqual' : 'lessOrEqual';
+        const thresholdScaled = Math.round(Number(threshold ?? 0) * 1000);
+        const probe = await this.probeClaimOnChain(req, {
+            passportId, sourceField,
+            proofLogWhere: { predicate: pred, threshold: thresholdScaled },
+            claimArgs: { predicate: pred, threshold: thresholdScaled }
+        });
+        if (!probe) return; // req already rejected
+        return {
+            passportId: probe.passportId,
+            sourceField,
+            predicate: pred,
+            threshold: Number(threshold ?? 0),
+            ...probe.envelope
+        };
+    };
+
+    /**
+     * Anonymous live check of a set-membership claim (sibling of
+     * verifyClaimOnChain, which stays signature-stable for deployed callers:
+     * CAP V4 functions require every declared param in the URL, so a new kind
+     * gets a NEW function). Claim key = (payloadHash, fieldKey, setRoot).
+     */
+    private verifyMembershipClaimOnChain = async (req: cds.Request) => {
+        const { passportId, sourceField, setRoot } = req.data as {
+            passportId?: string; sourceField?: string; setRoot?: string;
+        };
+        const root = String(setRoot ?? '').replace(/^0x/, '').toLowerCase();
+        if (!/^[0-9a-f]{64}$/.test(root)) return req.reject(400, 'setRoot must be 32-byte hex (64 chars)');
+        const probe = await this.probeClaimOnChain(req, {
+            passportId, sourceField,
+            proofLogWhere: { predicate: 'setMembership', setRoot: root },
+            claimArgs: { predicate: 'setMembership', setRoot: root },
+            // A plugin without the membership kind cannot check this claim;
+            // skip the live read and stay honestly unverified.
+            requireModelParam: 'setRoot'
+        });
+        if (!probe) return; // req already rejected
+        return {
+            passportId: probe.passportId,
+            sourceField,
+            predicate: 'setMembership',
+            setRoot: root,
+            ...probe.envelope
+        };
+    };
+
+    /**
+     * Anonymous live check of a proven version-integrity claim. Deliberately
+     * NOT routed through probeClaimOnChain: that helper probes candidate
+     * payload hashes for a claim about ONE document, while a cross-root claim
+     * names both documents explicitly, so there is nothing to guess. Both
+     * versions are anchored on the same vault by construction (the prover
+     * refuses otherwise), so the row's contract is the one to read.
+     */
+    private verifyVersionIntegrityOnChain = async (req: cds.Request) => {
+        const { passportId, payloadHashA, payloadHashB, allowedMask } = req.data as {
+            passportId?: string; payloadHashA?: string; payloadHashB?: string; allowedMask?: number;
+        };
+        const mask = Number(allowedMask ?? 0);
+        if (!Number.isInteger(mask) || mask < 0 || mask > 0xffff) {
+            return req.reject(400, 'allowedMask must be a 16-bit integer');
+        }
+        const probe = await this.probeCrossRootClaim(req, {
+            passportId, payloadHashA, payloadHashB, kind: 'documentIntegrity', bound: mask
+        });
+        if (!probe) return; // req already rejected
+        return { ...probe, allowedMask: mask, predicate: 'documentIntegrity' };
+    };
+
+    private verifyVersionChangeOnChain = async (req: cds.Request) => {
+        const { passportId, payloadHashA, payloadHashB, minChangedSlots } = req.data as {
+            passportId?: string; payloadHashA?: string; payloadHashB?: string; minChangedSlots?: number;
+        };
+        const k = Number(minChangedSlots ?? 0);
+        if (!Number.isInteger(k) || k < 1 || k > 16) {
+            return req.reject(400, 'minChangedSlots must be an integer 1..16');
+        }
+        const probe = await this.probeCrossRootClaim(req, {
+            passportId, payloadHashA, payloadHashB, kind: 'documentDiff', bound: k
+        });
+        if (!probe) return; // req already rejected
+        return { ...probe, minChangedSlots: k, predicate: 'documentDiff' };
+    };
+
+    /**
+     * Shared probe of the two cross-root verifiers. Deliberately NOT routed
+     * through probeClaimOnChain: that helper guesses candidate payload hashes
+     * for a claim about ONE document, while a cross-root claim names both
+     * documents explicitly, so there is nothing to guess. Both versions are
+     * anchored on the same vault by construction (the prover refuses
+     * otherwise), so the row's contract is the one to read.
+     */
+    private async probeCrossRootClaim(req: cds.Request, o: {
+        passportId?: string; payloadHashA?: string; payloadHashB?: string;
+        kind: 'documentIntegrity' | 'documentDiff'; bound: number;
+    }) {
+        const norm = (h: unknown) => String(h ?? '').replace(/^0x/, '').toLowerCase();
+        const pid = String(o.passportId ?? '').trim();
+        const hashA = norm(o.payloadHashA);
+        const hashB = norm(o.payloadHashB);
+        if (!pid) { req.reject(400, 'passportId is required'); return null; }
+        if (!/^[0-9a-f]{64}$/.test(hashA) || !/^[0-9a-f]{64}$/.test(hashB)) {
+            req.reject(400, 'payloadHashA and payloadHashB must be 32-byte hex (64 chars)');
+            return null;
+        }
+        const row: any = await SELECT.one.from(Passports)
+            .columns('passportId', 'contractAddress', 'anchorNetwork')
+            .where({ passportId: pid });
+        if (!row) { req.reject(404, `passport '${pid}' not found`); return null; }
+
+        const contractAddress = norm(row.contractAddress);
+        const serverNetwork = effectiveNetwork();
+        const anchorNetwork = (row.anchorNetwork as string | null) ?? null;
+        const crossNetwork = !!anchorNetwork && anchorNetwork !== serverNetwork;
+        const params = (cds.model?.definitions?.['NightgateService.verifyPredicateState'] as any)?.params;
+        const canOverride = !!params?.network;
+        // A plugin without the cross-root params cannot answer this at all;
+        // stay honestly unverified rather than sending args it would reject.
+        const kindSupported = !!params?.payloadHashB
+            && !!(o.kind === 'documentDiff' ? params?.k : params?.allowedMask);
+
+        let verified = false;
+        let checkedNetwork: string | null = null;
+        if (contractAddress && kindSupported && (!crossNetwork || canOverride)) {
+            checkedNetwork = crossNetwork ? anchorNetwork : serverNetwork;
+            try {
+                const nightgate = await cds.connect.to('NightgateService');
+                const verifier = new (cds.User as any)({ id: 'passport-verifier' });
+                const res: any = await (nightgate as any).tx({ user: verifier }, (tx: any) =>
+                    tx.send('verifyPredicateState', {
+                        contractAddress,
+                        payloadHash: hashA,
+                        payloadHashB: hashB,
+                        predicate: o.kind,
+                        ...(o.kind === 'documentDiff' ? { k: o.bound } : { allowedMask: o.bound }),
+                        compiledArtifactRef: 'attestation-vault',
+                        ...(crossNetwork ? { network: anchorNetwork } : {})
+                    }));
+                verified = res?.verified === true;
+            } catch { /* indexer unreachable or contract unknown: stay unverified */ }
+        }
+        return {
+            passportId: row.passportId,
+            payloadHashA: hashA, payloadHashB: hashB,
+            verified, anchorNetwork, serverNetwork, checkedNetwork,
+            checkedAt: new Date().toISOString()
+        };
+    }
+
+    /**
+     * Shared probe core of the anonymous claim verifiers: resolve the row,
+     * pick the candidate payload hashes (the stamped hash from the matching
+     * proof-log row first; pre-feature rows probe the current hash and the
+     * superseded versions, newest first, capped at 5, so old claims still
+     * verify after a re-anchor), then ask NIGHTGATE's crawler-free
+     * verifyPredicateState per candidate with the claim-kind-specific args.
+     * One implementation for every claim kind; failures degrade to
+     * verified:false, never 5xx. Returns null after rejecting the request.
+     */
+    private async probeClaimOnChain(req: cds.Request, o: {
+        passportId?: string; sourceField?: string;
+        proofLogWhere: Record<string, unknown>;
+        claimArgs: Record<string, unknown>;
+        requireModelParam?: string;
+    }) {
+        const pid = String(o.passportId ?? '').trim();
+        if (!pid) { req.reject(400, 'passportId is required'); return null; }
+        if (!o.sourceField) { req.reject(400, 'sourceField is required'); return null; }
         const row = await SELECT.one.from(Passports)
             .columns('ID', 'passportId', 'payloadHash', 'contractAddress', 'anchorNetwork', 'status')
             .where({ passportId: pid });
-        if (!row) return req.reject(404, `passport '${pid}' not found`);
+        if (!row) { req.reject(404, `passport '${pid}' not found`); return null; }
 
         const norm = (h: unknown) => String(h ?? '').replace(/^0x/, '').toLowerCase();
         const contractAddress = norm(row.contractAddress);
         const serverNetwork = effectiveNetwork();
         const anchorNetwork = (row as Record<string, unknown>).anchorNetwork as string | null ?? null;
         const crossNetwork = !!anchorNetwork && anchorNetwork !== serverNetwork;
-        const canOverride = !!(cds.model?.definitions?.['NightgateService.verifyPredicateState'] as any)?.params?.network;
+        const params = (cds.model?.definitions?.['NightgateService.verifyPredicateState'] as any)?.params;
+        const canOverride = !!params?.network;
+        const kindSupported = !o.requireModelParam || !!params?.[o.requireModelParam];
 
-        // On-chain claim keys embed the payload hash of the version the claim
-        // was proven under. Prefer the stamped hash from the proof log row;
-        // pre-feature rows (no stamp) probe the current hash and then the
-        // superseded versions (newest first, capped) so old claims still
-        // verify after a re-anchor.
-        const thresholdScaled = Math.round(Number(threshold ?? 0) * 1000);
+        // On-chain claim keys live per (CONTRACT, payloadHash): after a
+        // same-network vault redeploy a re-anchored row points at the NEW
+        // vault while its old claims were proven on the OLD one, whose
+        // address the anchor-version rows preserve. Candidates are therefore
+        // (payloadHash, contractAddress) PAIRS: the stamped hash probes the
+        // current contract first and then each superseded version's own
+        // contract; pre-stamp rows probe hash+contract per version.
+        const versions: any[] = await SELECT.from('passport.PassportAnchorVersions')
+            .columns('payloadHash', 'contractAddress')
+            .where({ passport_ID: (row as any).ID }).orderBy('version desc' as any);
         const proofRow: any = await SELECT.one.from(PredicateProofLog)
             .columns('payloadHash')
-            .where({ passport_ID: (row as any).ID, sourceField: String(sourceField), predicate: pred, threshold: thresholdScaled, status: 'succeeded', result: true })
+            .where({ passport_ID: (row as any).ID, sourceField: String(o.sourceField), ...o.proofLogWhere, status: 'succeeded', result: true })
             .orderBy('createdAt desc' as any);
-        let candidates: string[];
+        const seen = new Set<string>();
+        const candidates: { payloadHash: string; contractAddress: string }[] = [];
+        const push = (h: string, c: string) => {
+            if (!h || !c || seen.has(`${h}|${c}`)) return;
+            seen.add(`${h}|${c}`);
+            candidates.push({ payloadHash: h, contractAddress: c });
+        };
         if (proofRow?.payloadHash) {
-            candidates = [norm(proofRow.payloadHash)];
+            const stamped = norm(proofRow.payloadHash);
+            push(stamped, contractAddress);
+            for (const v of versions ?? []) push(stamped, norm(v.contractAddress) || contractAddress);
         } else {
-            const versions: any[] = await SELECT.from('passport.PassportAnchorVersions')
-                .columns('payloadHash').where({ passport_ID: (row as any).ID }).orderBy('version desc' as any);
-            candidates = [...new Set([norm(row.payloadHash), ...(versions ?? []).map((v) => norm(v.payloadHash))])]
-                .filter(Boolean).slice(0, 5);
+            push(norm(row.payloadHash), contractAddress);
+            for (const v of versions ?? []) push(norm(v.payloadHash), norm(v.contractAddress) || contractAddress);
         }
+        const probes = candidates.slice(0, 5);
 
         let verified = false;
         let checkedNetwork: string | null = null;
-        if (candidates.length && contractAddress && (!crossNetwork || canOverride)) {
+        if (probes.length && contractAddress && kindSupported && (!crossNetwork || canOverride)) {
             checkedNetwork = crossNetwork ? anchorNetwork : serverNetwork;
             try {
                 const nightgate = await cds.connect.to('NightgateService');
                 const verifier = new (cds.User as any)({ id: 'passport-verifier' });
-                for (const candidateHash of candidates) {
+                for (const cand of probes) {
                     const res: any = await (nightgate as any).tx({ user: verifier }, (tx: any) =>
                         tx.send('verifyPredicateState', {
-                            contractAddress,
-                            payloadHash: candidateHash,
-                            fieldKey: fieldKeyHex(String(sourceField)),
-                            predicate: pred,
-                            threshold: thresholdScaled,
+                            contractAddress: cand.contractAddress,
+                            payloadHash: cand.payloadHash,
+                            fieldKey: fieldKeyHex(String(o.sourceField)),
+                            ...o.claimArgs,
                             compiledArtifactRef: 'attestation-vault',
                             ...(crossNetwork ? { network: anchorNetwork } : {})
                         }));
@@ -610,16 +739,15 @@ export default class PassportService extends cds.ApplicationService {
         }
         return {
             passportId: row.passportId,
-            sourceField,
-            predicate: pred,
-            threshold: Number(threshold ?? 0),
-            verified,
-            anchorNetwork,
-            serverNetwork,
-            checkedNetwork,
-            checkedAt: new Date().toISOString()
+            envelope: {
+                verified,
+                anchorNetwork,
+                serverNetwork,
+                checkedNetwork,
+                checkedAt: new Date().toISOString()
+            }
         };
-    };
+    }
 
     private anchorExplorer = async () => {
         const rows = await SELECT.from(Passports)
@@ -630,20 +758,36 @@ export default class PassportService extends cds.ApplicationService {
         // Successfully proven ZK claims per passport. Public by design: claim,
         // threshold (scaled back to raw units) and proof tx; never the value.
         const proofs: any[] = await SELECT.from(PredicateProofLog)
-            .columns('passport_ID', 'sourceField', 'predicate', 'threshold', 'unit', 'txHash', 'createdAt')
+            .columns('passport_ID', 'sourceField', 'predicate', 'threshold', 'unit', 'txHash', 'createdAt', 'setRoot', 'setId')
             .where({ status: 'succeeded', result: true })
             .orderBy('createdAt');
         const claimsByPassport = new Map<string, unknown[]>();
         for (const p of proofs) {
             const list = claimsByPassport.get(p.passport_ID) ?? [];
-            list.push({
-                sourceField: p.sourceField,
-                predicate: p.predicate,
-                threshold: Number(p.threshold) / 1000,
-                unit: p.unit ?? '',
-                txHash: p.txHash ?? '',
-                provenAt: p.createdAt ?? null,
-            });
+            if (p.predicate === 'setMembership') {
+                // The allow-list is public by design; publishing the values
+                // lets any verifier recompute the set root from the list.
+                const set = claimSetById(p.setId ?? '');
+                list.push({
+                    sourceField: p.sourceField,
+                    predicate: 'setMembership',
+                    setRoot: p.setRoot ?? '',
+                    setId: p.setId ?? '',
+                    setLabel: setLabelFor(p.setId),
+                    allowedValues: set?.values ?? null,
+                    txHash: p.txHash ?? '',
+                    provenAt: p.createdAt ?? null,
+                });
+            } else {
+                list.push({
+                    sourceField: p.sourceField,
+                    predicate: p.predicate,
+                    threshold: Number(p.threshold) / 1000,
+                    unit: p.unit ?? '',
+                    txHash: p.txHash ?? '',
+                    provenAt: p.createdAt ?? null,
+                });
+            }
             claimsByPassport.set(p.passport_ID, list);
         }
         const norm = (h: unknown) => String(h ?? '').replace(/^0x/, '').toLowerCase();

@@ -31,10 +31,11 @@ service DemoService @(path: '/api/v1/demo', requires: 'any') {
         co2Kg            : Decimal,   // confidential, never published
         proveThreshold   : Decimal,   // public claim bound (kg CO2)
         secondLife       : Boolean,   // optional bonus act: age + repurpose = second anchor version
-        // Optional extra claims, JSON array of { field, value, threshold }.
-        // Fields come from demoClaimFields(); every value stays confidential
-        // and all claims are proven in ONE transaction together with the
-        // carbon footprint above.
+        // Optional extra claims, JSON array of { field, value, threshold }
+        // (numeric) or { field, member } (membership). Fields come from
+        // demoClaimFields(); every value stays confidential and all claims
+        // are proven in ONE transaction together with the carbon footprint
+        // above.
         claimsJson       : LargeString
     ) returns {
         runId         : UUID;
@@ -78,12 +79,19 @@ service DemoService @(path: '/api/v1/demo', requires: 'any') {
     function demoClaimFields() returns array of {
         field            : String;
         label            : String;
+        kind             : String;  // numeric | membership
         unit             : String;
-        predicate        : String;  // lessOrEqual | greaterOrEqual
+        predicate        : String;  // lessOrEqual | greaterOrEqual (numeric only)
         min              : Decimal;
         max              : Decimal;
         defaultValue     : Decimal;
         defaultThreshold : Decimal;
+        // membership kind: the hidden value is proven to be one of a published
+        // allow-list; the visitor picks it from the list itself.
+        setId            : String;
+        setLabel         : String;
+        optionsJson      : LargeString; // JSON array of the allow-list values
+        defaultOption    : String;
         primary          : Boolean; // always proven, driven by the co2 inputs
     };
 

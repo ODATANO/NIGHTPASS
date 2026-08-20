@@ -80,6 +80,22 @@ cds.on('bootstrap', (app: any) => {
             next();
         });
     }
+    // Maintenance switch: DEMO_MAINTENANCE=true parks the demo behind a
+    // static "update in progress" page and 503s its service surface, WITHOUT
+    // a redeploy to come back. Use while the demo sponsors are borrowed for
+    // other work (e.g. the 0.17.0 sponsoring endpoint) or during upgrades.
+    if (surfaces.has('demo') && process.env.DEMO_MAINTENANCE === 'true') {
+        const path = require('node:path');
+        const page = path.join(__dirname, '..', 'app', 'demo', 'maintenance.html');
+        app.use((req: any, res: any, next: any) => {
+            const p = String(req.path || '');
+            if (p === '/' || p === '/demo' || p.startsWith('/demo/')) return res.status(200).sendFile(page);
+            if (p.startsWith('/api/v1/demo')) {
+                return res.status(503).json({ error: 'demo_maintenance', message: 'The demo is being updated to v4; please come back in a few days.' });
+            }
+            next();
+        });
+    }
     // The "Try it" demo instance: only the demo app + its service surface.
     // Anchoring runs server-side through internal service calls, so none of
     // the cockpit/NIGHTGATE HTTP surfaces need to be public here.
@@ -424,13 +440,25 @@ cds.on('bootstrap', (app: any) => {
             if (Array.isArray(req.body.claims)) {
                 await DELETE.from('passport.PredicateProofLog').where({ passport_ID: ID });
                 const rows = req.body.claims
-                    .filter((c: any) => c && c.sourceField && (c.predicate === 'lessOrEqual' || c.predicate === 'greaterOrEqual'))
+                    .filter((c: any) => c && c.sourceField && (
+                        c.predicate === 'lessOrEqual' || c.predicate === 'greaterOrEqual' ||
+                        // Membership claims carry a set root instead of a threshold.
+                        (c.predicate === 'setMembership' && /^[0-9a-f]{64}$/i.test(String(c.setRoot ?? '')))
+                    ))
                     .map((c: any) => ({
                         ID: cds.utils.uuid(), passport_ID: ID,
                         sourceField: String(c.sourceField).slice(0, 120),
                         predicate: c.predicate,
-                        threshold: Math.round(Number(c.threshold ?? 0) * 1000),
-                        unit: String(c.unit ?? '').slice(0, 60),
+                        ...(c.predicate === 'setMembership'
+                            ? {
+                                threshold: null, unit: null,
+                                setRoot: String(c.setRoot).toLowerCase(),
+                                setId: c.setId ? String(c.setId).slice(0, 60) : null,
+                            }
+                            : {
+                                threshold: Math.round(Number(c.threshold ?? 0) * 1000),
+                                unit: String(c.unit ?? '').slice(0, 60),
+                            }),
                         txHash: String(c.txHash ?? '').slice(0, 120),
                         status: 'succeeded', result: true,
                         ...(c.provenAt ? { createdAt: c.provenAt } : {}),

@@ -4,10 +4,11 @@ sap.ui.define([
   "sap/ui/model/FilterOperator",
   "sap/ui/model/Sorter",
   "sap/ui/core/Fragment",
+  "sap/ui/core/Item",
   "sap/ui/model/json/JSONModel",
   "producer/util/WalletPicker",
   "sap/m/MessageBox"
-], function (BaseController, Filter, FilterOperator, Sorter, Fragment, JSONModel, WalletPicker, MessageBox) {
+], function (BaseController, Filter, FilterOperator, Sorter, Fragment, CoreItem, JSONModel, WalletPicker, MessageBox) {
   "use strict";
 
   return BaseController.extend("producer.controller.Detail", {
@@ -394,6 +395,70 @@ sap.ui.define([
         .catch(function (e) { that.error(e); });
     },
 
+    /**
+     * Version integrity: prove that this version changed nothing outside an
+     * allowed field set, compared to the previous anchored version. The prompt
+     * takes the allowed fields as a comma-separated list; empty is the
+     * strongest (and most common) claim: "no provable field changed at all",
+     * which is exactly what a telemetry re-anchor should be able to say.
+     *
+     * Server lane only: the cross-root circuit is the vault's largest, and the
+     * proof needs BOTH versions' openings, which live server-side.
+     */
+    onProveIntegrity: function () {
+      if (!this._isServer()) { return this.toast("integrity proofs run through a server wallet; log in with a server wallet"); }
+      var that = this;
+      MessageBox.show(
+        "Prove how this version relates to the previous anchored version. Values stay hidden either way: " +
+        "the proof states only which slots changed.\n\n" +
+        "\"Measurement update\" is the periodic-telemetry claim and proves BOTH bounds in one transaction: " +
+        "no specification field changed, AND at least one measured value really did. That is what tells a " +
+        "genuine re-measurement apart from a re-timestamp of unchanged numbers.\n\n" +
+        "\"Only these fields\" proves the upper bound alone for a named set, e.g. a corrected recycledContentPct.",
+        {
+          icon: MessageBox.Icon.QUESTION,
+          title: "Prove version transition",
+          actions: ["Measurement update", "Only these fields...", MessageBox.Action.CANCEL],
+          onClose: function (sAction) {
+            if (sAction === MessageBox.Action.CANCEL) { return; }
+            if (sAction === "Measurement update") {
+              // The measured slots may differ, and at least one must.
+              return that._runIntegrity(that._MEASURED_FIELDS, 1);
+            }
+            // sap.m.Dialog would be the richer form; a prompt keeps this to the
+            // one input it actually needs.
+            var sFields = window.prompt("Fields allowed to differ (comma separated, empty = nothing changed):", "");
+            if (sFields === null) { return; }
+            var aFields = sFields.split(",").map(function (s) { return s.trim(); }).filter(Boolean);
+            that._runIntegrity(aFields, 0);
+          }
+        }
+      );
+    },
+
+    // The measured slots of the provable panel (guide attribute names). Kept in
+    // sync with DYNAMIC_PROVABLE_FIELDS in srv/lib/passport-anchor.ts.
+    _MEASURED_FIELDS: ["CapacityFade", "RemainingCapacity", "NumberOfFullChargingAndDischargingCycles"],
+
+    _runIntegrity: function (aFields, iMinChanged) {
+      var that = this;
+      this.callAction("/proveVersionIntegrity", {
+        passportId: this._pid(),
+        allowedFieldsJson: JSON.stringify(aFields),
+        minChangedSlots: iMinChanged || 0,
+        walletId: this._walletId()
+      }).then(function (res) {
+        if (res.mode !== "proving") {
+          return that.toast("no signing session; the claim was logged as offline");
+        }
+        var aIds = [res.proofLogId];
+        if (res.changeProofLogId) { aIds.push(res.changeProofLogId); }
+        that.toast("proving " + (res.claim || "version transition") + "; the cross-root circuit is the slowest one, please wait");
+        that._pollProof(aIds);
+        that._refreshAll();
+      }).catch(function (e) { that.error(e); });
+    },
+
     _filterLogs: function (sKey) {
       var oFilter = new Filter("passport_ID", FilterOperator.EQ, sKey);
       var oSorter = new Sorter("createdAt", true); // newest first
@@ -648,12 +713,46 @@ sap.ui.define([
       leadContentPpm:         { unit: "ppm",           op: "lessOrEqual",    threshold: 100 },
       recycledCoPct:          { unit: "%",             op: "greaterOrEqual", threshold: 16 },
       recycledLiPct:          { unit: "%",             op: "greaterOrEqual", threshold: 6 },
-      recycledNiPct:          { unit: "%",             op: "greaterOrEqual", threshold: 6 }
+      recycledNiPct:          { unit: "%",             op: "greaterOrEqual", threshold: 6 },
+      // Membership field: no predicate/threshold, an allowed-set picker instead.
+      cellChemistry:          { membership: true }
+    },
+
+    // Named allow-list catalog (claimSetCatalog), fetched once per view.
+    _claimSets: function () {
+      var that = this;
+      if (!this._pClaimSets) {
+        this._pClaimSets = this.callAction("/claimSetCatalog", {}).then(function (res) {
+          try { return JSON.parse(res.setsJson || "[]"); } catch (e) { return []; }
+        }).catch(function () { that._pClaimSets = null; return []; });
+      }
+      return this._pClaimSets;
     },
 
     onProofFieldChange: function () {
-      var m = this._FIELD_META[this.byId("proofField").getSelectedKey()];
+      var that = this;
+      var sField = this.byId("proofField").getSelectedKey();
+      var m = this._FIELD_META[sField];
       if (!m) { return; }
+      var bMembership = !!m.membership;
+      ["proofPredicate", "proofPredicateLabel", "proofThreshold", "proofThresholdLabel",
+       "proofUnit", "proofUnitLabel"].forEach(function (id) {
+        that.byId(id).setVisible(!bMembership);
+      });
+      this.byId("proofSet").setVisible(bMembership);
+      this.byId("proofSetLabel").setVisible(bMembership);
+      if (bMembership) {
+        this._claimSets().then(function (aSets) {
+          var oSel = that.byId("proofSet");
+          var sPrev = oSel.getSelectedKey();
+          oSel.destroyItems();
+          aSets.filter(function (s) { return s.sourceField === sField; }).forEach(function (s) {
+            oSel.addItem(new CoreItem({ key: s.id, text: s.label + " (" + s.memberCount + " values)" }));
+          });
+          if (sPrev) { oSel.setSelectedKey(sPrev); }
+        });
+        return;
+      }
       this.byId("proofPredicate").setSelectedKey(m.op);
       this.byId("proofThreshold").setValue(String(m.threshold));
       this.byId("proofUnit").setValue(m.unit);
@@ -664,6 +763,9 @@ sap.ui.define([
       var ph = oCtx.getProperty("payloadHash") || "";
       if (!ph) { return this.toast("attest the passport with your wallet first"); }
       var field = this.byId("proofField").getSelectedKey() || "carbonFootprintKgCO2";
+      if ((this._FIELD_META[field] || {}).membership) {
+        return this.toast("membership claims ride in the proof cart: add to cart, then prove");
+      }
       var predicate = this.byId("proofPredicate").getSelectedKey();
       var thr = Number(this.byId("proofThreshold").getValue());
       var unit = this.byId("proofUnit").getValue();
@@ -677,6 +779,7 @@ sap.ui.define([
       this.callAction("/passportFieldValue", { passportId: this._pid(), sourceField: field }).then(function (res) {
         if (!res || !res.found || res.value === "") { return that.toast("value for '" + field + "' not found on the passport"); }
         if (!res.fieldKey || res.scaledValue === "" || !res.siblingsJson) { return that.toast("field '" + field + "' is not a provable field"); }
+        if (res.rootDrift) { return that.toast("re-anchor this passport first: its anchored content root predates the current provable-field layout"); }
         var rawVal = Number(res.value);
         var siblings, dirs;
         try { siblings = JSON.parse(res.siblingsJson); dirs = JSON.parse(res.dirsJson); }
@@ -686,7 +789,8 @@ sap.ui.define([
           try {
             await mod.proveFieldPredicate(api, {
               contractAddress: vault, payloadHash: ph, fieldKey: res.fieldKey,
-              threshold: thresholdScaled, op: op, fieldValue: res.scaledValue, siblings: siblings, dirs: dirs
+              threshold: thresholdScaled, op: op, fieldValue: res.scaledValue,
+              fieldSalt: res.fieldSalt, siblings: siblings, dirs: dirs
             }, append);
           } catch (e) {
             var msg = (e && (e.message || String(e))) || "";
@@ -723,6 +827,24 @@ sap.ui.define([
         return this.toast("cart is full (" + this._CART_MAX + " claims); prove it first");
       }
       var field = this.byId("proofField").getSelectedKey();
+      if ((this._FIELD_META[field] || {}).membership) {
+        // Membership item: field + named allow-list; the cart key namespace
+        // ("|set|") stays disjoint from the numeric "field|predicate|thr" keys.
+        var oSetItem = this.byId("proofSet").getSelectedItem();
+        if (!oSetItem) { return this.toast("pick an allowed set first"); }
+        var sSetId = oSetItem.getKey();
+        var sSetKey = field + "|set|" + sSetId;
+        if (aItems.some(function (i) { return i.key === sSetKey; })) {
+          return this.toast("this claim is already in the cart");
+        }
+        var sSetLabel = oSetItem.getText().replace(/ \(\d+ values\)$/, "");
+        aItems = aItems.concat([{
+          kind: "membership", key: sSetKey, field: field, setId: sSetId, setLabel: sSetLabel,
+          label: "Cell chemistry ∈ " + sSetLabel
+        }]);
+        oCart.setProperty("/items", aItems);
+        return this.toast("claim added (" + aItems.length + " in the cart)");
+      }
       var predicate = this.byId("proofPredicate").getSelectedKey();
       var thr = Number(this.byId("proofThreshold").getValue());
       if (!isFinite(thr) || thr < 0) { return this.toast("threshold must be a non-negative number"); }
@@ -769,13 +891,42 @@ sap.ui.define([
       // Server-side resolution first (the producer owns the values); abort
       // before any wallet popup when an item is not provable.
       Promise.all(aItems.map(function (it) {
-        return that.callAction("/passportFieldValue", { passportId: that._pid(), sourceField: it.field });
+        return it.kind === "membership"
+          ? that.callAction("/passportMembershipProof", { passportId: that._pid(), sourceField: it.field, setId: it.setId })
+          : that.callAction("/passportFieldValue", { passportId: that._pid(), sourceField: it.field });
       })).then(function (aRes) {
         var aProofs = [];
         for (var i = 0; i < aItems.length; i++) {
           var res = aRes[i];
+          if (aItems[i].kind === "membership") {
+            if (!res || !res.found) {
+              return that.toast("no '" + aItems[i].field + "' value on this passport; remove the claim from the cart");
+            }
+            if (!res.member) {
+              return that.toast("the passport's " + aItems[i].field + " is not in '" + (res.setLabel || aItems[i].setId) + "'; the claim cannot be proven");
+            }
+            if (res.rootDrift) {
+              return that.toast("re-anchor this passport first: its anchored content root predates the current provable-field layout");
+            }
+            aProofs.push({
+              item: aItems[i],
+              kind: "membership",
+              fieldKey: res.fieldKey,
+              setRoot: res.setRoot,
+              fieldDigest: res.fieldDigest,
+              fieldSalt: res.fieldSalt,
+              siblings: JSON.parse(res.siblingsJson),
+              dirs: JSON.parse(res.dirsJson),
+              setSiblings: JSON.parse(res.setSiblingsJson),
+              setDirs: JSON.parse(res.setDirsJson)
+            });
+            continue;
+          }
           if (!res || !res.found || res.value === "" || !res.fieldKey || res.scaledValue === "" || !res.siblingsJson) {
             return that.toast("'" + aItems[i].field + "' is not provable on this passport; remove it from the cart");
+          }
+          if (res.rootDrift) {
+            return that.toast("re-anchor this passport first: its anchored content root predates the current provable-field layout");
           }
           aProofs.push({
             item: aItems[i],
@@ -783,6 +934,7 @@ sap.ui.define([
             threshold: Math.round(aItems[i].threshold * 1000),
             op: aItems[i].predicate === "greaterOrEqual" ? 1 : 0,
             fieldValue: res.scaledValue,
+            fieldSalt: res.fieldSalt,
             siblings: JSON.parse(res.siblingsJson),
             dirs: JSON.parse(res.dirsJson)
           });
@@ -798,8 +950,14 @@ sap.ui.define([
             await mod.proveFieldPredicateBatch(api, {
               contractAddress: vault, payloadHash: ph,
               proofs: aProofs.map(function (p) {
-                return { fieldKey: p.fieldKey, threshold: p.threshold, op: p.op,
-                         fieldValue: p.fieldValue, siblings: p.siblings, dirs: p.dirs };
+                return p.kind === "membership"
+                  ? { kind: "membership", fieldKey: p.fieldKey, setRoot: p.setRoot,
+                      fieldDigest: p.fieldDigest, fieldSalt: p.fieldSalt,
+                      siblings: p.siblings, dirs: p.dirs,
+                      setSiblings: p.setSiblings, setDirs: p.setDirs }
+                  : { fieldKey: p.fieldKey, threshold: p.threshold, op: p.op,
+                      fieldValue: p.fieldValue, fieldSalt: p.fieldSalt,
+                      siblings: p.siblings, dirs: p.dirs };
               })
             }, append);
           } catch (e) {
@@ -818,10 +976,17 @@ sap.ui.define([
           append("saving " + aProofs.length + " proofs in cockpit…");
           for (var j = 0; j < aProofs.length; j++) {
             var p = aProofs[j];
-            await that.callAction("/recordWalletPredicate", {
-              passportId: that._pid(), sourceField: p.item.field, predicate: p.item.predicate,
-              threshold: p.threshold, unit: p.item.unit, txHash: r.hash, result: true
-            });
+            if (p.kind === "membership") {
+              await that.callAction("/recordWalletMembership", {
+                passportId: that._pid(), sourceField: p.item.field, setId: p.item.setId,
+                setRoot: p.setRoot, txHash: r.hash, result: true
+              });
+            } else {
+              await that.callAction("/recordWalletPredicate", {
+                passportId: that._pid(), sourceField: p.item.field, predicate: p.item.predicate,
+                threshold: p.threshold, unit: p.item.unit, txHash: r.hash, result: true
+              });
+            }
           }
           that.getView().getModel("cart").setProperty("/items", []);
           that._refreshAll(); append("done.");
@@ -840,7 +1005,9 @@ sap.ui.define([
       this.callAction("/provePassportValuesBatch", {
         passportId: this._pid(),
         claimsJson: JSON.stringify(aItems.map(function (it) {
-          return { sourceField: it.field, predicate: it.predicate, threshold: it.threshold, unit: it.unit };
+          return it.kind === "membership"
+            ? { sourceField: it.field, predicate: "setMembership", setId: it.setId }
+            : { sourceField: it.field, predicate: it.predicate, threshold: it.threshold, unit: it.unit };
         })),
         walletId: this._walletId()
       }).then(function (res) {
@@ -950,7 +1117,13 @@ sap.ui.define([
         oCtx.requestProperty("passportIdHash")
       ]).then(function (aRes) {
         var contentRoot = (aRes[0] && aRes[0].contentRoot) || "";
+        // anchorContentRoot takes the schema id as its third argument since the
+        // salted-leaf release; without it the plan refuses to build the call.
+        var schemaId = (aRes[0] && aRes[0].schemaId) || "";
         var pidHash = aRes[1] || "";
+        if (contentRoot && !schemaId) {
+          return that.toast("this server build returns no schemaId; update the server before anchoring from the wallet");
+        }
         that._lace("Attest with your wallet", async function (mod, api, append, vault) {
           // Batch path: a connector bundle with anchorBatch composes attest +
           // bindPassport + anchorContentRoot as ONE transaction (one wallet
@@ -959,7 +1132,7 @@ sap.ui.define([
           // sequential flow (which has no bindPassport).
           if (typeof mod.anchorBatch === "function" && pidHash) {
             append("anchoring attest + bindPassport" + (contentRoot ? " + content root" : "") + " as ONE transaction (prove -> balance -> submit)…");
-            await mod.anchorBatch(api, { contractAddress: vault, payloadHash: ph, metadataHash: ph, passportIdHash: pidHash, contentRoot: contentRoot }, append);
+            await mod.anchorBatch(api, { contractAddress: vault, payloadHash: ph, metadataHash: ph, passportIdHash: pidHash, contentRoot: contentRoot, schemaId: schemaId }, append);
             var r = await that._resolveHash(mod, append);
             append("saving tx in cockpit…");
             await that.callAction("/recordWalletAttest", { passportId: that._pid(), txHash: r.hash, identifier: r.id, contractAddress: vault });
@@ -971,7 +1144,7 @@ sap.ui.define([
             await that.callAction("/recordWalletAttest", { passportId: that._pid(), txHash: r2.hash, identifier: r2.id, contractAddress: vault });
             if (contentRoot) {
               append("anchoring content root (binds passport fields for field-bound proofs)…");
-              await mod.anchorContentRoot(api, { contractAddress: vault, payloadHash: ph, contentRoot: contentRoot }, append);
+              await mod.anchorContentRoot(api, { contractAddress: vault, payloadHash: ph, contentRoot: contentRoot, schemaId: schemaId }, append);
               await that._resolveHash(mod, append);
             }
           }

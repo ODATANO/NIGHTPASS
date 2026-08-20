@@ -1,103 +1,17 @@
 /**
- * Canonical payload projection v2: rebuild a passport's confidential payload
- * from DATABASE rows so it can be re-hashed and re-anchored after content
- * changes (re-anchoring policy).
- *
- * createPassport hashes this same projection at create time, so a fresh
- * passport's stored hash and the drift check's recompute agree by
- * construction. Rows anchored under the legacy v1 scheme (raw input objects,
- * not reproducible from the DB) show one-time drift until re-anchored; the
- * `payloadVersion: 2` marker guarantees a v2 hash never collides with a v1
- * hash. Determinism rules: fixed column projection per child, all
- * numerics coerced via Number() (so sqlite numbers and pg decimal strings
- * hash identically), null/undefined fields omitted, arrays sorted by a stable
- * business key, attributes canonicalized via hashableAttributes.
- *
- * The pure core (payloadFromDb) is unit-tested; readPayloadInputs is the thin
- * DB reader used by the reanchor action and the drift check.
+ * Canonical payload projection v2. The pure projection (payloadFromDb) is
+ * extracted to @odatano/dpp-sdk (shared with DAYPASS, byte-identical hashing);
+ * only the thin CAP reader lives here. See the SDK module for the determinism
+ * rules and the v1/v2 drift story.
  */
 
 import cds from '@sap/cds';
-import { hashableAttributes, type GuideAttributeRow } from './guide-attribute-defaults';
+import type { GuideAttributeRow } from '@odatano/dpp-sdk/battery/guide-defaults';
+
+export { PAYLOAD_VERSION, payloadFromDb, type PayloadInputs } from '@odatano/dpp-sdk/payload';
+import type { PayloadInputs } from '@odatano/dpp-sdk/payload';
 
 const { SELECT } = cds.ql;
-
-export const PAYLOAD_VERSION = 2;
-
-export interface PayloadInputs {
-    batteries: Record<string, unknown>[];
-    recycledMaterials: Record<string, unknown>[];
-    diligenceDocs: Record<string, unknown>[];
-    attributes: GuideAttributeRow[];
-}
-
-/** Numeric columns are coerced so sqlite (number) and pg (string) agree. */
-function num(v: unknown): number | undefined {
-    if (v == null) return undefined;
-    const n = typeof v === 'number' ? v : Number(v);
-    return Number.isFinite(n) ? n : undefined;
-}
-
-function str(v: unknown): string | undefined {
-    if (v == null) return undefined;
-    const s = String(v);
-    return s === '' ? undefined : s;
-}
-
-/** Object literal with all undefined-valued keys dropped. */
-function compact(o: Record<string, unknown>): Record<string, unknown> {
-    return Object.fromEntries(Object.entries(o).filter(([, v]) => v !== undefined));
-}
-
-const bySortKey = (key: (r: Record<string, unknown>) => string) =>
-    (a: Record<string, unknown>, b: Record<string, unknown>) => key(a).localeCompare(key(b));
-
-/**
- * Build the canonical v2 payload object from row-shaped inputs. Pure and
- * deterministic: the same logical content always yields the same object,
- * regardless of row order or DB adapter numeric representation.
- */
-export function payloadFromDb(inputs: PayloadInputs): Record<string, unknown> {
-    const batteries = inputs.batteries
-        .map((b) => compact({
-            serialNumber: str(b.serialNumber),
-            cellChemistry: str(b.cellChemistry),
-            capacityKwh: num(b.capacityKwh),
-            carbonFootprintKgCO2: num(b.carbonFootprintKgCO2),
-            supplierName: str(b.supplierName),
-            recycledContentPct: num(b.recycledContentPct),
-            cycleLife: num(b.cycleLife),
-            roundTripEfficiencyPct: num(b.roundTripEfficiencyPct),
-            leadContentPpm: num(b.leadContentPpm),
-        }))
-        .sort(bySortKey((b) => String(b.serialNumber ?? '')));
-
-    const recycledMaterials = inputs.recycledMaterials
-        .map((m) => compact({
-            material: str(m.material),
-            recycledPercentage: num(m.recycledPercentage),
-            sourceSupplierName: str(m.sourceSupplierName),
-        }))
-        .sort(bySortKey((m) => String(m.material ?? '')));
-
-    // Uploaded evidence is bound into the version by its sha256; docType-only
-    // placeholder rows stay hashable as before.
-    const diligenceDocs = inputs.diligenceDocs
-        .map((d) => compact({
-            docType: str(d.docType),
-            fileName: str(d.fileName),
-            sha256: str(d.sha256),
-        }))
-        .sort(bySortKey((d) => `${d.docType ?? ''}\0${d.fileName ?? ''}\0${d.sha256 ?? ''}`));
-
-    return {
-        payloadVersion: PAYLOAD_VERSION,
-        batteries,
-        recycledMaterials,
-        diligenceDocs,
-        attributes: hashableAttributes(inputs.attributes),
-    };
-}
 
 /** Read the payload inputs of a passport from the DB (current state). */
 export async function readPayloadInputs(passportRowId: string): Promise<PayloadInputs> {

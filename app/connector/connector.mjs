@@ -24,8 +24,8 @@ if (typeof globalThis.global === 'undefined') globalThis.global = globalThis;
 // Shared anchor call plan (pure TS, bundled by vite): the SAME ordered circuit
 // list the server submits via NIGHTGATE submitContractCallBatch, so the two
 // anchor paths cannot drift.
-import { anchorCallPlan } from '../../srv/lib/anchor-plan';
-import { proofCartPlan } from '../../srv/lib/proof-plan';
+import { anchorTxPlan } from '../../srv/lib/anchor-plan';
+import { proofCartPlan, claimKey } from '../../srv/lib/proof-plan';
 
 // NOTE: all heavy SDK/WASM imports are LAZY (loaded inside the action functions)
 // so the page + wallet connect work even before any ZK artifact loads. Importing
@@ -50,7 +50,7 @@ const LOCAL_PROVER_URL = 'http://localhost:6300';
  * Opt-in switch for wallet-delegated proving (NIGHTGATE 0.12.1 `proving: 'wallet'`).
  *
  * Set `localStorage['nightpass:wallet-prover'] = '1'` in the cockpit tab and contract circuits are
- * proved INSIDE the connected wallet — no docker proof server needed at all. Off by default
+ * proved INSIDE the connected wallet; no docker proof server is needed at all. Off by default
  * because it trades seconds (docker prover) for MINUTES of the user's own CPU per circuit, which
  * is the wrong default for a demo. Reading localStorage is wrapped: it throws in some privacy
  * modes, and a wallet-proving toggle must never be able to break the normal path.
@@ -383,7 +383,7 @@ async function prepareSdkContext(api, witnesses, log) {
         connector: api,
         manifest,
         contract: CONTRACT,
-        // 'wallet' delegates contract proving to the connected wallet's own prover — no local
+        // 'wallet' delegates contract proving to the connected wallet's own prover; no local
         // proof server at all (NIGHTGATE 0.12.1). Opt-in per browser via
         //   localStorage['nightpass:wallet-prover'] = '1'
         // because it costs MINUTES of the user's CPU per circuit, versus seconds against the
@@ -416,11 +416,11 @@ async function prepareSdkContext(api, witnesses, log) {
 
     // Wallet modality: the provider assembled above already proves in the wallet, so nothing is
     // overridden. Server modality: keep pointing at the LOCAL proof server rather than the hosted
-    // one the connector reported (see LOCAL_PROVER_URL note — the hosted one is CORS-unusable).
+    // one the connector reported (see the LOCAL_PROVER_URL note; the hosted one is CORS-unusable).
     let proofProvider;
     if (providers.provingModality === 'wallet') {
         proofProvider = providers.proofProvider;
-        log('prover: WALLET-DELEGATED (in-wallet WASM prover — expect minutes per circuit)');
+        log('prover: WALLET-DELEGATED (in-wallet WASM prover; expect minutes per circuit)');
     } else {
         proofProvider = proofMod.httpClientProofProvider(LOCAL_PROVER_URL, providers.zkConfigProvider);
         log(`prover override: ${LOCAL_PROVER_URL}`);
@@ -601,16 +601,25 @@ export async function provePredicate(api, { contractAddress, payloadHash, value,
 //      it folds to the anchored root, THEN asserts the predicate. A successful tx
 //      proves the predicate holds for THIS passport's field, value still hidden.
 
-/** anchorContentRoot(payload_hash, content_root): pin the field Merkle root. */
-export async function anchorContentRoot(api, { contractAddress, payloadHash, contentRoot }, log = console.log) {
+/**
+ * anchorContentRoot(payload_hash, content_root, schema_id): pin the field
+ * Merkle root plus the schema it was built over. The schema id is the depth-4
+ * root over the 16 slot descriptors; the cross-root comparison circuit
+ * recomputes it, so a root anchored under a foreign schema label cannot be
+ * compared later. Anchoring is insert-once: re-anchoring the same payload with
+ * a DIFFERENT root or schema is rejected in-circuit (an identical re-anchor is
+ * a no-op).
+ */
+export async function anchorContentRoot(api, { contractAddress, payloadHash, contentRoot, schemaId }, log = console.log) {
     const L = mklog(log);
+    if (!schemaId) throw new Error('anchorContentRoot: schemaId is required (third circuit argument since 0.16.0)');
     L('anchorContentRoot: loading browser SDK…');
     const { buildAttestationVaultWitnesses } = await loadBrowserSdk();
     L('anchorContentRoot: deriving app-managed attester secret…');
     const attestationSecret = await deriveAttesterSecret(api);
     const call = {
         circuitId: 'anchorContentRoot',
-        args: [fromHex(payloadHash), fromHex(contentRoot)],
+        args: [fromHex(payloadHash), fromHex(contentRoot), fromHex(schemaId)],
         witnesses: buildAttestationVaultWitnesses({ attestationSecret })
     };
     L('anchoring content root (binds the passport fields for later field-bound proofs)…');
@@ -759,28 +768,40 @@ async function runPreparedBatch(api, contractAddress, calls, log) {
  * passportIdHash to this wallet's attester identity and asserts the attest,
  * which is exactly why the deterministic call order above is required.
  */
-export async function anchorBatch(api, { contractAddress, payloadHash, metadataHash, passportIdHash, contentRoot }, log = console.log) {
+export async function anchorBatch(api, { contractAddress, payloadHash, metadataHash, passportIdHash, contentRoot, schemaId }, log = console.log) {
     const L = mklog(log);
     L('anchorBatch: loading browser SDK (first call downloads ~10MB WASM, please wait)…');
     const { buildAttestationVaultWitnesses } = await loadBrowserSdk();
     L('anchorBatch: deriving app-managed attester secret (no wallet popup)…');
     const attestationSecret = await deriveAttesterSecret(api);
     const witnesses = buildAttestationVaultWitnesses({ attestationSecret });
-    // Plan args are 64-hex Bytes<32> strings in circuit signature order; the
-    // anchor circuits take no other argument types.
-    const calls = anchorCallPlan({ payloadHash, metadataHash, passportIdHash, ...(contentRoot ? { contentRoot } : {}) })
-        .map((c) => ({ circuitId: c.circuit, args: c.args.map((h) => fromHex(h)), witnesses }));
-    L(`anchorBatch: ${calls.length} vault calls in one tx [${calls.map((c) => c.circuitId).join('+')}]`);
-    return runPreparedBatch(api, contractAddress, calls, L);
+    // The shared plan groups the calls into transactions. It is TWO since
+    // 0.16.0: attest writes the vault's attestation-sequence counter, and the
+    // ledger rejects a batch whose cell update is followed by a later intent
+    // (1010/188). So this asks for two wallet approvals; a single one would
+    // simply not land (see srv/lib/anchor-plan.ts for the measurement).
+    const txs = anchorTxPlan({ payloadHash, metadataHash, passportIdHash, ...(contentRoot ? { contentRoot, schemaId } : {}) });
+    L(`anchorBatch: ${txs.length} transactions [${txs.map((t) => t.label).join(' then ')}], one approval each`);
+    let last = null;
+    for (let i = 0; i < txs.length; i++) {
+        const calls = txs[i].calls.map((c) => ({ circuitId: c.circuit, args: c.args.map((h) => fromHex(h)), witnesses }));
+        L(`anchorBatch: transaction ${i + 1}/${txs.length} [${txs[i].label}] — please approve in your wallet`);
+        last = await runPreparedBatch(api, contractAddress, calls, L);
+    }
+    return last;
 }
 
 /**
  * proveFieldPredicate(payload_hash, field_key, threshold, op): field-bound proof.
- * `merkleProof` = { fieldValue (scaled decimal string), siblings (4 × 64-hex),
- * dirs (4 booleans) }. op 0 = value ≤ threshold, 1 = value ≥ threshold.
+ * `merkleProof` = { fieldValue (scaled decimal string), fieldSalt (64-hex),
+ * siblings (4 × 64-hex), dirs (4 booleans) }. op 0 = value ≤ threshold,
+ * 1 = value ≥ threshold. The salt is the slot's share of the document salt
+ * seed: leaves are salted since 0.16.0, so without it the recomputed leaf
+ * never folds to the anchored root.
  */
-export async function proveFieldPredicate(api, { contractAddress, payloadHash, fieldKey, threshold, op, fieldValue, siblings, dirs }, log = console.log) {
+export async function proveFieldPredicate(api, { contractAddress, payloadHash, fieldKey, threshold, op, fieldValue, fieldSalt, siblings, dirs }, log = console.log) {
     const L = mklog(log);
+    if (!fieldSalt) throw new Error('proveFieldPredicate: fieldSalt is required (salted leaves since 0.16.0)');
     L('proveFieldPredicate: loading browser SDK…');
     const { buildAttestationVaultWitnesses } = await loadBrowserSdk();
     L('proveFieldPredicate: deriving app-managed attester secret…');
@@ -789,7 +810,10 @@ export async function proveFieldPredicate(api, { contractAddress, payloadHash, f
     const call = {
         circuitId: 'proveFieldPredicate',
         args: [fromHex(payloadHash), fromHex(fieldKey), BigInt(threshold), BigInt(opNum)],
-        witnesses: buildAttestationVaultWitnesses({ attestationSecret, merkleProof: { fieldValue: String(fieldValue), siblings, dirs } })
+        witnesses: buildAttestationVaultWitnesses({
+            attestationSecret,
+            merkleProof: { fieldValue: String(fieldValue), fieldSalt, siblings, dirs }
+        })
     };
     L(`proving field ${fieldValue} ${opNum === 0 ? '≤' : '≥'} ${threshold}, bound to this passport's content root, value hidden…`);
     const result = await runPreparedCall(api, contractAddress, call, L);
@@ -798,24 +822,30 @@ export async function proveFieldPredicate(api, { contractAddress, payloadHash, f
 }
 
 /**
- * Proof cart: prove N field-bound predicates for ONE passport in ONE
- * transaction (one wallet approval, one fee). `proofs` entries carry the
- * claim ({ fieldKey, threshold (scaled), op }) plus their inclusion proof
- * ({ fieldValue (scaled decimal string), siblings (4 x 64-hex), dirs (4
- * booleans) }); the claim list is validated/deduped by the shared
- * proofCartPlan (same source the server lane will consume).
+ * Proof cart: prove N field-bound claims for ONE passport in ONE transaction
+ * (one wallet approval, one fee). Two entry kinds may mix freely:
+ *   - predicate: { fieldKey, threshold (scaled), op } plus the inclusion
+ *     proof { fieldValue (scaled decimal string), siblings (4 x 64-hex),
+ *     dirs (4 booleans) };
+ *   - membership: { kind: 'membership', fieldKey, setRoot } plus
+ *     { fieldDigest (64-hex), siblings (4), dirs (4), setSiblings (6 x
+ *     64-hex), setDirs (6 booleans) } (proveFieldMembership: the hidden
+ *     value's digest folds into BOTH the content root and the allow-list
+ *     set root).
+ * The claim list is validated/deduped by the shared proofCartPlan (same
+ * source the server lane consumes).
  *
  * Witness mechanics: findDeployedContract binds ONE witness object, but each
- * proveFieldPredicate needs its own Merkle proof. The witness functions for
- * field_value/merkle_siblings/merkle_dirs therefore read a mutable holder,
- * and each call's before() hook (runPreparedBatch) points the holder at that
- * call's pre-converted proof data. Calls run sequentially inside the scope,
- * so this is deterministic and independent of witness invocation counts.
+ * call needs its own Merkle material. All witness functions therefore read a
+ * mutable holder, and each call's before() hook (runPreparedBatch) points
+ * the holder at that call's pre-converted data. Calls run sequentially
+ * inside the scope, and each circuit only invokes the witnesses it
+ * declares, so one merged witness object serves mixed carts.
  *
- * Failure semantics: a predicate that does not hold rejects during LOCAL
- * proving ("predicate false"), so the whole cart aborts with nothing
- * submitted. Proving time stays additive (N proofs = N proving runs); the
- * cart amortizes approvals, balancing, fees and confirmation waits to one.
+ * Failure semantics: a claim that does not hold rejects during LOCAL
+ * proving ("predicate false" / non-member), so the whole cart aborts with
+ * nothing submitted. Proving time stays additive (N proofs = N proving
+ * runs); the cart amortizes approvals, balancing, fees and confirmations.
  */
 export async function proveFieldPredicateBatch(api, { contractAddress, payloadHash, proofs }, log = console.log) {
     const L = mklog(log);
@@ -824,45 +854,67 @@ export async function proveFieldPredicateBatch(api, { contractAddress, payloadHa
     const { buildAttestationVaultWitnesses } = await loadBrowserSdk();
     L('proveFieldPredicateBatch: deriving app-managed attester secret…');
     const attestationSecret = await deriveAttesterSecret(api);
-    const plan = proofCartPlan({
-        payloadHash,
-        claims: proofs.map((p) => ({ fieldKey: p.fieldKey, threshold: p.threshold, op: Number(p.op) }))
-    });
+    const planClaimOf = (p) => (p.kind === 'membership'
+        ? { kind: 'membership', fieldKey: p.fieldKey, setRoot: p.setRoot }
+        : { fieldKey: p.fieldKey, threshold: p.threshold, op: Number(p.op) });
+    const plan = proofCartPlan({ payloadHash, claims: proofs.map(planClaimOf) });
     if (plan.dropped.length) L(`proveFieldPredicateBatch: dropped ${plan.dropped.length} duplicate claim(s) (already in the cart)`);
     // Pre-convert each kept claim's witness data; the holder swaps between
-    // calls. Claims were deduped by (fieldKey, threshold, op), so matching
+    // calls. Claims were deduped by their canonical claim key, so matching
     // the original proofs entry by the same key is unambiguous.
-    const byKey = new Map(proofs.map((p) => [
-        `${String(p.fieldKey).toLowerCase()}|${String(p.threshold)}|${Number(p.op)}`, p
-    ]));
+    const byKey = new Map(proofs.map((p) => [claimKey(planClaimOf(p)), p]));
     const converted = plan.claims.map((c) => {
-        const src = byKey.get(`${c.fieldKey}|${c.threshold}|${c.op}`);
+        const src = byKey.get(claimKey(c));
         if (!src) throw new Error(`no inclusion proof supplied for claim on field key ${c.fieldKey.slice(0, 16)}…`);
         const siblings = (src.siblings || []).map((h) => fromHex(h));
         const dirs = (src.dirs || []).map(Boolean);
         if (siblings.length !== 4 || dirs.length !== 4) {
             throw new Error('each proof needs a depth-4 inclusion proof (4 siblings + 4 dirs)');
         }
-        return { fieldValue: BigInt(src.fieldValue), siblings, dirs };
+        // Salted leaves (0.16.0): every field-bound circuit recomputes the leaf
+        // from value + SALT, so a cart item without its slot salt can only fail
+        // at proving time, minutes in.
+        if (!src.fieldSalt) throw new Error('each proof needs its fieldSalt (salted leaves since 0.16.0)');
+        const fieldSalt = fromHex(src.fieldSalt);
+        if (c.kind === 'membership') {
+            const setSiblings = (src.setSiblings || []).map((h) => fromHex(h));
+            const setDirs = (src.setDirs || []).map(Boolean);
+            if (setSiblings.length !== 6 || setDirs.length !== 6) {
+                throw new Error('each membership proof needs a depth-6 set inclusion proof (6 siblings + 6 dirs)');
+            }
+            if (!src.fieldDigest) throw new Error('each membership proof needs the fieldDigest (blake2b-256 of the exact value)');
+            return { fieldDigest: fromHex(src.fieldDigest), fieldSalt, siblings, dirs, setSiblings, setDirs };
+        }
+        return { fieldValue: BigInt(src.fieldValue), fieldSalt, siblings, dirs };
     });
     const holder = { current: null };
     // Base witnesses carry the attester secret; the Merkle witnesses read the
     // holder so ONE bound witness object serves every call's distinct proof.
+    // Each circuit only invokes the witnesses it declares (predicate:
+    // field_value; membership: field_digest + set_*; both: merkle_*).
     const witnesses = {
         ...buildAttestationVaultWitnesses({ attestationSecret }),
         field_value: (ctx) => [ctx.privateState, holder.current.fieldValue],
+        field_salt: (ctx) => [ctx.privateState, holder.current.fieldSalt],
         merkle_siblings: (ctx) => [ctx.privateState, holder.current.siblings],
-        merkle_dirs: (ctx) => [ctx.privateState, holder.current.dirs]
+        merkle_dirs: (ctx) => [ctx.privateState, holder.current.dirs],
+        field_digest: (ctx) => [ctx.privateState, holder.current.fieldDigest],
+        set_siblings: (ctx) => [ctx.privateState, holder.current.setSiblings],
+        set_dirs: (ctx) => [ctx.privateState, holder.current.setDirs]
     };
     const calls = plan.calls.map((c, i) => ({
         circuitId: c.circuit,
-        args: [fromHex(c.args[0]), fromHex(c.args[1]), BigInt(c.args[2]), BigInt(c.args[3])],
+        // Per-circuit arg conversion: predicate = 2 hex + 2 BigInt,
+        // membership = 3 hex (payloadHash, fieldKey, setRoot).
+        args: c.circuit === 'proveFieldMembership'
+            ? [fromHex(c.args[0]), fromHex(c.args[1]), fromHex(c.args[2])]
+            : [fromHex(c.args[0]), fromHex(c.args[1]), BigInt(c.args[2]), BigInt(c.args[3])],
         witnesses,
         before: () => { holder.current = converted[i]; }
     }));
-    L(`proveFieldPredicateBatch: ${calls.length} predicate proof(s) in one tx (proving runs once per claim, please wait)…`);
+    L(`proveFieldPredicateBatch: ${calls.length} proof(s) in one tx (proving runs once per claim, please wait)…`);
     const result = await runPreparedBatch(api, contractAddress, calls, L);
-    L(`✓ ${calls.length} field-bound predicate(s) proven on-chain in one transaction, values hidden.`);
+    L(`✓ ${calls.length} field-bound claim(s) proven on-chain in one transaction, values hidden.`);
     return { ...(result && typeof result === 'object' ? result : { result }), claims: plan.claims, dropped: plan.dropped };
 }
 

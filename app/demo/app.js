@@ -255,8 +255,39 @@
   function claimRow(spec) {
     var wrap = document.createElement('label');
     wrap.className = 'claim-item';
-    var rel = spec.predicate === 'lessOrEqual' ? 'at most' : 'at least';
     var idBase = 'claim_' + spec.field;
+    if (spec.kind === 'membership') {
+      // Membership claim: pick the confidential value from the published
+      // allow-list; the proof shows it IS in the list, never which one.
+      var options = [];
+      try { options = JSON.parse(spec.optionsJson || '[]'); } catch (e) { options = []; }
+      wrap.innerHTML =
+        '<span class="claim-line">' +
+          '<input type="checkbox" id="' + idBase + '_on" data-field="' + esc(spec.field) + '">' +
+          '<span class="claim-label">' + esc(spec.label) + '</span>' +
+          '<span class="chip-conf">confidential</span>' +
+          '<span class="claim-inputs">' +
+            '<span class="claim-input">Value' +
+              '<select id="' + idBase + '_c" disabled>' +
+                options.map(function (o) {
+                  return '<option value="' + esc(o) + '"' + (o === spec.defaultOption ? ' selected' : '') + '>' + esc(o) + '</option>';
+                }).join('') +
+              '</select>' +
+            '</span>' +
+            '<span class="claim-input">Prove: in ' + esc(spec.setLabel || 'the allowed list') + '</span>' +
+          '</span>' +
+        '</span>' +
+        '<span class="hint claim-hint"></span>';
+      var mbox = wrap.querySelector('#' + idBase + '_on');
+      mbox.addEventListener('change', function () {
+        wrap.classList.toggle('on', mbox.checked);
+        wrap.querySelector('#' + idBase + '_c').disabled = !mbox.checked;
+        updateClaimState();
+      });
+      wrap.querySelector('#' + idBase + '_c').addEventListener('change', updateClaimState);
+      return wrap;
+    }
+    var rel = spec.predicate === 'lessOrEqual' ? 'at most' : 'at least';
     wrap.innerHTML =
       '<span class="claim-line">' +
         '<input type="checkbox" id="' + idBase + '_on" data-field="' + esc(spec.field) + '">' +
@@ -291,6 +322,10 @@
     claimSpecs.forEach(function (spec) {
       var on = $('claim_' + spec.field + '_on');
       if (!on || !on.checked) return;
+      if (spec.kind === 'membership') {
+        out.push({ spec: spec, field: spec.field, member: $('claim_' + spec.field + '_c').value });
+        return;
+      }
       out.push({
         spec: spec,
         field: spec.field,
@@ -302,6 +337,7 @@
   }
 
   function claimTrue(c) {
+    if (c.spec.kind === 'membership') { return !!c.member; } // options ARE the list
     return c.spec.predicate === 'lessOrEqual' ? c.value <= c.threshold : c.value >= c.threshold;
   }
 
@@ -316,6 +352,7 @@
       var hint = row.closest('.claim-item').querySelector('.claim-hint');
       var c = picked.find(function (p) { return p.field === spec.field; });
       if (!c) { hint.textContent = ''; hint.classList.remove('err'); return; }
+      if (spec.kind === 'membership') { hint.textContent = ''; hint.classList.remove('err'); return; }
       var rel = spec.predicate === 'lessOrEqual' ? 'at most' : 'at least';
       if (claimTrue(c)) {
         // No informational hint: ticked rows stay one line. Only an untrue
@@ -371,7 +408,9 @@
         co2Kg: co2,
         proveThreshold: thr,
         claimsJson: JSON.stringify(extra.map(function (c) {
-          return { field: c.field, value: c.value, threshold: c.threshold };
+          return c.spec.kind === 'membership'
+            ? { field: c.field, member: c.member }
+            : { field: c.field, value: c.value, threshold: c.threshold };
         }))
       });
       store.set('runId', r.runId);
@@ -430,19 +469,19 @@
     return `waiting for a free slot (${running || 'busy'}${ahead})`;
   }
 
-  // The three anchor circuits ride in ONE batched Midnight transaction
-  // (NIGHTGATE 0.10.x deterministic batch order). Rendered as one grouped
-  // timeline entry so the batching is visible, not just implied by three
-  // identical tx links. Multi-claim proofs (kind "prove:<field>") get the
-  // same treatment: one group, one shared proof tx.
+  // The anchor circuits are grouped into one timeline entry. They ride in TWO
+  // Midnight transactions since the vault started sequencing attestations:
+  // attest alone, then anchorContentRoot + bindPassport together (see
+  // srv/lib/anchor-plan.ts). Multi-claim proofs (kind "prove:<field>") stay a
+  // single batched transaction and get the same grouped treatment.
   const BATCH_KINDS = ['attest', 'bindPassport', 'anchorContentRoot'];
   const isProveKind = (k) => String(k || '').indexOf('prove:') === 0;
 
   const ANCHOR_GROUP = {
     title: 'Anchor passport on-chain',
-    badge: (n) => n + ' circuits · 1 batched transaction',
+    badge: (n) => n + ' circuits · 2 transactions',
     info: '',
-    txLabel: 'batched tx '
+    txLabel: 'tx '
   };
   const PROVE_GROUP = {
     title: 'ZK-prove your claims',

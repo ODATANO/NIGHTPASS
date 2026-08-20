@@ -2,28 +2,47 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
     CLAIM_FIELDS, PRIMARY_CLAIM_FIELD, MAX_DEMO_CLAIMS, claimHolds, claimFieldByName,
-    validateClaims, demoClaimList, demoBatteryValues,
+    membershipSetFor, validateClaims, demoClaimList, demoBatteryValues,
 } from '../../srv/lib/demo-claims';
-import { BATTERY_PROVABLE_FIELDS } from '../../srv/lib/passport-anchor';
+import { BATTERY_PROVABLE_FIELDS, STRING_PROVABLE_FIELDS } from '../../srv/lib/passport-anchor';
+import { claimSetById } from '../../srv/lib/claim-sets';
+
+/** Every claim built from a spec's defaults (true by construction). */
+function defaultClaims() {
+    return CLAIM_FIELDS.map((c) => c.kind === 'membership'
+        ? { field: c.field, member: c.defaultValue }
+        : { field: c.field, value: c.defaultValue, threshold: c.defaultThreshold });
+}
 
 describe('claim catalogue', () => {
     // A field the circuit cannot prove would fail deep in the run, after the
     // visitor already waited for the anchor.
     it('only lists fields the proof path supports', () => {
         for (const c of CLAIM_FIELDS) {
-            assert.ok((BATTERY_PROVABLE_FIELDS as readonly string[]).includes(c.field), `${c.field} not provable`);
+            if (c.kind === 'membership') {
+                assert.ok((STRING_PROVABLE_FIELDS as readonly string[]).includes(c.field), `${c.field} not provable`);
+                assert.ok(claimSetById(c.setId), `${c.field} references unknown set '${c.setId}'`);
+            } else {
+                assert.ok((BATTERY_PROVABLE_FIELDS as readonly string[]).includes(c.field), `${c.field} not provable`);
+            }
         }
     });
 
     it('ships defaults that form a TRUE claim', () => {
         for (const c of CLAIM_FIELDS) {
-            assert.ok(claimHolds(c, c.defaultValue, c.defaultThreshold), `${c.field} default claim is false`);
+            if (c.kind === 'membership') {
+                assert.ok(membershipSetFor(c)?.values.includes(c.defaultValue),
+                    `${c.field} default '${c.defaultValue}' is not in set '${c.setId}'`);
+            } else {
+                assert.ok(claimHolds(c, c.defaultValue, c.defaultThreshold), `${c.field} default claim is false`);
+            }
         }
     });
 
     it('has the carbon footprint as the primary claim', () => {
-        assert.ok(claimFieldByName(PRIMARY_CLAIM_FIELD));
-        assert.equal(claimFieldByName(PRIMARY_CLAIM_FIELD)!.predicate, 'lessOrEqual');
+        const primary = claimFieldByName(PRIMARY_CLAIM_FIELD);
+        assert.ok(primary && primary.kind !== 'membership');
+        assert.equal(primary.predicate, 'lessOrEqual');
     });
 });
 
@@ -56,8 +75,18 @@ describe('validateClaims', () => {
         assert.equal(tooLow.ok, false);
     });
 
+    it('accepts a membership claim from the allow-list and rejects a non-member', () => {
+        const good = validateClaims([{ field: 'cellChemistry', member: 'Li-ion LFP' }]);
+        assert.equal(good.ok, true);
+        assert.deepEqual(good.claims, [{ field: 'cellChemistry', member: 'Li-ion LFP' }]);
+        // Exact-string rule: a different spelling is a different (non-)member.
+        assert.equal(validateClaims([{ field: 'cellChemistry', member: 'lfp' }]).ok, false);
+        assert.equal(validateClaims([{ field: 'cellChemistry', member: 'Unobtainium' }]).ok, false);
+        assert.equal(validateClaims([{ field: 'cellChemistry' }]).ok, false);
+    });
+
     it('caps the number of claims', () => {
-        const many = CLAIM_FIELDS.map((c) => ({ field: c.field, value: c.defaultValue, threshold: c.defaultThreshold }));
+        const many = defaultClaims();
         assert.equal(validateClaims(many).ok, true);
         assert.equal(validateClaims([...many, ...many]).ok, false);
         assert.equal(MAX_DEMO_CLAIMS, CLAIM_FIELDS.length);
@@ -68,8 +97,9 @@ describe('demoClaimList', () => {
     it('always proves the footprint, from the dedicated inputs', () => {
         const list = demoClaimList({ co2Kg: 3000, proveThreshold: 4000 });
         assert.equal(list.length, 1);
+        const first = list[0] as { field: string; value: number; threshold: number; predicate: string };
         assert.deepEqual(
-            { f: list[0].field, v: list[0].value, t: list[0].threshold, p: list[0].predicate },
+            { f: first.field, v: first.value, t: first.threshold, p: first.predicate },
             { f: PRIMARY_CLAIM_FIELD, v: 3000, t: 4000, p: 'lessOrEqual' });
     });
 
@@ -86,13 +116,25 @@ describe('demoClaimList', () => {
         assert.equal(list.find((c) => c.field === 'capacityKwh')!.predicate, 'greaterOrEqual');
     });
 
+    it('resolves a membership claim with its set id and label', () => {
+        const list = demoClaimList({
+            co2Kg: 3000, proveThreshold: 4000,
+            extraClaims: [{ field: 'cellChemistry', member: 'Na-ion' }],
+        });
+        const m = list.find((c) => c.field === 'cellChemistry');
+        assert.ok(m && m.predicate === 'setMembership');
+        assert.equal(m.member, 'Na-ion');
+        assert.equal(m.setId, 'chemistry-known');
+        assert.equal(m.setLabel, claimSetById('chemistry-known')!.label);
+    });
+
     it('never lets an extra claim override the footprint inputs', () => {
         const list = demoClaimList({
             co2Kg: 3000, proveThreshold: 4000,
             extraClaims: [{ field: PRIMARY_CLAIM_FIELD, value: 99, threshold: 99 }],
         });
         assert.equal(list.length, 1);
-        assert.equal(list[0].value, 3000);
+        assert.equal((list[0] as { value: number }).value, 3000);
     });
 });
 
@@ -101,7 +143,17 @@ describe('demoBatteryValues', () => {
         const v = demoBatteryValues({ co2Kg: 2500, extraClaims: [{ field: 'cycleLife', value: 4000, threshold: 3000 }] });
         assert.equal(v.carbonFootprintKgCO2, 2500);
         assert.equal(v.cycleLife, 4000);
-        assert.equal(v.capacityKwh, claimFieldByName('capacityKwh')!.defaultValue);
+        const cap = claimFieldByName('capacityKwh');
+        assert.ok(cap && cap.kind !== 'membership');
+        assert.equal(v.capacityKwh, cap.defaultValue);
+    });
+
+    it('always emits the chemistry so the membership leaf is provable', () => {
+        // Unclaimed: the catalogue default.
+        assert.equal(demoBatteryValues({ co2Kg: 1 }).cellChemistry, 'Li-ion NMC');
+        // Claimed: the visitor's pick.
+        const v = demoBatteryValues({ co2Kg: 1, extraClaims: [{ field: 'cellChemistry', member: 'Li-ion LFP' }] });
+        assert.equal(v.cellChemistry, 'Li-ion LFP');
     });
 
     it('ignores unknown fields', () => {

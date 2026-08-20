@@ -46,6 +46,10 @@
           </Menu>
         </menu>
       </MenuButton>
+      <Button text="Prove integrity" enabled="{= ${ui>/anchored} &amp;&amp; ${session>/mode} === 'server' }"
+              icon="sap-icon://compare-2"
+              tooltip="Prove that the current version changed nothing outside an allowed set of fields, compared to the previous anchored version. Values stay hidden; the proof states only which slots changed."
+              press="onProveIntegrity"/>
       <Button text="Grant" enabled="{ui>/anchored}" icon="{= ${session>/mode} === 'server' ? 'sap-icon://it-host' : 'sap-icon://wallet' }" press="onGrantAction"/>
       <Button text="Revoke" enabled="{ui>/anchored}" icon="sap-icon://delete" press="onRevokeAction"/>
       <Button text="Prove" enabled="{ui>/anchored}" icon="{= ${session>/mode} === 'server' ? 'sap-icon://it-host' : 'sap-icon://wallet' }" press="onProveAction"/>
@@ -231,16 +235,22 @@
                   <core:Item key="recycledCoPct" text="Recycled cobalt (%)"/>
                   <core:Item key="recycledLiPct" text="Recycled lithium (%)"/>
                   <core:Item key="recycledNiPct" text="Recycled nickel (%)"/>
+                  <core:Item key="cellChemistry" text="Cell chemistry (set membership)"/>
                 </Select>
-                <Label text="Predicate"/>
+                <Label id="proofPredicateLabel" text="Predicate"/>
                 <Select id="proofPredicate" selectedKey="lessOrEqual">
                   <core:Item key="lessOrEqual" text="value ≤ threshold"/>
                   <core:Item key="greaterOrEqual" text="value ≥ threshold"/>
                 </Select>
-                <Label text="Threshold"/>
+                <Label id="proofThresholdLabel" text="Threshold"/>
                 <Input id="proofThreshold" value="4000" type="Number"/>
-                <Label text="Unit"/>
+                <Label id="proofUnitLabel" text="Unit"/>
                 <Input id="proofUnit" value="kg CO₂ / kWh"/>
+                <!-- Membership claims: the hidden value is proven to be ONE of a
+                     published allow-list, without revealing which. -->
+                <Label id="proofSetLabel" text="Allowed set" visible="false"/>
+                <Select id="proofSet" visible="false"
+                        tooltip="The passport's value is proven to be in this published list; the exact value stays confidential"/>
               </f:content>
             </f:SimpleForm>
             <!-- Proof cart: collect claims, prove them all in ONE tx. Wallet
@@ -278,7 +288,7 @@
                 <ColumnListItem>
                   <cells>
                     <Text text="{sourceField}"/>
-                    <Text text="{= ${predicate} + ' ' + ${threshold} + ' ' + (${unit} || '') }"/>
+                    <Text text="{= ${predicate} === 'setMembership' ? ('∈ ' + (${setId} || 'allowed set')) : (${predicate} + ' ' + ${threshold} + ' ' + (${unit} || '')) }"/>
                     <ObjectStatus text="{= ${status} === 'succeeded' ? 'proven' : ${status} === 'failed' ? 'false' : ${status} === 'offline' ? 'offline' : ${status} === 'pending' ? 'proving…' : '—' }"
                       state="{= ${status} === 'succeeded' ? 'Success' : ${status} === 'failed' ? 'Error' : ${status} === 'pending' ? 'Warning' : 'None' }"/>
                     <ObjectStatus text="{status}" state="{= ${status} === 'succeeded' ? 'Success' : ${status} === 'failed' ? 'Error' : ${status} === 'pending' ? 'Warning' : 'None' }"/>
