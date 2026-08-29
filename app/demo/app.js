@@ -274,9 +274,15 @@
                 }).join('') +
               '</select>' +
             '</span>' +
-            '<span class="claim-input">Prove: in ' + esc(spec.setLabel || 'the allowed list') + '</span>' +
+            '<span class="claim-input">Prove: one of ' + options.length + ' ' + esc(spec.setLabel || 'allowed values').toLowerCase() + '</span>' +
           '</span>' +
         '</span>' +
+        // Membership is a different kind of claim than the bounds above, so
+        // it gets a permanent explanation plus the public list it refers to.
+        '<span class="hint claim-explain">Proves your chemistry is on this public list. Which of the ' + options.length +
+          ' it is stays hidden. ' +
+          '<button type="button" class="link-btn" id="' + idBase + '_toggle">Show the list</button></span>' +
+        '<span class="claim-set-list" id="' + idBase + '_list" hidden>' + options.map(esc).join(' \u00b7 ') + '</span>' +
         '<span class="hint claim-hint"></span>';
       var mbox = wrap.querySelector('#' + idBase + '_on');
       mbox.addEventListener('change', function () {
@@ -285,6 +291,13 @@
         updateClaimState();
       });
       wrap.querySelector('#' + idBase + '_c').addEventListener('change', updateClaimState);
+      var toggle = wrap.querySelector('#' + idBase + '_toggle');
+      var list = wrap.querySelector('#' + idBase + '_list');
+      toggle.addEventListener('click', function (ev) {
+        ev.preventDefault();
+        list.hidden = !list.hidden;
+        toggle.textContent = list.hidden ? 'Show the list' : 'Hide the list';
+      });
       return wrap;
     }
     var rel = spec.predicate === 'lessOrEqual' ? 'at most' : 'at least';
@@ -469,24 +482,26 @@
     return `waiting for a free slot (${running || 'busy'}${ahead})`;
   }
 
-  // The anchor circuits are grouped into one timeline entry. They ride in TWO
-  // Midnight transactions since the vault started sequencing attestations:
-  // attest alone, then anchorContentRoot + bindPassport together (see
-  // srv/lib/anchor-plan.ts). Multi-claim proofs (kind "prove:<field>") stay a
-  // single batched transaction and get the same grouped treatment.
-  const BATCH_KINDS = ['attest', 'bindPassport', 'anchorContentRoot'];
+  // The anchor is TWO Midnight transactions since the vault started
+  // sequencing attestations (see srv/lib/anchor-plan.ts): attest alone, then
+  // anchorContentRoot + bindPassport together. The timeline mirrors that:
+  // attest is its own entry, the other two form one grouped entry. Multi-claim
+  // proofs (kind "prove:<field>") stay a single batched transaction and get
+  // the same grouped treatment.
+  const BATCH_KINDS = ['anchorContentRoot', 'bindPassport'];
   const isProveKind = (k) => String(k || '').indexOf('prove:') === 0;
 
   const ANCHOR_GROUP = {
-    title: 'Anchor passport on-chain',
-    badge: (n) => n + ' circuits · 2 transactions',
-    info: '',
+    title: 'Bind passport id + anchor field root',
+    badge: (n) => n + ' circuits · 1 transaction',
+    info: 'The passport id is bound to the fingerprint and the salted field tree root is anchored, both in one transaction.',
     txLabel: 'tx '
   };
   const PROVE_GROUP = {
     title: 'ZK-prove your claims',
     badge: (n) => n + ' ZK proofs · 1 batched transaction',
-    info: '',
+    info: 'Every line below is a public statement about one of your confidential values, and that statement is all the proof reveals. ' +
+      'The real number, or which entry of the public list your chemistry is, never appears anywhere: on-chain sits only the evidence that the statement holds.',
     txLabel: 'proof tx '
   };
 
@@ -691,6 +706,17 @@
       links.push('<span class="hint">Your battery lived a second life: it aged, was repurposed and re-anchored as version 2. The explorer page shows its full anchor history; version 1 stays verifiable forever.</span>');
     }
     $('doneLinks').innerHTML = links.join('') || '';
+    // The proven statements, as they were shown in the timeline: the public
+    // side of every confidential value.
+    const proven = steps.filter((s) => (s.kind === 'provePredicate' || isProveKind(s.kind)) && s.status === 'succeeded');
+    const list = $('doneClaimList');
+    list.innerHTML = '';
+    for (const s of proven) {
+      const li = document.createElement('li');
+      li.textContent = String(s.label || s.kind).replace(/^ZK-prove /, '');
+      list.append(li);
+    }
+    $('doneClaims').hidden = proven.length === 0;
     show('viewDone');
   }
 

@@ -48,13 +48,14 @@
       </p>
       <div class="feature-row">
         <span class="feature-pill"><span class="fdot"></span>dust-sponsored fees</span>
-        <span class="feature-pill"><span class="fdot"></span>on-chain ownership registration</span>
+        <span class="feature-pill"><span class="fdot"></span>salted field tree, nothing guessable</span>
         <span class="feature-pill"><span class="fdot"></span>batched circuit calls, one tx</span>
         <span class="feature-pill"><svg class="lock" aria-hidden="true" viewBox="0 0 14 16" xmlns="http://www.w3.org/2000/svg"><path d="M4 7 V5 a3 3 0 0 1 6 0 V7" fill="none"/><rect x="1.8" y="7" width="10.4" height="7.2" rx="2" fill="none"/></svg>zero-knowledge proofs, values hidden</span>
+        <span class="feature-pill"><svg class="lock" aria-hidden="true" viewBox="0 0 14 16" xmlns="http://www.w3.org/2000/svg"><path d="M4 7 V5 a3 3 0 0 1 6 0 V7" fill="none"/><rect x="1.8" y="7" width="10.4" height="7.2" rx="2" fill="none"/></svg>list membership, entry hidden</span>
       </div>
       <p class="hero-sub">
         In about five minutes you will create a small battery passport, anchor
-        it on the Midnight blockchain and prove up to four confidential claims
+        it on the Midnight blockchain and prove up to five confidential claims
         about it, without revealing a single number.
       </p>
       <div class="cta-row">
@@ -71,18 +72,24 @@
       </div>
       <div class="fact-row">
         <div class="fact">
-          <div class="fact-k">8</div>
-          <div class="fact-v">custom fields per Passport, 3 of them optional claim values</div>
+          <div class="fact-k">9</div>
+          <div class="fact-v">fields per passport, 4 of them optional confidential values you can make claims about</div>
+        </div>
+        <div class="fact">
+          <div class="fact-k">3</div>
+          <div class="fact-v">on-chain transactions per passport: the fingerprint, one batch for id binding + field root, one batch for every proof</div>
         </div>
         <div class="fact">
           <div class="fact-k">5</div>
-          <div class="fact-v">on-chain operations per Passport, 3 of them batched into a single transaction</div>
-        </div>
-        <div class="fact">
-          <div class="fact-k">4</div>
-          <div class="fact-v"><svg class="lock" aria-hidden="true" viewBox="0 0 14 16" xmlns="http://www.w3.org/2000/svg"><path d="M4 7 V5 a3 3 0 0 1 6 0 V7" fill="none"/><rect x="1.8" y="7" width="10.4" height="7.2" rx="2" fill="none"/></svg>secret values you can prove (CO2, capacity, cycle life, recycled content): each stays within a public bound, proven together in one transaction, without ever revealing the clear values</div>
+          <div class="fact-v"><svg class="lock" aria-hidden="true" viewBox="0 0 14 16" xmlns="http://www.w3.org/2000/svg"><path d="M4 7 V5 a3 3 0 0 1 6 0 V7" fill="none"/><rect x="1.8" y="7" width="10.4" height="7.2" rx="2" fill="none"/></svg>kinds of confidential claims: CO2, capacity, cycle life and recycled content each stay within a public bound, and the cell chemistry is shown to be on a public list without saying which one. All proven together in one transaction</div>
         </div>
       </div>
+      <ul class="how-list">
+        <li>Nothing readable goes on-chain, only a fingerprint.</li>
+        <li>Your fields live in a salted Merkle tree; only its root is anchored.</li>
+        <li>A proof publishes the statement, never the value.</li>
+        <li>Your key stays here; the hosted sponsor pays the fees.</li>
+      </ul>
     </section>
 
     <!-- ============ view: form ============ -->
@@ -156,7 +163,7 @@
         <p class="muted small">Freshly generated for you. The bind step anchors the blake2b-256 hash of exactly
           this id on-chain, and the explorer will list your passport under it.</p>
       </div>
-      <p class="muted" id="runHint">This runs live on a Midnight testnet. Every tx link opens a real on-chain transaction; the whole anchor (fingerprint, passport binding, field root) rides in ONE batched transaction.</p>
+      <p class="muted" id="runHint">This runs live on a Midnight testnet. Every tx link opens a real on-chain transaction; the fingerprint goes first, passport binding and field root share one batch, and all your proofs share another.</p>
       <ol id="timeline" class="timeline"></ol>
       <div id="runError" class="panel err-panel" hidden></div>
       <div class="cta-row">
@@ -174,8 +181,12 @@
           <span class="hint">Scan it: this QR is the passport's public link, like the one printed on a real battery.</span>
         </div>
         <div id="doneLinks" class="done-links"></div>
-        <p class="muted">Your confidential CO2 value never left the server. What is on-chain is the
-          passport's anchor and a zero-knowledge proof of the claim, verifiable by anyone.</p>
+        <div id="doneClaims" class="done-claims" hidden>
+          <div class="done-claims-title">What anyone can verify now</div>
+          <ul id="doneClaimList"></ul>
+        </div>
+        <p class="muted">Your confidential values never left the server. What is on-chain is the
+          passport's anchor and one zero-knowledge proof per statement above, verifiable by anyone.</p>
         <p class="star-line">Liked it? <a href="https://github.com/ODATANO/NIGHTPASS" target="_blank"
             rel="noopener">Leave a star on the NIGHTPASS repo</a> &#9733;</p>
         <p class="muted small">Powered by <a href="https://github.com/ODATANO/NIGHTGATE"

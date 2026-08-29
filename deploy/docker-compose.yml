@@ -59,24 +59,34 @@ services:
       - passport-pg-data:/var/lib/postgresql/data
 
   # ---- "Try it" demo instance (profile: demo, off by default) --------------
-  # Anchors visitor passports on preprod with a dedicated sponsor wallet and
-  # publishes them into the main explorer via the ingest endpoint. Start with
-  # `docker compose --profile demo up -d` AFTER filling .env.demo and swapping
-  # in Caddyfile.demo (see README, "Try-it demo instance").
+  # Visitors anchor their own passport on preprod. DEMO_TRANSPORT=remote (the
+  # default in .env.demo.example): each run proves in this container (on the
+  # proof-server below) and hands its transactions to the hosted NIGHTGATE
+  # under an agent grant, which pays the dust. No wallet, no worker, no
+  # sponsor pool here. Start with `docker compose --profile demo up -d` AFTER
+  # filling .env.demo and swapping in Caddyfile.demo (see README).
   nightpass-demo:
     build: ..
     restart: unless-stopped
     logging: *default-logging
-    mem_limit: 12g
+    # 4g carries wasm/server proving plus CAP; the wallet-worker era needed 12g.
+    mem_limit: 4g
     profiles: ["demo"]
     env_file: .env.demo
+    # Schema is deployed as a one-off before up (README): the deploy step
+    # keeps the plugin event loop alive and never returns inside the CMD.
+    command: ["sh", "-c", "exec npx cds-tsx serve"]
     environment:
       NIGHTGATE_REPLICA_COUNT: "1"
+      # Prover keys fetched once from the hosted /zk-config, kept on a volume.
+      NIGHTGATE_ZK_CACHE_DIR: /data/zk-cache
       cds_requires_db_credentials_host: postgres-demo
       cds_requires_db_credentials_port: "5432"
       cds_requires_db_credentials_user: nightpass_demo
       cds_requires_db_credentials_password: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in deploy/.env}
       cds_requires_db_credentials_database: nightpass_demo
+    volumes:
+      - passport-demo-zk-cache:/data/zk-cache
     expose: ["4004"]
     # Wedged-process detection. demoInfo is DB-free and cheap; a container
     # that stops answering HTTP goes unhealthy. Docker itself only MARKS the
@@ -114,8 +124,11 @@ services:
     volumes:
       - passport-demo-pg-data:/var/lib/postgresql/data
 
-  # ZK proof server for the demo instance's anchor/proof transactions.
-  # Internal network only, never published to the host.
+  # ZK proof server for the demo instance's anchor/proof transactions. It
+  # RECEIVES THE WITNESSES, so it is ours and internal-only, never the hosted
+  # sponsor's. Optional: without NIGHTGATE_PROOF_SERVER_URL the remote lane
+  # proves in-process (wasm, 25-75 s per transaction and it blocks the
+  # request thread while proving).
   proof-server:
     image: midnightntwrk/proof-server:8.1.0
     restart: unless-stopped
@@ -149,3 +162,4 @@ volumes:
   passport-demo-pg-data:
   caddy-data:
   caddy-config:
+  passport-demo-zk-cache:

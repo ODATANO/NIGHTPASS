@@ -62,55 +62,58 @@ secrets; it reads and verifies only.
 ## Try-it demo instance (optional, compose profile `demo`)
 
 A second container (`nightpass-demo` + an internal `proof-server`) lets
-visitors anchor their OWN sponsored passport on `demo.<your-domain>`.
-Prepared but NOT part of the default stack. Rollout:
-
-Since 2026-07-24 the demo runs on PREPROD: ownership pre-registration
-(registrar step), ONE batched anchor transaction, up to four visitor claims
-in one proof transaction (`PASSPORT_PUBLIC_SURFACE=demo,explorer`). Finished
-passports publish to zkpassport.eu; the done view shows QR + explorer link.
+visitors anchor their OWN passport on `demo.<your-domain>`. Since
+2026-08-28 the demo runs on the REMOTE transport: the container holds no
+wallet and no NIGHT. Each run derives a throwaway seed, builds and proves
+its transactions locally (`@odatano/nightgate-tx`, proving on the internal
+proof-server) and hands the fee-unpaid bytes to the hosted NIGHTGATE
+(`api.nightgate.dev`) under an agent grant; the hosted sponsor pool pays
+the dust. Per run: attest, anchorContentRoot + bindPassport (one batch), the
+claim cart (one batch), optionally the second-life re-anchor. Verification
+reads go through the same API with the token. Runs start immediately (no
+wallet sync). Rollout:
 
 1. **DNS**: A record for `demo.<your-domain>` (the wildcard already covers it
    on zkpassport.eu).
-2. **Sponsor pool** (dev machine): `scripts/zz-demo-sponsors-preprod.mjs`
-   derives the PREPROD identities of the existing S1..S3 sponsor mnemonics,
-   funds each with 1000 tNIGHT from Main and dust-registers them (run against
-   a local preprod instance, e.g. `scripts/zz-demo-server-preprod.mjs`).
+2. **Hosted side** (operator of the NIGHTGATE API): the demo vault in the
+   sponsor policy (`allowedContracts` + `bindPassport` in `allowedCircuits`),
+   then `createAgentGrant(allowedActions: ['sponsorUnboundTransaction'],
+   sponsorSessionId: <pool sentinel>, allowedContracts: [<vault>],
+   allowedCircuits: [attest, bindPassport, anchorContentRoot,
+   proveFieldPredicate, proveFieldMembership], maxJobsPerDay: <DEMO_MAX_PER_DAY x 4>,
+   agentLabel: 'nightpass-demo')`. The token is shown once.
 3. **Config**: `cp deploy/.env.demo.example deploy/.env.demo` and fill it:
-   sponsor secrets from `DEMO_SPONSOR*_*`, the REGISTRAR pair (Main; the
-   viewing key MUST be the derived account-0 value, see the example's note),
-   fresh ENCRYPTION_KEY. Add `TRY_DOMAIN=demo.<your-domain>` to
-   `deploy/.env`; scp `.env.demo` to the server (gitignored, mode 600).
+   `DEMO_NIGHTGATE_AGENT_TOKEN`, `PASSPORT_CONTRACT_ADDRESS` (the vault from
+   step 2), a fresh `ENCRYPTION_KEY` (payload cipher + tester seeds at rest).
+   Add `TRY_DOMAIN=demo.<your-domain>` to `deploy/.env`; scp `.env.demo` to
+   the server (gitignored, mode 600).
 4. **Caddy**: `cp Caddyfile.demo Caddyfile` on the server (adds the demo
    site), then `docker compose restart caddy`.
-5. **Fresh DB on the preview -> preprod switch**: the old demo data (preview
-   testers/runs/wallet sync states) is dead weight on preprod. Stop the demo
-   container and drop its data volume once:
-   `docker compose --profile demo down nightpass-demo && docker volume rm deploy_passport-demo-pg-data`.
-   The next boot deploys a fresh schema (0.10.1 incl. `accountIndex`).
-6. **Start + seed the sponsor sync states**: a fresh server DB would cold-sync
-   every pool wallet for hours on preprod. Instead, carry the warm states over
-   from the dev machine (blobs are keyed to each wallet's viewing key, so they
-   restore as-is):
+5. **Schema, then start**: deploy the schema as a one-off so a slow
+   `cds.deploy` can never eat the healthcheck window, then start:
    ```bash
-   node scripts/zz-export-syncstates.mjs                 # dev machine -> syncstates.json
-   scp syncstates.json root@<server>:/root/nightpass/
-   docker compose --profile demo up -d --build           # first boot creates the schema
-   docker compose --profile demo cp ../syncstates.json nightpass-demo:/tmp/
-   docker compose --profile demo exec nightpass-demo node scripts/zz-import-syncstates.mjs /tmp/syncstates.json
-   docker compose --profile demo restart nightpass-demo  # boot prewarm now restores warm
-   rm ../syncstates.json                                 # and delete the local copy too
+   docker compose --profile demo build nightpass-demo
+   docker compose --profile demo run --rm --no-deps nightpass-demo npm run deploy
+   docker compose --profile demo up -d
    ```
-   Then check `https://demo.<your-domain>/api/v1/demo/demoInfo()` shows
-   `"enabled": true` and the landing's battery gauge fills up as the pool
-   reports ready.
-7. **Smoke**: run one visitor flow from a phone. Expect the register tx,
-   ONE batched anchor tx, ONE proof tx for all picked claims, and on the
-   done view the QR plus a zkpassport.eu link that auto-verifies green.
+   The first boot fetches the prover keys from the hosted `/zk-config` into
+   the `passport-demo-zk-cache` volume (`remote lane zk assets ready` in the
+   log); later boots find them cached.
+6. **Smoke**: `https://demo.<your-domain>/api/v1/demo/demoInfo()` shows
+   `"enabled": true`; run one visitor flow from a phone. Expect two anchor
+   txs (attest, then root + bind), ONE proof tx for all picked claims, and on
+   the done view the QR plus an explorer link that auto-verifies green. On
+   the hosted side the grant's `jobsUsed` grows by 3 per run (4 with the
+   second-life act).
+
+Fallback: `DEMO_TRANSPORT=plugin` keeps the in-process lane (server wallets,
+sponsor pool, `mem_limit` 12g); the wallet/sponsor keys in the example file
+document that profile.
 
 Ops notes: the demo DB volume is disposable (visitor data only); caps are
-env-tunable in `.env.demo`; the sponsor wallet is intentionally small, and
-rotating it means running the setup script again + updating `.env.demo`.
+env-tunable in `.env.demo`; the second line of defence is the grant's
+`maxJobsPerDay` on the hosted side; rotating the token means a new grant
+(`revokeAgentGrant` the old one) and a container restart.
 
 ### Periodic restart (stale sponsor sessions)
 
