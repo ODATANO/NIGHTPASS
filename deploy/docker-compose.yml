@@ -97,7 +97,9 @@ services:
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://localhost:4004/api/v1/demo/demoInfo()').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 30s
-      timeout: 10s
+      # The remote lane builds transactions on the CAP thread; a probe can wait
+      # behind a build, so the timeout must clear one build step.
+      timeout: 30s
       retries: 5
       start_period: 300s
     depends_on:

@@ -7,7 +7,7 @@ import { demoClaimList, demoBatteryValues, membershipSetFor, CLAIM_FIELDS, PRIMA
 import { feeSponsorWalletIds, producerWalletSecrets } from './lib/producer-wallets';
 import { encryptSecret, decryptSecret } from './lib/demo-crypto';
 import { sendDetached, waitForJobResult, detachedFromRequest, explorerTxUrl, blake2b256Hex } from './lib/passport-anchor';
-import { RemoteLane, remoteLaneConfigFromEnv, registerRemoteSigner, releaseRemoteSigner, ensureRemoteZkAssets, hostedVerifyClient } from './lib/lane-remote';
+import { createRemoteLane, remoteLaneConfigFromEnv, registerRemoteSigner, releaseRemoteSigner, ensureRemoteZkAssets, hostedVerifyClient } from './lib/lane-remote';
 
 const { INSERT, SELECT, UPDATE } = cds.ql;
 
@@ -236,7 +236,7 @@ export default class DemoService extends cds.ApplicationService {
      */
     private async testerIdentity(seedHex: string): Promise<{ viewingKey?: string; shieldedAddress: string; nightAddress: string }> {
         if (this.remoteTransport()) {
-            const lane = new RemoteLane(remoteLaneConfigFromEnv(), seedHex, 'identity');
+            const lane = createRemoteLane(remoteLaneConfigFromEnv(), seedHex, 'identity');
             try {
                 const id = await lane.identity();
                 return { shieldedAddress: id.attesterId, nightAddress: id.nightAddress };

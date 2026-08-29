@@ -7,6 +7,7 @@
  */
 import cds from '@sap/cds';
 import { randomUUID } from 'node:crypto';
+import { Worker } from 'node:worker_threads';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { blake2b256Hex, effectiveNetwork } from './passport-anchor';
@@ -430,8 +431,168 @@ export async function ensureRemoteZkAssets(cfg: RemoteLaneConfig = remoteLaneCon
 }
 
 /** The lane for a registered remote handle, configured from the environment. */
-export function remoteLaneFor(handle: string, cfg: RemoteLaneConfig = remoteLaneConfigFromEnv()): RemoteLane {
+export function remoteLaneFor(handle: string, cfg: RemoteLaneConfig = remoteLaneConfigFromEnv()): RemoteChainLane {
     const signer = signers.get(handle);
     if (!signer) throw new Error(`remote chain lane: no signer registered for '${handle}'`);
-    return new RemoteLane(cfg, signer.seedHex, handle.slice(0, 8));
+    return createRemoteLane(cfg, signer.seedHex, handle.slice(0, 8));
+}
+
+// --- worker host --------------------------------------------------------------
+// A build (wallet facade start, ledger assembly, the proving client) is
+// CPU-bound wasm on whichever thread runs it; on the CAP thread it stalls
+// every request for the length of the build. Each lane therefore lives in its
+// own worker thread behind a proxy with the same surface.
+
+/** The remote lane's surface beyond ChainLane. */
+export interface RemoteChainLane extends ChainLane {
+    identity(): Promise<{ attesterId: string; nightAddress: string; provingMode: string }>;
+    verifyAnchor(p: { contractAddress: string; payloadHash: string; contentRoot?: string; schemaId?: string }): Promise<boolean>;
+}
+
+/** Methods the worker host forwards to its RemoteLane. */
+export const REMOTE_LANE_WORKER_METHODS: ReadonlySet<string> = new Set([
+    'identity', 'submitAnchorTx', 'submitProofCart', 'verifyClaimLanded', 'verifyAnchor', 'dispose'
+]);
+
+const WORKER_FILE = __filename.replace(/lane-remote(\.[cm]?[jt]s)$/, 'lane-remote-worker$1');
+
+/** An error as it crosses the thread boundary. */
+export interface LaneErrorShape {
+    name: string;
+    message: string;
+    stack?: string;
+    code?: string;
+    status?: number;
+    partial?: boolean;
+    jobId?: string;
+    claimIds?: [string, string][];
+}
+
+export function serializeLaneError(e: unknown): LaneErrorShape {
+    const err = e as any;
+    const out: LaneErrorShape = {
+        name: String(err?.name ?? 'Error'),
+        message: String(err?.message ?? err ?? 'unknown error')
+    };
+    if (typeof err?.stack === 'string') out.stack = err.stack;
+    const code = err?.code ?? err?.cause?.job?.errorCode ?? err?.cause?.code;
+    if (code !== undefined) out.code = String(code);
+    const status = Number(err?.status ?? err?.cause?.status ?? 0);
+    if (status) out.status = status;
+    if (err instanceof ProofCartError) {
+        out.partial = err.partial;
+        out.jobId = err.jobId;
+        out.claimIds = [...err.claimIds.entries()];
+    }
+    return out;
+}
+
+export function deserializeLaneError(o: LaneErrorShape): Error {
+    const err: Error & { code?: string; status?: number } = o.name === 'ProofCartError'
+        ? new ProofCartError(o.message, { partial: !!o.partial, jobId: o.jobId, claimIds: new Map(o.claimIds ?? []) })
+        : new Error(o.message);
+    if (o.name !== 'ProofCartError' && o.name) err.name = o.name;
+    if (o.stack) err.stack = o.stack;
+    if (o.code !== undefined) err.code = o.code;
+    if (o.status !== undefined) err.status = o.status;
+    return err;
+}
+
+type Pending = { resolve: (v: any) => void; reject: (e: Error) => void };
+
+/** Main-thread proxy of a RemoteLane running in a worker thread. */
+export class RemoteLaneWorker implements RemoteChainLane {
+    readonly kind = 'remote' as const;
+    private worker: Worker | null = null;
+    private nextId = 1;
+    private readonly pending = new Map<number, Pending>();
+    private readonly log = cds.log('remote-lane');
+
+    constructor(private readonly cfg: RemoteLaneConfig, private readonly seedHex: string, private readonly label = 'remote') {}
+
+    private spawn(): Worker {
+        if (this.worker) return this.worker;
+        // Only tsx's CommonJS hook in the worker: the inherited ESM loader
+        // cannot resolve this codebase's extensionless imports there.
+        const w = new Worker(WORKER_FILE, {
+            execArgv: ['--require', 'tsx/cjs'],
+            workerData: { cfg: this.cfg, seedHex: this.seedHex, label: this.label }
+        });
+        w.on('message', (m: { id: number; ok: boolean; result?: unknown; error?: LaneErrorShape }) => {
+            const p = this.pending.get(m.id);
+            if (!p) return;
+            this.pending.delete(m.id);
+            if (m.ok) p.resolve(m.result);
+            else p.reject(deserializeLaneError(m.error ?? { name: 'Error', message: 'worker returned no error' }));
+        });
+        w.on('error', (e) => this.failAll(new Error(`[${this.label}] lane worker crashed: ${String((e as Error)?.message ?? e)}`, { cause: e })));
+        w.on('exit', (code) => {
+            if (this.worker === w) this.worker = null;
+            this.failAll(new Error(`[${this.label}] lane worker exited with code ${code}`));
+        });
+        this.worker = w;
+        return w;
+    }
+
+    private failAll(err: Error): void {
+        for (const [, p] of this.pending) p.reject(err);
+        this.pending.clear();
+    }
+
+    private call<T>(method: string, ...args: unknown[]): Promise<T> {
+        const w = this.spawn();
+        const id = this.nextId++;
+        return new Promise<T>((resolve, reject) => {
+            this.pending.set(id, { resolve, reject });
+            w.postMessage({ id, method, args });
+        });
+    }
+
+    /** Liveness of the worker thread; spawns it when needed. */
+    ping(): Promise<{ threadId: number; label: string }> {
+        return this.call('ping');
+    }
+
+    identity(): Promise<{ attesterId: string; nightAddress: string; provingMode: string }> {
+        return this.call('identity');
+    }
+
+    submitAnchorTx(input: AnchorTxInput): Promise<LaneTx> {
+        return this.call('submitAnchorTx', input);
+    }
+
+    async submitProofCart(input: ProofCartInput): Promise<ProofCartOutcome> {
+        const out = await this.call<ProofCartOutcome>('submitProofCart', input);
+        return { ...out, claimIds: out.claimIds instanceof Map ? out.claimIds : new Map(out.claimIds ?? []) };
+    }
+
+    verifyClaimLanded(input: ClaimVerifyInput): Promise<{ verified: boolean; txHash: string }> {
+        return this.call('verifyClaimLanded', input);
+    }
+
+    verifyAnchor(p: { contractAddress: string; payloadHash: string; contentRoot?: string; schemaId?: string }): Promise<boolean> {
+        return this.call('verifyAnchor', p);
+    }
+
+    /** Releases the lane in the worker, then the thread. Idempotent. */
+    async dispose(): Promise<void> {
+        const w = this.worker;
+        if (!w) return;
+        try {
+            await this.call('dispose');
+        } catch (e) {
+            this.log.warn(`[${this.label}] lane dispose in worker failed: ${String((e as Error)?.message ?? e)}`);
+        }
+        this.worker = null;
+        await w.terminate().catch(() => { /* already gone */ });
+    }
+}
+
+/**
+ * A remote lane for one seed: in a worker thread by default, in-process when
+ * `NIGHTPASS_REMOTE_LANE_INLINE` is set (tests, single-threaded debugging).
+ */
+export function createRemoteLane(cfg: RemoteLaneConfig, seedHex: string, label = 'remote', env: NodeJS.ProcessEnv = process.env): RemoteChainLane {
+    const inline = /^(1|true|yes|on)$/i.test(String(env.NIGHTPASS_REMOTE_LANE_INLINE ?? '').trim());
+    return inline ? new RemoteLane(cfg, seedHex, label) : new RemoteLaneWorker(cfg, seedHex, label);
 }
