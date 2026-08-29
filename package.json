@@ -11,7 +11,8 @@
   "dependencies": {
     "@cap-js/postgres": "^3",
     "@odatano/dpp-sdk": "^0.1.0",
-    "@odatano/nightgate": "^0.18.0",
+    "@odatano/nightgate": "^0.21.7",
+    "@odatano/nightgate-tx": "^0.4.0",
     "@sap/cds": "^10",
     "animejs": "^4.5.0",
     "express": "^4",
@@ -42,7 +43,7 @@
     "vendor:explorer": "node scripts/vendor-explorer.mjs",
     "start": "cds-tsx serve",
     "build:connector-lib": "vite build app/connector -c app/connector/vite.lib.config.mjs",
-    "deploy": "node -e \"const cds=require('@sap/cds');(async()=>{await cds.plugins;const m=await cds.load('*');await cds.deploy(m).to('db');console.log('database schema deployed')})().catch(e=>{console.error(e);process.exit(1)})\"",
+    "deploy": "node -e \"const cds=require('@sap/cds');(async()=>{await cds.plugins;const m=await cds.load('*');await cds.deploy(m).to('db');console.log('database schema deployed');process.exit(0)})().catch(e=>{console.error(e);process.exit(1)})\"",
     "gen:types": "cds-typer \"*\" --outputDTsFiles false",
     "typecheck": "tsc --noEmit",
     "test": "node --import tsx --test \"test/unit/**/*.test.ts\"",

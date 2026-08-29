@@ -109,3 +109,7 @@ docs/x-post-*.png
 docs/DPP Registration_*.csv
 image.png
 docs/proof-cart-plan.md
+
+# 0.21 upgrade working notes (local)
+docs/nightgate-0.21-plan.md
+docs/nightgate-0.21-implementation.md
