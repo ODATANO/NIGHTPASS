@@ -74,9 +74,10 @@ describe('proofCartPlan', () => {
                 { kind: 'membership', fieldKey: H('d'), setRoot: H('e') }
             ]
         });
+        // Membership first: guaranteed transcripts lead the batch (see proofCartPlan).
         assert.deepEqual(plan.calls, [
-            { circuit: 'proveFieldPredicate', args: [H('a'), H('b'), '4000000', '0'] },
-            { circuit: 'proveFieldMembership', args: [H('a'), H('d'), H('e')] }
+            { circuit: 'proveFieldMembership', args: [H('a'), H('d'), H('e')] },
+            { circuit: 'proveFieldPredicate', args: [H('a'), H('b'), '4000000', '0'] }
         ]);
     });
 
@@ -124,5 +125,23 @@ describe('proofCartPlan', () => {
             () => proofCartPlan({ payloadHash: H('a'), claims: [{ kind: 'membership', fieldKey: H('b'), setRoot: '0x12' }] }),
             /setRoot must be 32-byte hex/
         );
+    });
+});
+
+describe('proofCartPlan ordering', () => {
+    const H = (c: string) => c.repeat(64);
+    it('puts membership claims (guaranteed) ahead of predicate claims (fallible), keeping claims index-aligned', () => {
+        const plan = proofCartPlan({
+            payloadHash: H('a'),
+            claims: [
+                { fieldKey: H('1'), threshold: 10, op: 0 },
+                { kind: 'membership', fieldKey: H('2'), setRoot: H('9') },
+                { fieldKey: H('3'), threshold: 20, op: 1 }
+            ]
+        });
+        assert.deepEqual(plan.calls.map((c) => c.circuit),
+            ['proveFieldMembership', 'proveFieldPredicate', 'proveFieldPredicate']);
+        assert.deepEqual(plan.claims.map((c) => c.fieldKey), [H('2'), H('1'), H('3')]);
+        assert.equal(plan.dropped.length, 0);
     });
 });

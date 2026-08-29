@@ -1,5 +1,6 @@
 import cds from '@sap/cds';
 import { anchorTxPlan } from './anchor-plan';
+import type { ChainLane } from './chain-lane';
 import { randomBytes } from 'node:crypto';
 import { AsyncResource } from 'node:async_hooks';
 import { sortKeys, canonicalize, blake2b256Hex, hashPayload } from '@odatano/dpp-sdk/hash';
@@ -593,7 +594,6 @@ export interface AnchorOpts {
     passportId: string;
     passportIdHash: string;
     contractAddress: string;
-    sessionId: string;
     /**
      * Optional content-root Merkle root (64-hex) to anchor after attest, so the
      * field-bound predicate proof can bind a value to a passport field. Build it
@@ -607,190 +607,39 @@ export interface AnchorOpts {
      * proves it describes the tree.
      */
     schemaId?: string;
-    /**
-     * The CAP user the NIGHTGATE calls run as (usually the original req.user).
-     * Required with detached sends: NIGHTGATE binds wallet sessions to the
-     * owning userId, so the calls must carry the same identity.
-     */
-    user?: unknown;
-    /**
-     * Optional NIGHTGATE session that pays the dust fees for all three anchor
-     * steps (per-tx sponsoring, NIGHTGATE 0.8.0): the acting session builds
-     * and signs, the sponsor balances only the dust and submits. Must belong
-     * to the same user as the acting session (or be operator-listed in
-     * NIGHTGATE_FEE_SPONSOR_SESSION).
-     */
-    sponsorSessionId?: string;
     /** Called after each successful step, so callers can log a tx row. */
     onStep?: (step: AnchorStep) => Promise<void> | void;
 }
 
-// The consolidated contract shipped by the plugin. (The old separate
-// `passport-attestation` artifact was folded into `attestation-vault`.)
-const CONTRACT_REF = 'attestation-vault';
+/** The consolidated contract shipped by the plugin, also served by the hosted API. */
+export const CONTRACT_REF = 'attestation-vault';
 
 /**
- * Whether the loaded NIGHTGATE exposes `submitContractCallBatch` (>= 0.9.3).
- * Feature-detected on the model so a host still running an older plugin keeps
- * the proven sequential path instead of a failing send.
+ * Anchor a passport on-chain through a ChainLane: `attest` alone, then
+ * `anchorContentRoot` (when a root is given) + `bindPassport` as one batch.
+ * The split comes from `anchorTxPlan`, the same source the browser connector
+ * consumes, so the submit paths cannot drift. Returns the attest tx hash.
+ * `onStep` fires once per logical step; steps sharing a batch report the
+ * same jobId/txHash.
  */
-function batchCallsAvailable(): boolean {
-    return Boolean((cds.model?.definitions as any)?.['NightgateService.submitContractCallBatch']);
-}
-
-/**
- * Whether batched calls apply in call order (NIGHTGATE >= 0.10.0, which
- * rewrites the merged intents' segment ids before proving). Only then may
- * DEPENDENT calls share a batch; 0.9.3 batches applied in random order and
- * were restricted to order-independent subsets. Detected via the
- * `registerPassport` action, which shipped in the same release.
- */
-function orderedBatchAvailable(): boolean {
-    return batchCallsAvailable()
-        && Boolean((cds.model?.definitions as any)?.['NightgateService.registerPassport']);
-}
-
-/**
- * Anchor a passport on-chain: `attest` → `bindPassport` (passportId →
- * payloadHash) → optional `anchorContentRoot` (Merkle root over provable
- * fields). Returns the attest tx hash. Each step polls to completion; `onStep`
- * fires per step for transaction logging.
- *
- * Batching by plugin generation:
- *   - NIGHTGATE >= 0.10.0 (ordered batches: segment ids rewritten into call
- *     order before proving): ALL anchor calls ride in ONE transaction,
- *     dependencies included. 3 txs become 1.
- *   - NIGHTGATE 0.9.3 (random apply order): `attest` stays a separate
- *     chain-confirmed tx (dependent calls failed intermittently with
- *     Transcript(104)); bind + root share a batch. 3 txs become 2.
- *   - older plugins: the proven sequential path, one tx per call.
- * `onStep` always fires once per logical step; steps sharing a batch report
- * the same jobId/txHash.
- */
-export async function anchorPassport(nightgate: cds.Service, opts: AnchorOpts): Promise<{ attestationTxHash: string }> {
-    const { payloadHash, passportId, passportIdHash, contractAddress, sessionId, contentRoot, schemaId, user, sponsorSessionId, onStep } = opts;
-    const sponsored = sponsorSessionId ? { sponsorSessionId } : {};
+export async function anchorPassport(lane: ChainLane, opts: AnchorOpts): Promise<{ attestationTxHash: string }> {
+    const { payloadHash, passportId, passportIdHash, contractAddress, contentRoot, schemaId, onStep } = opts;
     if (contentRoot && !schemaId) {
         throw new Error('anchorPassport: schemaId is required alongside contentRoot (anchorContentRoot takes it since 0.16.0)');
     }
-
-    if (orderedBatchAvailable()) {
-        // The anchor as the shared plan groups it: attest in its own tx, then
-        // the rest as ONE batch (see anchor-plan.ts for why attest can no
-        // longer share a transaction). Same source the browser connector's
-        // anchorBatch consumes, so the two submit paths cannot drift.
-        const txPlan = anchorTxPlan({
-            payloadHash,
-            metadataHash: blake2b256Hex(`passport://${passportId}`),
-            passportIdHash,
-            ...(contentRoot ? { contentRoot, schemaId } : {})
-        });
-        let attestationTxHash = '';
-        for (const tx of txPlan) {
-            let jobId = '';
-            const txHash = await runChainStep(tx.label, async () => {
-                const single = tx.calls.length === 1 ? tx.calls[0] : null;
-                const res: any = single
-                    ? await sendDetached(nightgate, 'submitContractCall', {
-                        contractAddress,
-                        circuit: single.circuit,
-                        compiledArtifactRef: CONTRACT_REF,
-                        sessionId,
-                        args: JSON.stringify(single.args),
-                        ...sponsored
-                    }, user)
-                    : await sendDetached(nightgate, 'submitContractCallBatch', {
-                        contractAddress,
-                        compiledArtifactRef: CONTRACT_REF,
-                        sessionId,
-                        calls: JSON.stringify(tx.calls),
-                        ...sponsored
-                    }, user);
-                jobId = String(res.jobId ?? '');
-                return waitForJob(nightgate, res.jobId, sessionId, user);
-            });
-            if (!attestationTxHash) attestationTxHash = txHash;
-            for (const c of tx.calls) {
-                await onStep?.({ kind: c.circuit as AnchorStep['kind'], jobId, txHash });
-            }
+    const txPlan = anchorTxPlan({
+        payloadHash,
+        metadataHash: blake2b256Hex(`passport://${passportId}`),
+        passportIdHash,
+        ...(contentRoot ? { contentRoot, schemaId } : {})
+    });
+    let attestationTxHash = '';
+    for (const tx of txPlan) {
+        const { txHash, jobId } = await lane.submitAnchorTx({ contractAddress, tx });
+        if (!attestationTxHash) attestationTxHash = txHash;
+        for (const c of tx.calls) {
+            await onStep?.({ kind: c.circuit as AnchorStep['kind'], jobId, txHash });
         }
-        return { attestationTxHash };
     }
-
-    let attestJobId = '';
-    const attestationTxHash = await runChainStep('attest', async () => {
-        const anchor: any = await sendDetached(nightgate, 'anchorDocument', {
-            sha256:              payloadHash,
-            storageRef:          `passport://${passportId}`,
-            sessionId,
-            contractAddress,
-            contentType:         'application/json',
-            compiledArtifactRef: CONTRACT_REF,
-            ...sponsored
-        }, user);
-        attestJobId = String(anchor.jobId ?? '');
-        return waitForJob(nightgate, anchor.jobId, sessionId, user);
-    });
-    await onStep?.({ kind: 'attest', jobId: attestJobId, txHash: attestationTxHash });
-
-    if (contentRoot && batchCallsAvailable()) {
-        // bindPassport + anchorContentRoot as ONE batched transaction. attest
-        // is chain-confirmed at this point (waitForJob enforces chainStatus),
-        // so both calls assert only already-on-chain state and any apply
-        // order inside the merged tx is valid.
-        let batchJobId = '';
-        const batchTxHash = await runChainStep('bindPassport+anchorContentRoot', async () => {
-            const batch: any = await sendDetached(nightgate, 'submitContractCallBatch', {
-                contractAddress,
-                compiledArtifactRef: CONTRACT_REF,
-                sessionId,
-                // Insert-only anchorContentRoot first, the cell-UPDATING
-                // bindPassport last (same sequencing rule as anchorCallPlan).
-                calls: JSON.stringify([
-                    { circuit: 'anchorContentRoot', args: [payloadHash, contentRoot, schemaId] },
-                    { circuit: 'bindPassport',      args: [passportIdHash, payloadHash] }
-                ]),
-                ...sponsored
-            }, user);
-            batchJobId = String(batch.jobId ?? '');
-            return waitForJob(nightgate, batch.jobId, sessionId, user);
-        });
-        await onStep?.({ kind: 'bindPassport', jobId: batchJobId, txHash: batchTxHash });
-        await onStep?.({ kind: 'anchorContentRoot', jobId: batchJobId, txHash: batchTxHash });
-        return { attestationTxHash };
-    }
-
-    let bindJobId = '';
-    const bindTxHash = await runChainStep('bindPassport', async () => {
-        const bind: any = await sendDetached(nightgate, 'submitContractCall', {
-            contractAddress,
-            circuit:             'bindPassport',
-            compiledArtifactRef: CONTRACT_REF,
-            sessionId,
-            args:                JSON.stringify([passportIdHash, payloadHash]),
-            ...sponsored
-        }, user);
-        bindJobId = String(bind.jobId ?? '');
-        return waitForJob(nightgate, bind.jobId, sessionId, user);
-    });
-    await onStep?.({ kind: 'bindPassport', jobId: bindJobId, txHash: bindTxHash });
-
-    if (contentRoot) {
-        let rootJobId = '';
-        const rootTxHash = await runChainStep('anchorContentRoot', async () => {
-            const root: any = await sendDetached(nightgate, 'submitContractCall', {
-                contractAddress,
-                circuit:             'anchorContentRoot',
-                compiledArtifactRef: CONTRACT_REF,
-                sessionId,
-                args:                JSON.stringify([payloadHash, contentRoot, schemaId]),
-                ...sponsored
-            }, user);
-            rootJobId = String(root.jobId ?? '');
-            return waitForJob(nightgate, root.jobId, sessionId, user);
-        });
-        await onStep?.({ kind: 'anchorContentRoot', jobId: rootJobId, txHash: rootTxHash });
-    }
-
     return { attestationTxHash };
 }

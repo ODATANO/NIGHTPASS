@@ -11,6 +11,12 @@ import {
     DYNAMIC_PROVABLE_FIELDS, runChainStep,
     effectiveNetwork, explorerTxUrl
 } from './lib/passport-anchor';
+import { PluginLane } from './lib/lane-plugin';
+import { remoteLaneFor, hasRemoteSigner, remoteVaultFor } from './lib/lane-remote';
+import {
+    ProofCartError,
+    type ChainLane, type CartClaimArgs, type ProofCartInput
+} from './lib/chain-lane';
 import { CLAIM_SETS, claimSetById } from './lib/claim-sets';
 import {
     allowedMaskFor, fieldsFromMask, describeMask, firstUnmaskedDifference, countChangedSlots,
@@ -31,6 +37,12 @@ import { verifyAttestState, attestRootState, verifyGrantState, verifyPredicateSt
 import { sweepAction, verdictToStatus } from './lib/stuck-rows';
 
 const CONTRACT_REF = 'attestation-vault';
+
+/** One cart claim's log row plus its on-chain coordinates (for per-claim settlement). */
+type ProofClaimMeta = {
+    proofLogId: string; key: string; fieldKey: string;
+    predicate: 'lessOrEqual' | 'greaterOrEqual' | 'setMembership'; threshold?: number; setRoot?: string;
+};
 
 const { INSERT, SELECT, UPDATE, DELETE } = cds.ql;
 
@@ -213,6 +225,20 @@ export default class ProducerService extends cds.ApplicationService {
     }
 
     /**
+     * The vault a row's chain work targets: the vault leased to a demo run
+     * (registered with its remote signer), else the vault an ANCHORED row is
+     * bound on (follow-ups must hit that contract), else the instance
+     * default. PASSPORT_VAULT_MIGRATE=1 restores env precedence for a
+     * deliberate re-anchor onto a new vault (scripts/zz-vault-migrate.mjs).
+     */
+    private vaultFor(row: { contractAddress?: string | null; status?: string | null } | null, sessionId?: string | null): string | null {
+        const leased = remoteVaultFor(sessionId);
+        if (leased) return leased;
+        if (process.env.PASSPORT_VAULT_MIGRATE !== '1' && row?.status === 'anchored' && row.contractAddress) return row.contractAddress;
+        return this.contractAddress() ?? row?.contractAddress ?? null;
+    }
+
+    /**
      * Lazy server signing session from env (PRODUCER_VIEWING_KEY + mnemonic/seed).
      *
      * BARE `srv.send()` on purpose: it joins the caller's AMBIENT request tx,
@@ -309,6 +335,8 @@ export default class ProducerService extends cds.ApplicationService {
      * session to belong to the same user as the acting one).
      */
     private async sponsorSessionIdFor(actingSessionId: string, preferredWalletId?: string): Promise<string | undefined> {
+        // The remote lane's sponsor is the hosted pool behind the agent grant.
+        if (hasRemoteSigner(actingSessionId)) return undefined;
         const pool = feeSponsorWalletIds();
         if (!pool.length) return undefined;
         // A caller-supplied preference must be a member of the CONFIGURED
@@ -576,7 +604,7 @@ export default class ProducerService extends cds.ApplicationService {
 
     private async passportRef(passportId: string) {
         return SELECT.one.from(Passports)
-            .columns('ID', 'passportId', 'payloadHash', 'passportIdHash', 'contractAddress')
+            .columns('ID', 'passportId', 'payloadHash', 'passportIdHash', 'contractAddress', 'status')
             .where({ passportId });
     }
 
@@ -718,7 +746,7 @@ export default class ProducerService extends cds.ApplicationService {
         const payloadCipher = encryptPayload(canonicalPayload, passportId);
 
         const demoHost = process.env.PASSPORT_DEMO_HOST ?? 'https://passport.example';
-        const contractAddress = this.contractAddress();
+        const contractAddress = this.vaultFor(null, sessionId);
         const ID = cds.utils.uuid();
 
         await INSERT.into(Passports).entries({
@@ -759,7 +787,7 @@ export default class ProducerService extends cds.ApplicationService {
             { passportId?: string; sessionId?: string; walletId?: string; sponsorWalletId?: string };
         const row: any = await this.passportRef(String(passportId ?? ''));
         if (!row) return req.reject(404, `passport '${passportId}' not found`);
-        const contractAddress = this.contractAddress() ?? row.contractAddress;
+        const contractAddress = this.vaultFor(row, sessionId);
         const session = await this.effectiveSession(sessionId, walletId);
         if (!session || !contractAddress) {
             return req.reject(400, 'no signing session / PASSPORT_CONTRACT_ADDRESS available; cannot submit on-chain');
@@ -900,7 +928,7 @@ export default class ProducerService extends cds.ApplicationService {
             // Additive return field; deployed callers ignore it.
             if (await this.contentRootAnchored(row.ID)) {
                 const verdict = await attestRootState({
-                    contractAddress: this.contractAddress() ?? row.contractAddress,
+                    contractAddress: this.vaultFor(row),
                     payloadHash: row.payloadHash, contentRoot: tree.contentRoot, schemaId: tree.schemaId
                 });
                 base.rootDrift = verdict === 'mismatch';
@@ -967,7 +995,7 @@ export default class ProducerService extends cds.ApplicationService {
         // Drift check only when a root is anchored; 'unknown' (unreachable
         // indexer) keeps rootDrift=false and the circuit aborts honestly.
         if (await this.contentRootAnchored(row.ID)) {
-            const contractAddress = this.contractAddress() ?? row.contractAddress;
+            const contractAddress = this.vaultFor(row);
             const verdict = await attestRootState({
                 contractAddress, payloadHash: row.payloadHash, contentRoot: tree.contentRoot, schemaId: tree.schemaId
             });
@@ -1431,28 +1459,41 @@ export default class ProducerService extends cds.ApplicationService {
      * the row (status 'failed') plus a failed PassportTransactions entry, not
      * on an HTTP response: the request that started this is long gone.
      */
+    /**
+     * The chain lane behind a session handle: a registered remote signer
+     * (the demo's run id) gives the hosted-API lane, any other id the
+     * in-process plugin lane (after its pending prewarm job, if any).
+     */
+    private async laneFor(sessionId: string, user: unknown, sponsorSessionId?: string): Promise<ChainLane> {
+        if (hasRemoteSigner(sessionId)) return remoteLaneFor(sessionId);
+        const nightgate = await cds.connect.to('NightgateService');
+        // First action on a fresh server signing session: the facade is still
+        // being built/synced by the prewarm job; submitting earlier fails with
+        // "No facade for sessionId". Await it once (detached context, short
+        // read polls only).
+        const prewarmJob = this.serverPrewarmJobs.get(sessionId);
+        if (prewarmJob) {
+            this.serverPrewarmJobs.delete(sessionId);
+            const log = cds.log('producer');
+            log.info(`awaiting server-session prewarm ${prewarmJob} before the first chain call...`);
+            await waitForJobResult(nightgate, prewarmJob, sessionId, user);
+            log.info('server-session prewarm complete');
+        }
+        return new PluginLane(nightgate, sessionId, user, sponsorSessionId);
+    }
+
     private async runAnchorDetached(
         ID: string, passportId: string, payloadHash: string, passportIdHash: string,
         contractAddress: string, sessionId: string, user: unknown, contentRoot?: string,
         sponsorSessionId?: string, schemaId?: string
     ): Promise<void> {
         const log = cds.log('producer');
+        let lane: ChainLane | null = null;
         try {
-            const nightgate = await cds.connect.to('NightgateService');
-            // First anchor after a fresh server signing session: the facade is
-            // still being built/synced by the prewarm job; submitting earlier
-            // fails with "No facade for sessionId". Await it once (detached
-            // context, short read polls only).
-            const prewarmJob = this.serverPrewarmJobs.get(sessionId);
-            if (prewarmJob) {
-                this.serverPrewarmJobs.delete(sessionId);
-                log.info(`awaiting server-session prewarm ${prewarmJob} before first anchor...`);
-                await waitForJobResult(nightgate, prewarmJob, sessionId, user);
-                log.info('server-session prewarm complete');
-            }
+            lane = await this.laneFor(sessionId, user, sponsorSessionId);
             if (sponsorSessionId) log.info(`anchor fees for ${passportId} sponsored by session ${sponsorSessionId.slice(0, 8)}...`);
-            const { attestationTxHash } = await anchorPassport(nightgate, {
-                payloadHash, passportId, passportIdHash, contractAddress, sessionId, user, contentRoot, schemaId, sponsorSessionId,
+            const { attestationTxHash } = await anchorPassport(lane, {
+                payloadHash, passportId, passportIdHash, contractAddress, contentRoot, schemaId,
                 onStep: async (s) => {
                     await this.runDetached(async () => {
                         await INSERT.into(PassportTransactions).entries({
@@ -1476,6 +1517,8 @@ export default class ProducerService extends cds.ApplicationService {
                     passport_ID: ID, kind: 'attest', status: 'failed', errorMessage: msg
                 } as any);
             }).catch(() => { /* status update is best-effort */ });
+        } finally {
+            await lane?.dispose().catch(() => { /* nothing left to release */ });
         }
     }
 
@@ -1497,7 +1540,7 @@ export default class ProducerService extends cds.ApplicationService {
         if (!grantee) return req.reject(400, 'grantee is required');
         const row: any = await this.passportRef(passportId);
         if (!row) return req.reject(404, `passport '${passportId}' not found`);
-        const contractAddress = this.contractAddress() ?? row.contractAddress;
+        const contractAddress = this.vaultFor(row);
         const session = await this.effectiveSession(argSession, walletId);
 
         if (!session || !contractAddress) {
@@ -1591,7 +1634,7 @@ export default class ProducerService extends cds.ApplicationService {
         const pred = predicate === 'greaterOrEqual' ? 'greaterOrEqual' : 'lessOrEqual';
         const useUnit = unit || 'milli-kg CO2 / kWh';
         const session = await this.effectiveSession(sessionId, walletId);
-        const contractAddress = this.contractAddress() ?? row.contractAddress;
+        const contractAddress = this.vaultFor(row, sessionId);
 
         if (!session || !contractAddress) {
             await INSERT.into(PredicateProofLog).entries({
@@ -1745,7 +1788,7 @@ export default class ProducerService extends cds.ApplicationService {
             : { sourceField: e.field, predicate: e.pred, threshold: e.thresholdScaled, unit: e.unit };
 
         const session = await this.effectiveSession(sessionId, walletId);
-        const contractAddress = this.contractAddress() ?? row.contractAddress;
+        const contractAddress = this.vaultFor(row, sessionId);
         if (!session || !contractAddress) {
             // Own short root tx: the tree/set builds above can take seconds
             // (first WASM load), long enough for a worker facade save to
@@ -1798,10 +1841,10 @@ export default class ProducerService extends cds.ApplicationService {
 
         if (!rootAnchored) await this.persistContentTree(row.ID, tree);
         const sponsorSessionId = await this.sponsorSessionIdFor(String(session), sponsorWalletId);
-        const args = {
-            payloadHash: row.payloadHash,
+        const cart: ProofCartInput = {
+            contractAddress, payloadHash: row.payloadHash,
             ...(rootAnchored ? {} : { contentRoot: tree.contentRoot, schemaId: tree.schemaId }),
-            claimsJson: JSON.stringify(kept.map((e) => (e.kind === 'membership'
+            claims: kept.map((e): CartClaimArgs => (e.kind === 'membership'
                 ? {
                     fieldKey: e.proof.fieldKey, value: String(values[e.field]),
                     allowedValues: e.allowedValues, salt: e.proof.salt,
@@ -1813,20 +1856,26 @@ export default class ProducerService extends cds.ApplicationService {
                     siblings: e.proof.siblings, dirs: e.proof.dirs,
                     predicate: e.pred, threshold: e.thresholdScaled,
                     ...(e.unit ? { unit: e.unit } : {})
-                }))),
-            sessionId: session, contractAddress, compiledArtifactRef: CONTRACT_REF,
-            ...(sponsorSessionId ? { sponsorSessionId } : {})
+                })),
+            // One ZK proof per claim, so the wait budget scales with the cart.
+            // In-process (wasm) proving is minutes per claim; the default 10
+            // minutes covers an anchor batch but not a four-claim cart.
+            timeoutMs: (10 + 8 * Math.max(0, kept.length - 1)) * 60_000
         };
         const user = req.user;
-        const claimMeta = kept.map((e, i) => ({
+        const claimMeta: ProofClaimMeta[] = kept.map((e, i) => ({
             proofLogId: proofLogIds[i],
             key: responseClaimKey(e.kind === 'membership'
                 ? { fieldKey: e.proof.fieldKey, predicate: 'setMembership', setRoot: e.setRoot }
-                : { fieldKey: e.proof.fieldKey, predicate: e.pred, threshold: e.thresholdScaled })!
+                : { fieldKey: e.proof.fieldKey, predicate: e.pred, threshold: e.thresholdScaled })!,
+            fieldKey: e.proof.fieldKey,
+            ...(e.kind === 'membership'
+                ? { predicate: 'setMembership' as const, setRoot: e.setRoot }
+                : { predicate: e.pred, threshold: e.thresholdScaled })
         }));
         (req as any).on('succeeded', () => {
             void detachedFromRequest(() =>
-                this.runProveBatchDetached(claimMeta, row.ID, !rootAnchored, args, user)
+                this.runProveBatchDetached(claimMeta, row.ID, !rootAnchored, cart, String(session), sponsorSessionId, user)
             ).catch((e: unknown) =>
                 cds.log('producer').error(`detached proof-cart runner crashed for ${row.passportId}:`, e));
         });
@@ -1840,80 +1889,60 @@ export default class ProducerService extends cds.ApplicationService {
      *   - pre-submit failure (a false predicate rejects at local proving, or
      *     the job errors before the mempool): ALL rows flip to failed;
      *   - post-submit PARTIAL_SUCCESS (ledger fallible phase applied a
-     *     subset): settle EACH row from verifyPredicateAttestation instead of
-     *     assuming all-or-nothing (0.12.0 contract).
+     *     subset): settle EACH row from the lane's per-claim verify instead
+     *     of assuming all-or-nothing (0.12.0 contract).
      */
     private async runProveBatchDetached(
-        claimMeta: { proofLogId: string; key: string }[],
+        claimMeta: ProofClaimMeta[],
         passportRowId: string,
         rootInBatch: boolean,
-        args: Record<string, unknown> & { sessionId: string; contractAddress: string },
+        cart: ProofCartInput,
+        sessionId: string,
+        sponsorSessionId: string | undefined,
         user: unknown
     ): Promise<void> {
         const log = cds.log('producer');
-        let res: any = null;
+        let lane: ChainLane | null = null;
         try {
-            const nightgate = await cds.connect.to('NightgateService');
-            const prewarmJob = this.serverPrewarmJobs.get(args.sessionId);
-            if (prewarmJob) {
-                this.serverPrewarmJobs.delete(args.sessionId);
-                await waitForJobResult(nightgate, prewarmJob, args.sessionId, user);
-            }
-            // Same bounded 1014 retry the anchor steps use: a proof batch is
-            // submitted right after the anchor from the same wallet, so it can
-            // race that tx's dust-state settlement and be rejected outright by
-            // the pool (seen live with a 4-claim cart). 1014 is provably
-            // pre-mempool, so a rebuild-and-resend can never double-apply.
-            // One ZK proof per claim, so the wait budget scales with the cart.
-            // In-process (wasm) proving is minutes per claim; the default 10
-            // minutes covers an anchor batch but not a four-claim cart.
-            const proofTimeoutMs = (10 + 8 * Math.max(0, claimMeta.length - 1)) * 60_000;
-            const jobResult: any = await runChainStep('proof cart', async () => {
-                res = await sendDetached(nightgate, 'issueFieldPredicateAttestationBatch', args, user);
-                return waitForJobResult(
-                    nightgate, res.jobId, args.sessionId, user,
-                    { requireChainSuccess: true, timeoutMs: proofTimeoutMs }
-                );
-            });
-            const txHash = String(jobResult?.proof?.proofValue ?? jobResult?.txHash ?? '');
-            const paByKey = this.batchClaimIdsByKey(res, jobResult);
+            lane = await this.laneFor(sessionId, user, sponsorSessionId);
+            const out = await lane.submitProofCart(cart);
             await this.runDetached(async () => {
                 for (const m of claimMeta) {
                     await UPDATE.entity(PredicateProofLog).set({
-                        status: 'succeeded', result: true, txHash,
-                        predicateAttestationId: paByKey.get(m.key) ?? ''
+                        status: 'succeeded', result: true, txHash: out.txHash,
+                        predicateAttestationId: out.claimIds.get(m.key) ?? ''
                     }).where({ ID: m.proofLogId });
                 }
                 if (rootInBatch) {
                     // The root anchor rode in the SAME tx as the proofs.
                     await INSERT.into(PassportTransactions).entries({
-                        passport_ID: passportRowId, kind: 'anchorContentRoot', jobId: res.jobId,
-                        txHash, status: 'succeeded', explorerUrl: txExplorerUrl(txHash)
+                        passport_ID: passportRowId, kind: 'anchorContentRoot', jobId: out.jobId,
+                        txHash: out.txHash, status: 'succeeded', explorerUrl: txExplorerUrl(out.txHash)
                     } as any);
                 }
                 await INSERT.into(PassportTransactions).entries({
-                    passport_ID: passportRowId, kind: 'provePredicate', jobId: res.jobId, txHash,
-                    status: 'succeeded', explorerUrl: txExplorerUrl(txHash)
+                    passport_ID: passportRowId, kind: 'provePredicate', jobId: out.jobId, txHash: out.txHash,
+                    status: 'succeeded', explorerUrl: txExplorerUrl(out.txHash)
                 } as any);
             });
-            log.info(`proof cart proven (${claimMeta.length} claims, one tx): ${txHash}`);
+            log.info(`proof cart proven (${claimMeta.length} claims, one tx): ${out.txHash}`);
         } catch (e) {
             const msg = String((e as Error)?.message ?? e).slice(0, 500);
-            const partial = /OnChainStatus|PARTIAL/i.test(msg) && res;
+            const partial = e instanceof ProofCartError && e.partial;
+            const claimIds = e instanceof ProofCartError ? e.claimIds : new Map<string, string>();
             log.warn(`proof cart ${partial ? 'PARTIAL' : 'failed'} for passport row ${passportRowId}:`, e);
-            const paByKey = res ? this.batchClaimIdsByKey(res, null) : new Map<string, string>();
             const verdicts = new Map<string, { verified: boolean; txHash: string }>();
-            if (partial) {
-                // Which claims actually landed? Ask the crawler-free per-claim
+            if (partial && lane) {
+                // Which claims actually landed? Ask the lane's per-claim
                 // verifier; unreachable = leave that row failed (never lie green).
-                const nightgate = await cds.connect.to('NightgateService').catch(() => null);
                 for (const m of claimMeta) {
-                    const paId = paByKey.get(m.key);
-                    if (!nightgate || !paId) continue;
                     try {
-                        const v: any = await sendDetached(nightgate, 'verifyPredicateAttestation',
-                            { predicateAttestationId: paId }, user);
-                        verdicts.set(m.key, { verified: !!v?.verified, txHash: String(v?.provenTxHash ?? '') });
+                        const v = await lane.verifyClaimLanded({
+                            key: m.key, predicateAttestationId: claimIds.get(m.key),
+                            contractAddress: cart.contractAddress, payloadHash: cart.payloadHash,
+                            fieldKey: m.fieldKey, predicate: m.predicate, threshold: m.threshold, setRoot: m.setRoot
+                        });
+                        if (v.verified) verdicts.set(m.key, v);
                     } catch { /* stays failed */ }
                 }
             }
@@ -1923,7 +1952,7 @@ export default class ProducerService extends cds.ApplicationService {
                     if (v?.verified) {
                         await UPDATE.entity(PredicateProofLog).set({
                             status: 'succeeded', result: true, txHash: v.txHash,
-                            predicateAttestationId: paByKey.get(m.key) ?? ''
+                            predicateAttestationId: claimIds.get(m.key) ?? ''
                         }).where({ ID: m.proofLogId });
                     } else {
                         await UPDATE.entity(PredicateProofLog).set({ status: 'failed', result: false })
@@ -1935,6 +1964,8 @@ export default class ProducerService extends cds.ApplicationService {
                     status: 'failed', errorMessage: msg
                 } as any);
             });
+        } finally {
+            await lane?.dispose().catch(() => { /* nothing left to release */ });
         }
     }
 
@@ -2055,7 +2086,7 @@ export default class ProducerService extends cds.ApplicationService {
         }
 
         const session = await this.effectiveSession(sessionId, walletId);
-        const contractAddress = this.contractAddress() ?? row.contractAddress;
+        const contractAddress = this.vaultFor(row, sessionId);
         const claim = `versus version ${prior.version}: ${describeMask(mask)}`
             + (k > 0 ? `, and at least ${k} slot(s) did change` : '');
         const base = {
@@ -2236,23 +2267,6 @@ export default class ProducerService extends cds.ApplicationService {
     /** Claim key -> predicateAttestationId from the batch action response
      *  (res.claims, JSON string) or the job result (claims array). Both sides
      *  of the join key through proof-plan's responseClaimKey. */
-    private batchClaimIdsByKey(res: any, jobResult: any): Map<string, string> {
-        const out = new Map<string, string>();
-        const add = (c: any) => {
-            if (!c?.predicateAttestationId) return;
-            const key = responseClaimKey({
-                fieldKey: c?.fieldKey,
-                predicate: c?.predicate ?? c?.claim?.predicate,
-                threshold: c?.threshold ?? c?.claim?.threshold,
-                setRoot: c?.setRoot ?? c?.claim?.setRoot
-            });
-            if (key) out.set(key, String(c.predicateAttestationId));
-        };
-        try { for (const c of JSON.parse(String(res?.claims ?? '[]'))) add(c); } catch { /* job result below */ }
-        for (const c of (Array.isArray(jobResult?.claims) ? jobResult.claims : [])) add(c);
-        return out;
-    }
-
     /**
      * The long-running leg of provePassportValue. The field-bound proof job
      * submits TWO txs (anchorContentRoot, then proveFieldPredicate); the job
@@ -2345,7 +2359,7 @@ export default class ProducerService extends cds.ApplicationService {
         const sha256 = sha256Hex(bytes);
 
         const session = await this.effectiveSession(sessionId, walletId);
-        const contractAddress = this.contractAddress() ?? row.contractAddress;
+        const contractAddress = this.vaultFor(row, sessionId);
         const docId = cds.utils.uuid();
         const mode = session && contractAddress ? 'anchoring' : 'offline';
         await INSERT.into(DiligenceDoc).entries({
@@ -2360,7 +2374,7 @@ export default class ProducerService extends cds.ApplicationService {
         const args = {
             sha256, contentType: String(mimeType), size: bytes.length,
             storageRef: `passport-diligence://${passportId}/${docId}`,
-            sessionId: String(session), contractAddress, compiledArtifactRef: CONTRACT_REF,
+            sessionId: String(session), contractAddress: String(contractAddress), compiledArtifactRef: CONTRACT_REF,
             ...(sponsorSessionId ? { sponsorSessionId } : {})
         };
         const user = req.user;
@@ -2469,7 +2483,7 @@ export default class ProducerService extends cds.ApplicationService {
                 `passport '${pid}' is '${row.status}'; re-anchoring needs an anchored passport ` +
                 `(drafts and first-anchor failures go through submitPassport)`);
         }
-        const contractAddress = this.contractAddress() ?? row.contractAddress;
+        const contractAddress = this.vaultFor(row, sessionId);
         const session = await this.effectiveSession(sessionId, walletId);
         if (!session || !contractAddress) {
             return req.reject(400, 're-anchoring is an on-chain operation; no signing session / PASSPORT_CONTRACT_ADDRESS available');
@@ -2618,7 +2632,7 @@ export default class ProducerService extends cds.ApplicationService {
         if (row.status !== 'anchored') {
             return { passportId: pid, previousStatus, newStatus, mode: 'draft', archivedVersion: 0, payloadHash: '', grantsToRegrant: [] };
         }
-        const contractAddress = this.contractAddress() ?? row.contractAddress;
+        const contractAddress = this.vaultFor(row, sessionId);
         const session = await this.effectiveSession(sessionId, walletId);
         if (!session || !contractAddress) {
             cds.log('producer').warn(`status change of '${pid}' recorded WITHOUT re-anchor (no session/contract); content is now drifted`);
@@ -2679,7 +2693,7 @@ export default class ProducerService extends cds.ApplicationService {
         if (!row) return req.reject(404, `passport '${pid}' not found`);
         this.assertWalletOwnsPassport(req, row, wid);
 
-        const contractAddress = this.contractAddress() ?? row.contractAddress;
+        const contractAddress = this.vaultFor(row);
         if (!contractAddress) return req.reject(400, 'no PASSPORT_CONTRACT_ADDRESS available');
         const registrarId = process.env.PASSPORT_REGISTRAR_WALLET?.trim() || 'default';
         const regSession = await this.serverSigningSession(registrarId);
@@ -2768,7 +2782,7 @@ export default class ProducerService extends cds.ApplicationService {
         }
 
         // Anchored: the handover IS an on-chain operation (registrar-only).
-        const contractAddress = this.contractAddress() ?? row.contractAddress;
+        const contractAddress = this.vaultFor(row);
         if (!contractAddress) return req.reject(400, 'no PASSPORT_CONTRACT_ADDRESS available');
         const registrarId = process.env.PASSPORT_REGISTRAR_WALLET?.trim() || 'default';
         const regSession = await this.serverSigningSession(registrarId);

@@ -120,7 +120,15 @@ export function responseClaimKey(c: {
 
 /**
  * Build the ordered call list for one proof cart transaction: one circuit
- * call per claim, exact duplicates dropped.
+ * call per claim, exact duplicates dropped, membership claims FIRST.
+ *
+ * Why the order: the ledger applies every GUARANTEED transcript before any
+ * FALLIBLE one, and the batch pre-check refuses a guaranteed call behind a
+ * fallible one (`BatchCausalityViolation`, nothing submitted). On the vault
+ * `proveFieldMembership` runs guaranteed while `proveFieldPredicate` has
+ * grown fallible, so a mixed cart must lead with the membership claims
+ * (measured 2026-08-28: four predicates then one membership was refused).
+ * Same-circuit calls are unordered among themselves anyway.
  */
 export function proofCartPlan({ payloadHash, claims }: { payloadHash: string; claims: ProofClaim[] }): ProofCartPlan {
     checkHex32(payloadHash, 'payloadHash');
@@ -147,13 +155,14 @@ export function proofCartPlan({ payloadHash, claims }: { payloadHash: string; cl
         seen.add(key);
         kept.push(claim);
     });
+    const ordered = [...kept.filter((c) => c.kind === 'membership'), ...kept.filter((c) => c.kind !== 'membership')];
     return {
-        calls: kept.map((c): ProofCartCall => (
+        calls: ordered.map((c): ProofCartCall => (
             c.kind === 'membership'
                 ? { circuit: 'proveFieldMembership', args: [payloadHash, c.fieldKey, c.setRoot] }
                 : { circuit: 'proveFieldPredicate', args: [payloadHash, c.fieldKey, String(c.threshold), String(c.op)] }
         )),
-        claims: kept,
+        claims: ordered,
         dropped
     };
 }
