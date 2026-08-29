@@ -200,9 +200,8 @@ export class RemoteLane implements ChainLane {
     constructor(private readonly cfg: RemoteLaneConfig, private readonly seedHex: string, private readonly label = 'remote') {}
 
     /** Identity of the seed this lane signs with (attester id, night address). */
-    async identity(): Promise<{ attesterId: string; nightAddress: string; provingMode: string }> {
-        const b = await this.builder();
-        return { attesterId: b.attesterId, nightAddress: b.addresses.night, provingMode: b.provingMode };
+    identity(): Promise<{ attesterId: string; nightAddress: string; provingMode: string }> {
+        return remoteIdentity(this.cfg, this.seedHex);
     }
 
     private builder(): Promise<TxBuilderLike> {
@@ -222,6 +221,9 @@ export class RemoteLane implements ChainLane {
                 ...(this.cfg.cacheDir ? { cacheDir: this.cfg.cacheDir } : {}),
                 ...(this.cfg.proofServerUrl ? { provingMode: 'server', proofServerUrl: this.cfg.proofServerUrl } : {}),
                 ...(this.cfg.ttlMinutes ? { ttlMinutes: this.cfg.ttlMinutes } : {}),
+                // Vault circuits move no value: nothing to balance, so no
+                // wallet sync (0.4.1). A value-moving call would fail at balancing.
+                walletSync: false,
                 onProgress: (e: Record<string, unknown>) => {
                     if (e?.phase === 'fetch') this.log.info(`[${this.label}] zk asset ${String(e.file ?? e.circuit ?? '')}`);
                 }
@@ -428,6 +430,16 @@ export async function ensureRemoteZkAssets(cfg: RemoteLaneConfig = remoteLaneCon
         circuits: REMOTE_LANE_CIRCUITS
     });
     return { fetched: Number(r?.fetched ?? 0), cached: Number(r?.cached ?? 0) };
+}
+
+/**
+ * Attester id and NIGHT address of a seed, derived without a builder or the
+ * network (nightgate-tx 0.4.1 `deriveIdentity`).
+ */
+export async function remoteIdentity(cfg: RemoteLaneConfig, seedHex: string): Promise<{ attesterId: string; nightAddress: string; provingMode: string }> {
+    const { txbuilder } = await sdk();
+    const id = await txbuilder.deriveIdentity({ seedHex, networkId: cfg.networkId });
+    return { attesterId: id.attesterId, nightAddress: id.addresses.night, provingMode: cfg.proofServerUrl ? 'server' : 'wasm' };
 }
 
 /** The lane for a registered remote handle, configured from the environment. */

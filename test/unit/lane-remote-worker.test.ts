@@ -2,7 +2,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { threadId } from 'node:worker_threads';
 import {
-    serializeLaneError, deserializeLaneError, createRemoteLane, RemoteLaneWorker, RemoteLane,
+    serializeLaneError, deserializeLaneError, createRemoteLane, RemoteLaneWorker, RemoteLane, remoteIdentity,
     REMOTE_LANE_WORKER_METHODS, type RemoteLaneConfig
 } from '../../srv/lib/lane-remote';
 import { ProofCartError } from '../../srv/lib/chain-lane';
@@ -71,5 +71,18 @@ describe('RemoteLaneWorker', () => {
         await lane.dispose();
         await lane.dispose();
         assert.equal((lane as any).worker, null);
+    });
+});
+
+describe('remoteIdentity', () => {
+    it('derives a deterministic attester id and a preprod NIGHT address without a builder', async () => {
+        const a = await remoteIdentity(CFG, SEED);
+        const b = await remoteIdentity(CFG, SEED);
+        assert.match(a.attesterId, /^[0-9a-f]{64}$/);
+        assert.equal(a.attesterId, b.attesterId);
+        assert.match(a.nightAddress, /^mn_addr_preprod1/);
+        assert.equal(a.provingMode, 'wasm');
+        assert.equal((await remoteIdentity({ ...CFG, proofServerUrl: 'http://p:6300' }, SEED)).provingMode, 'server');
+        assert.notEqual((await remoteIdentity(CFG, 'cd'.repeat(64))).attesterId, a.attesterId);
     });
 });
