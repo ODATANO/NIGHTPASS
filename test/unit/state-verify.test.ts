@@ -21,9 +21,13 @@ const GRANTEE = 'ff'.repeat(32);
 const origConnectTo = cds.connect.to;
 const origDb = Object.getOwnPropertyDescriptor(cds, 'db');
 
-/** Stub `cds.connect.to('nightgate')` with a `send` that runs `sendImpl`. */
+/**
+ * Stub `cds.connect.to('nightgate')` with a `send` that runs `sendImpl`,
+ * reachable directly and through the technical-user `tx` the verify reader uses.
+ */
 function stubNightgate(sendImpl: (event: string, data: any) => Promise<any>): void {
-    (cds.connect as any).to = async () => ({ send: sendImpl });
+    const svc = { send: sendImpl };
+    (cds.connect as any).to = async () => ({ ...svc, tx: async (_ctx: unknown, cb: (tx: typeof svc) => Promise<any>) => cb(svc) });
 }
 /** Stub `cds.db.read(...).columns(...).where(...)` to resolve `rows`. */
 function stubDbRead(rows: any[]): void {

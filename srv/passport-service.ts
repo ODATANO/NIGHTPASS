@@ -1,6 +1,7 @@
 import cds from '@sap/cds';
 import { Passport, Passports, PredicateProofLog, Partners } from '#cds-models/passport';
 import { effectiveNetwork, explorerTxUrl, verifyPeers, fieldKeyHex } from './lib/passport-anchor';
+import { readState, verifyNetworkOverrideAvailable } from './lib/verify-reader';
 import { granteeIdForDid } from './lib/grantee';
 import { claimSetById, setLabelFor } from './lib/claim-sets';
 import { restrictedProbe } from './lib/query-guard';
@@ -326,7 +327,7 @@ export default class PassportService extends cds.ApplicationService {
         const serverNetwork = effectiveNetwork();
         const anchorNetwork = (row as Record<string, unknown>).anchorNetwork as string | null ?? null;
         const crossNetwork = !!anchorNetwork && anchorNetwork !== serverNetwork;
-        const canOverride = !!(cds.model?.definitions?.['NightgateService.verifyAttestationState'] as any)?.params?.network;
+        const canOverride = verifyNetworkOverrideAvailable();
 
         let verified = false;
         let checkedNetwork: string | null = null;
@@ -334,15 +335,12 @@ export default class PassportService extends cds.ApplicationService {
         if (payloadHash && contractAddress && (!crossNetwork || canOverride)) {
             checkedNetwork = crossNetwork ? anchorNetwork : serverNetwork;
             try {
-                const nightgate = await cds.connect.to('NightgateService');
-                const verifier = new (cds.User as any)({ id: 'passport-verifier' });
-                const res: any = await (nightgate as any).tx({ user: verifier }, (tx: any) =>
-                    tx.send('verifyAttestationState', {
-                        contractAddress,
-                        payloadHash,
-                        compiledArtifactRef: 'attestation-vault',
-                        ...(crossNetwork ? { network: anchorNetwork } : {})
-                    }));
+                const res: any = await readState('verifyAttestationState', {
+                    contractAddress,
+                    payloadHash,
+                    compiledArtifactRef: 'attestation-vault',
+                    ...(crossNetwork ? { network: anchorNetwork } : {})
+                });
                 verified = res?.verified === true;
             } catch { /* indexer unreachable or contract unknown: stay unverified */ }
         } else if (payloadHash && contractAddress && peerBase) {
@@ -407,22 +405,19 @@ export default class PassportService extends cds.ApplicationService {
         const serverNetwork = effectiveNetwork();
         const anchorNetwork = (v.anchorNetwork as string | null) ?? null;
         const crossNetwork = !!anchorNetwork && anchorNetwork !== serverNetwork;
-        const canOverride = !!(cds.model?.definitions?.['NightgateService.verifyAttestationState'] as any)?.params?.network;
+        const canOverride = verifyNetworkOverrideAvailable();
 
         let verified = false;
         let checkedNetwork: string | null = null;
         if (payloadHash && contractAddress && (!crossNetwork || canOverride)) {
             checkedNetwork = crossNetwork ? anchorNetwork : serverNetwork;
             try {
-                const nightgate = await cds.connect.to('NightgateService');
-                const verifier = new (cds.User as any)({ id: 'passport-verifier' });
-                const res: any = await (nightgate as any).tx({ user: verifier }, (tx: any) =>
-                    tx.send('verifyAttestationState', {
-                        contractAddress,
-                        payloadHash,
-                        compiledArtifactRef: 'attestation-vault',
-                        ...(crossNetwork ? { network: anchorNetwork } : {})
-                    }));
+                const res: any = await readState('verifyAttestationState', {
+                    contractAddress,
+                    payloadHash,
+                    compiledArtifactRef: 'attestation-vault',
+                    ...(crossNetwork ? { network: anchorNetwork } : {})
+                });
                 verified = res?.verified === true;
             } catch { /* indexer unreachable or contract unknown: stay unverified */ }
         }
@@ -629,18 +624,15 @@ export default class PassportService extends cds.ApplicationService {
         if (contractAddress && kindSupported && (!crossNetwork || canOverride)) {
             checkedNetwork = crossNetwork ? anchorNetwork : serverNetwork;
             try {
-                const nightgate = await cds.connect.to('NightgateService');
-                const verifier = new (cds.User as any)({ id: 'passport-verifier' });
-                const res: any = await (nightgate as any).tx({ user: verifier }, (tx: any) =>
-                    tx.send('verifyPredicateState', {
-                        contractAddress,
-                        payloadHash: hashA,
-                        payloadHashB: hashB,
-                        predicate: o.kind,
-                        ...(o.kind === 'documentDiff' ? { k: o.bound } : { allowedMask: o.bound }),
-                        compiledArtifactRef: 'attestation-vault',
-                        ...(crossNetwork ? { network: anchorNetwork } : {})
-                    }));
+                const res: any = await readState('verifyPredicateState', {
+                    contractAddress,
+                    payloadHash: hashA,
+                    payloadHashB: hashB,
+                    predicate: o.kind,
+                    ...(o.kind === 'documentDiff' ? { k: o.bound } : { allowedMask: o.bound }),
+                    compiledArtifactRef: 'attestation-vault',
+                    ...(crossNetwork ? { network: anchorNetwork } : {})
+                });
                 verified = res?.verified === true;
             } catch { /* indexer unreachable or contract unknown: stay unverified */ }
         }
@@ -721,18 +713,15 @@ export default class PassportService extends cds.ApplicationService {
         if (probes.length && contractAddress && kindSupported && (!crossNetwork || canOverride)) {
             checkedNetwork = crossNetwork ? anchorNetwork : serverNetwork;
             try {
-                const nightgate = await cds.connect.to('NightgateService');
-                const verifier = new (cds.User as any)({ id: 'passport-verifier' });
                 for (const cand of probes) {
-                    const res: any = await (nightgate as any).tx({ user: verifier }, (tx: any) =>
-                        tx.send('verifyPredicateState', {
-                            contractAddress: cand.contractAddress,
-                            payloadHash: cand.payloadHash,
-                            fieldKey: fieldKeyHex(String(o.sourceField)),
-                            ...o.claimArgs,
-                            compiledArtifactRef: 'attestation-vault',
-                            ...(crossNetwork ? { network: anchorNetwork } : {})
-                        }));
+                    const res: any = await readState('verifyPredicateState', {
+                        contractAddress: cand.contractAddress,
+                        payloadHash: cand.payloadHash,
+                        fieldKey: fieldKeyHex(String(o.sourceField)),
+                        ...o.claimArgs,
+                        compiledArtifactRef: 'attestation-vault',
+                        ...(crossNetwork ? { network: anchorNetwork } : {})
+                    });
                     if (res?.verified === true) { verified = true; break; }
                 }
             } catch { /* indexer unreachable or contract unknown: stay unverified */ }

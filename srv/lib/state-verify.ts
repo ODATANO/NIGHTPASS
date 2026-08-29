@@ -1,5 +1,6 @@
 import cds from '@sap/cds';
 import type { ChainVerdict } from './chain-verify';
+import { readState, verifyParamAvailable } from './verify-reader';
 
 /**
  * Crawler-free verification of a wallet-submitted action's ON-CHAIN EFFECT.
@@ -42,8 +43,7 @@ export async function verifyAttestState(o: {
     const payloadHash = norm(o.payloadHash);
     if (!contractAddress || !payloadHash) return 'unknown';
     try {
-        const nightgate = await cds.connect.to('NightgateService');
-        const res: any = await nightgate.send('verifyAttestationState', {
+        const res: any = await readState('verifyAttestationState', {
             contractAddress,
             payloadHash,
             ...(o.contentRoot ? { contentRoot: norm(o.contentRoot) } : {}),
@@ -85,10 +85,9 @@ export async function attestRootState(o: {
     const contentRoot = norm(o.contentRoot);
     const schemaId = norm(o.schemaId);
     if (!contractAddress || !payloadHash || !contentRoot) return 'unknown';
-    const wantsSchema = !!schemaId && !!(cds.model?.definitions?.['NightgateService.verifyAttestationState'] as any)?.params?.schemaId;
+    const wantsSchema = !!schemaId && verifyParamAvailable('verifyAttestationState', 'schemaId');
     try {
-        const nightgate = await cds.connect.to('NightgateService');
-        const res: any = await nightgate.send('verifyAttestationState', {
+        const res: any = await readState('verifyAttestationState', {
             contractAddress, payloadHash, contentRoot,
             ...(wantsSchema ? { schemaId } : {}),
             compiledArtifactRef: CONTRACT_REF
@@ -169,12 +168,10 @@ export async function verifyCrossRootState(o: {
     const payloadHash = norm(o.payloadHashA);
     const payloadHashB = norm(o.payloadHashB);
     if (!contractAddress || !payloadHash || !payloadHashB) return 'unknown';
-    const params = (cds.model?.definitions?.['NightgateService.verifyPredicateState'] as any)?.params;
-    const needed = o.kind === 'documentDiff' ? params?.k : params?.allowedMask;
-    if (!params?.payloadHashB || !needed) return 'unknown';
+    const needed = verifyParamAvailable('verifyPredicateState', o.kind === 'documentDiff' ? 'k' : 'allowedMask');
+    if (!verifyParamAvailable('verifyPredicateState', 'payloadHashB') || !needed) return 'unknown';
     try {
-        const nightgate = await cds.connect.to('NightgateService');
-        const res: any = await nightgate.send('verifyPredicateState', {
+        const res: any = await readState('verifyPredicateState', {
             contractAddress, payloadHash, payloadHashB,
             predicate: o.kind,
             ...(o.kind === 'documentDiff'
@@ -213,12 +210,11 @@ export async function verifyPredicateState(o: {
     if (!contractAddress || !payloadHash) return 'unknown';
     const membership = o.predicate === 'setMembership';
     if (membership) {
-        const hasSetRootParam = !!(cds.model?.definitions?.['NightgateService.verifyPredicateState'] as any)?.params?.setRoot;
+        const hasSetRootParam = verifyParamAvailable('verifyPredicateState', 'setRoot');
         if (!hasSetRootParam || !norm(o.setRoot)) return 'unknown';
     }
     try {
-        const nightgate = await cds.connect.to('NightgateService');
-        const res: any = await nightgate.send('verifyPredicateState', {
+        const res: any = await readState('verifyPredicateState', {
             contractAddress,
             payloadHash,
             ...(o.fieldKey ? { fieldKey: norm(o.fieldKey) } : {}),
