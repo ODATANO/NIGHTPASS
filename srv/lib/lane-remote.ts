@@ -168,7 +168,11 @@ interface TxBuilderLike {
     attesterId: string;
     provingMode: 'wasm' | 'server';
     addresses: { night: string };
-    buildSponsorable(input: { contractAddress: string; call?: Prepared; calls?: Prepared[]; bind: false }): Promise<{ unboundTxB64: string; serializedBytes: number }>;
+    buildSponsorable(input: {
+        contractAddress: string; call?: Prepared; calls?: Prepared[]; bind: false;
+        /** The calls past `orderedPrefix` share no state: grouped by execution stage before proving (0.4.2). */
+        independentCalls?: boolean; orderedPrefix?: number;
+    }): Promise<{ unboundTxB64: string; serializedBytes: number }>;
     close(): Promise<void>;
 }
 
@@ -242,7 +246,10 @@ export class RemoteLane implements ChainLane {
     }
 
     /** Build locally, hand the unbound bytes to the sponsor, wait for the chain. Rebuilds on the retryable classes. */
-    private async buildAndSponsor(label: string, contractAddress: string, prepare: () => Promise<Prepared[]>): Promise<LaneTx> {
+    private async buildAndSponsor(
+        label: string, contractAddress: string, prepare: () => Promise<Prepared[]>,
+        batch: { independentCalls?: boolean; orderedPrefix?: number } = {}
+    ): Promise<LaneTx> {
         let lastErr: unknown;
         for (let attempt = 0; attempt < 3; attempt++) {
             if (attempt > 0) await new Promise((r) => setTimeout(r, 15_000));
@@ -252,7 +259,7 @@ export class RemoteLane implements ChainLane {
                 const t0 = Date.now();
                 const built = calls.length === 1
                     ? await b.buildSponsorable({ contractAddress, call: calls[0], bind: false })
-                    : await b.buildSponsorable({ contractAddress, calls, bind: false });
+                    : await b.buildSponsorable({ contractAddress, calls, bind: false, ...batch });
                 this.log.info(`[${this.label}] ${label}: built ${built.serializedBytes}B in ${Date.now() - t0}ms, handing to sponsor`);
                 const job = await ng.sponsorUnbound({
                     unboundTxB64: built.unboundTxB64,
@@ -333,6 +340,10 @@ export class RemoteLane implements ChainLane {
                 }
                 for (const claim of input.claims) calls.push(await this.prepareClaim(c, secret, input.payloadHash, claim));
                 return calls;
+            }, {
+                // Claims write distinct keys: the builder may group them by
+                // execution stage. An in-batch root anchor stays first.
+                independentCalls: true, orderedPrefix: input.contentRoot ? 1 : 0
             });
             landedTx = out.txHash;
             // The hosted lane issues no predicate-attestation ids; claims are
