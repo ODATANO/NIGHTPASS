@@ -1509,14 +1509,18 @@ export default class ProducerService extends cds.ApplicationService {
             });
             log.info(`passport ${passportId} anchored: ${attestationTxHash}`);
         } catch (e) {
-            const msg = String((e as Error)?.message || (e as Error)?.name || e);
+            // The column holds 1000 chars; an SDK error can carry a whole
+            // contract state. The status flip never rides with the log row.
+            const msg = String((e as Error)?.message || (e as Error)?.name || e).slice(0, 1000);
             log.warn(`on-chain anchor failed for ${passportId}:`, e);
             await this.runDetached(async () => {
                 await UPDATE.entity(Passports).set({ status: 'failed' }).where({ ID });
+            }).catch((err) => log.warn(`could not mark ${passportId} failed:`, err));
+            await this.runDetached(async () => {
                 await INSERT.into(PassportTransactions).entries({
                     passport_ID: ID, kind: 'attest', status: 'failed', errorMessage: msg
                 } as any);
-            }).catch(() => { /* status update is best-effort */ });
+            }).catch(() => { /* the log row is best-effort */ });
         } finally {
             await lane?.dispose().catch(() => { /* nothing left to release */ });
         }

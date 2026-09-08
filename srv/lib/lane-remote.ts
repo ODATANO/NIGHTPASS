@@ -140,6 +140,59 @@ export async function resolveTxHash(
     return id;
 }
 
+// --- prover-key cache ----------------------------------------------------------
+// The txbuilder reuses any cached file as is, and the prover keys of one vault
+// lineage prove nothing on the next (0.23 redeployed the vault). The cache is
+// therefore keyed by the artifact digest the hosted manifest reports.
+
+export interface ContractManifestLike {
+    contracts?: { name?: string; artifactHash?: string }[];
+}
+
+/** The cache directory for the manifest's attestation-vault artifact; the base itself when the manifest names none. */
+export function cacheDirForManifest(base: string, manifest: ContractManifestLike | null | undefined): string {
+    const hash = manifest?.contracts?.find((c) => c?.name === 'attestation-vault')?.artifactHash;
+    return typeof hash === 'string' && HASH64.test(hash) ? join(base, hash.slice(0, 16).toLowerCase()) : base;
+}
+
+const cacheDirPromises = new Map<string, Promise<string>>();
+
+/**
+ * Resolves the keyed cache directory once per process and API. Fail-closed:
+ * without the manifest the lane does not build, because an unkeyed cache may
+ * hold the keys of an earlier lineage (seen live 2026-09-08: a manifest
+ * timeout under load led to "mismatched verifier keys" on the new vault).
+ */
+export function artifactCacheDir(
+    cfg: RemoteLaneConfig, o: { fetchFn?: typeof fetch; attempts?: number; delayMs?: number } = {}
+): Promise<string> {
+    const base = cfg.cacheDir ?? join(homedir(), '.cache', 'nightgate-txbuilder', 'attestation-vault');
+    const key = `${cfg.apiUrl}|${base}`;
+    let p = cacheDirPromises.get(key);
+    if (!p) {
+        p = (async () => {
+            const attempts = o.attempts ?? 4;
+            let lastErr: unknown;
+            for (let i = 0; i < attempts; i++) {
+                if (i > 0) await new Promise((r) => setTimeout(r, o.delayMs ?? 5000));
+                try {
+                    const res = await (o.fetchFn ?? fetch)(`${cfg.apiUrl}/contract-manifest`, { signal: AbortSignal.timeout(30_000) });
+                    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                    const dir = cacheDirForManifest(base, await res.json() as ContractManifestLike);
+                    if (dir === base) throw new Error('manifest names no attestation-vault artifact');
+                    return dir;
+                } catch (e) {
+                    lastErr = e;
+                }
+            }
+            cacheDirPromises.delete(key);
+            throw new Error(`remote chain lane: contract manifest unavailable after ${attempts} attempts (${String((lastErr as Error)?.message ?? lastErr)})`, { cause: lastErr });
+        })();
+        cacheDirPromises.set(key, p);
+    }
+    return p;
+}
+
 // --- retry classification -----------------------------------------------------
 
 /**
@@ -147,14 +200,15 @@ export async function resolveTxHash(
  * pre-mempool state conflict (1010/104, fee unspent), a lost dust race the
  * sponsor did not absorb (1010/170, 1010/196), the pool reject (1014), and
  * the hosted API asking for a moment (503 JOB_ADMISSION_BUSY / WALLET_SYNCING,
- * 429). Everything else is final. Resubmitting identical bytes is never done.
+ * 429) and a gateway answer that never reached a handler (502). Everything
+ * else is final. Resubmitting identical bytes is never done.
  */
 export function isRebuildable(err: unknown): boolean {
     const e = err as any;
     const status = Number(e?.status ?? 0);
     const code = String(e?.code ?? e?.job?.errorCode ?? '');
     const msg = String(e?.message ?? e?.job?.errorMessage ?? e ?? '');
-    if (status === 429 || status === 503) return true;
+    if (status === 429 || status === 502 || status === 503) return true;
     if (/JOB_ADMISSION_BUSY|WALLET_SYNCING|WORKER_ROTATING|SPONSOR_POLICY_UNAVAILABLE/.test(code + ' ' + msg)) return true;
     return /\b1010\/(104|170|196)\b|\b1014\b|dust-race|DustDoubleSpend|InvalidDustSpendProof/i.test(msg);
 }
@@ -210,7 +264,7 @@ export class RemoteLane implements ChainLane {
 
     private builder(): Promise<TxBuilderLike> {
         this.builderPromise ??= (async () => {
-            const { txbuilder, vault } = await sdk();
+            const [{ txbuilder, vault }, cacheDir] = await Promise.all([sdk(), artifactCacheDir(this.cfg)]);
             const t0 = Date.now();
             const b: TxBuilderLike = await txbuilder.createTxBuilder({
                 seedHex: this.seedHex,
@@ -222,7 +276,7 @@ export class RemoteLane implements ChainLane {
                 contractClass: vault.Contract,
                 contractName: 'attestation-vault',
                 circuits: REMOTE_LANE_CIRCUITS,
-                ...(this.cfg.cacheDir ? { cacheDir: this.cfg.cacheDir } : {}),
+                cacheDir,
                 ...(this.cfg.proofServerUrl ? { provingMode: 'server', proofServerUrl: this.cfg.proofServerUrl } : {}),
                 ...(this.cfg.ttlMinutes ? { ttlMinutes: this.cfg.ttlMinutes } : {}),
                 // Vault circuits move no value: nothing to balance, so no
@@ -434,10 +488,10 @@ export function hostedVerifyClient(cfg: RemoteLaneConfig): Promise<VerifyClientL
  * disk), so a visitor never waits for the download inside their timeline.
  */
 export async function ensureRemoteZkAssets(cfg: RemoteLaneConfig = remoteLaneConfigFromEnv()): Promise<{ fetched: number; cached: number }> {
-    const { txbuilder } = await sdk();
+    const [{ txbuilder }, cacheDir] = await Promise.all([sdk(), artifactCacheDir(cfg)]);
     const r = await txbuilder.ensureZkAssets({
         zkConfigBaseUrl: `${cfg.apiUrl}/zk-config/attestation-vault`,
-        cacheDir: cfg.cacheDir,
+        cacheDir,
         circuits: REMOTE_LANE_CIRCUITS
     });
     return { fetched: Number(r?.fetched ?? 0), cached: Number(r?.cached ?? 0) };

@@ -1,6 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+    artifactCacheDir, cacheDirForManifest,
     deriveIndexerWsUrl, isRebuildable, remoteLaneConfigFromEnv, resolveTxHash,
     registerRemoteSigner, releaseRemoteSigner, hasRemoteSigner, remoteLaneFor, remoteVaultFor,
     SPONSOR_POOL_SENTINEL, REMOTE_LANE_CIRCUITS
@@ -133,5 +134,35 @@ describe('resolveTxHash', () => {
         const f = (async () => { calls++; return { json: async () => ({ data: { transactions: [] } }) } as any; }) as unknown as typeof fetch;
         assert.equal(await resolveTxHash(ID, 'http://indexer', { fetchFn: f, attempts: 3, delayMs: 1 }), ID);
         assert.equal(calls, 3);
+    });
+});
+
+describe('prover-key cache keyed by the hosted artifact', () => {
+    const HASH = '699b7f9fbfbe09e1bac14030105328e150ed23fa515211a5fc2622302073c90c';
+    const manifest = { contracts: [{ name: 'counter', artifactHash: 'f9'.repeat(32) }, { name: 'attestation-vault', artifactHash: HASH }] };
+
+    it('nests the cache under the first 16 hex of the attestation-vault digest', () => {
+        assert.match(cacheDirForManifest('/data/zk-cache', manifest), /zk-cache[\\/]699b7f9fbfbe09e1$/);
+    });
+
+    it('stays on the base when the manifest names no vault or a malformed digest', () => {
+        assert.equal(cacheDirForManifest('/base', { contracts: [{ name: 'counter', artifactHash: 'ab' }] }), '/base');
+        assert.equal(cacheDirForManifest('/base', { contracts: [{ name: 'attestation-vault', artifactHash: 'nope' }] }), '/base');
+        assert.equal(cacheDirForManifest('/base', null), '/base');
+    });
+
+    it('resolves through the hosted manifest, retries, and never falls back to the unkeyed base', async () => {
+        const cfg = remoteLaneConfigFromEnv({ ...ENV, NIGHTGATE_API_URL: 'https://keyed.example', NIGHTGATE_ZK_CACHE_DIR: '/zk' });
+        const ok = (async () => new Response(JSON.stringify(manifest), { status: 200 })) as unknown as typeof fetch;
+        assert.match(await artifactCacheDir(cfg, { fetchFn: ok }), /^[\\/]zk[\\/]699b7f9fbfbe09e1$/);
+        // second attempt succeeds: one transient failure is absorbed
+        const flaky = remoteLaneConfigFromEnv({ ...ENV, NIGHTGATE_API_URL: 'https://flaky.example', NIGHTGATE_ZK_CACHE_DIR: '/zk' });
+        let n = 0;
+        const onceDown = (async () => { if (n++ === 0) throw new Error('timeout'); return new Response(JSON.stringify(manifest), { status: 200 }); }) as unknown as typeof fetch;
+        assert.match(await artifactCacheDir(flaky, { fetchFn: onceDown, delayMs: 1 }), /699b7f9fbfbe09e1$/);
+        assert.equal(n, 2);
+        const down = remoteLaneConfigFromEnv({ ...ENV, NIGHTGATE_API_URL: 'https://down.example', NIGHTGATE_ZK_CACHE_DIR: '/zk' });
+        const fail = (async () => { throw new Error('ECONNREFUSED'); }) as unknown as typeof fetch;
+        await assert.rejects(artifactCacheDir(down, { fetchFn: fail, attempts: 2, delayMs: 1 }), /manifest unavailable after 2 attempts.*ECONNREFUSED/);
     });
 });
