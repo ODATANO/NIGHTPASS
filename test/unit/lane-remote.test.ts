@@ -58,6 +58,8 @@ describe('isRebuildable', () => {
         [Object.assign(new Error('x'), { code: 'JOB_ADMISSION_BUSY' }), true],
         [{ job: { errorCode: 'WALLET_SYNCING', errorMessage: 'sponsor still syncing' } }, true],
         [new Error('node rejected: 1010/104 state conflict'), true],
+        [new Error('ensureZkAssets: GET https://api/zk-config/attestation-vault/zkir/bindDocument.bzkir -> HTTP 502'), true],
+        [new Error('ensureZkAssets: GET https://api/zk-config/x -> HTTP 404'), false],
         [new Error('InvalidDustSpendProof (1010/170)'), true],
         [new Error('Custom error 1014'), true],
         [new Error('predicate does not hold'), false],
@@ -104,7 +106,7 @@ describe('remote signer registry', () => {
 
     it('pins the pool sentinel and the demo circuit set', () => {
         assert.equal(SPONSOR_POOL_SENTINEL, '00000000-0000-0000-0000-706f6f6c0000');
-        assert.deepEqual(REMOTE_LANE_CIRCUITS, ['attest', 'bindPassport', 'anchorContentRoot', 'proveFieldPredicate', 'proveFieldMembership']);
+        assert.deepEqual(REMOTE_LANE_CIRCUITS, ['attest', 'bindDocument', 'anchorContentRoot', 'proveFieldPredicate', 'proveFieldMembership']);
     });
 });
 

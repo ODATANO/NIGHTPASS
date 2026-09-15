@@ -9,7 +9,7 @@ import {
     detachedFromRequest, sendDetached,
     buildContentRoot, newSaltSeed, decryptPayload, fieldKeyHex, BATTERY_PROVABLE_FIELDS, BATTERY_STRING_FIELDS,
     DYNAMIC_PROVABLE_FIELDS, runChainStep,
-    effectiveNetwork, explorerTxUrl
+    effectiveNetwork, explorerTxUrl, recordKeyFor
 } from './lib/passport-anchor';
 import { PluginLane } from './lib/lane-plugin';
 import { remoteLaneFor, hasRemoteSigner, remoteVaultFor } from './lib/lane-remote';
@@ -28,13 +28,23 @@ import { DYNAMIC_ATTRIBUTES, encodeDynamicValue, decodeDynamicValue, dedupeUpdat
 import { payloadFromDb, readPayloadInputs } from './lib/passport-payload';
 import { validateTransition, parseBatteryStatus, encodeBatteryStatus, type BatteryStatus } from './lib/battery-lifecycle';
 import { validateDiligenceUpload, decodeUpload, sha256Hex } from './lib/diligence-upload';
-import { proofCartPlan, claimKey, responseClaimKey, type ProofClaim } from './lib/proof-plan';
+import { proofCartPlan, claimKey, responseClaimKey, claimValidUntil, type ProofClaim } from './lib/proof-plan';
 import { listProducerWallets, producerWalletSecrets, feeSponsorWalletId, feeSponsorWalletIds } from './lib/producer-wallets';
 import { s4ConfigFromEnv, fetchMaterialDocuments, enrichMaster, loadProductMaster } from './lib/s4-client';
 import { buildReceiptRows } from './lib/s4-material-document';
 import { verifyContractTx, type ChainVerdict } from './lib/chain-verify';
-import { verifyAttestState, attestRootState, verifyGrantState, verifyPredicateState, verifyCrossRootState } from './lib/state-verify';
+import { verifyAttestState, attestRootState, verifyGrantState, verifyPredicateState, verifyCrossRootState, resolveAnchorAttester } from './lib/state-verify';
 import { sweepAction, verdictToStatus } from './lib/stuck-rows';
+
+/**
+ * Lifetime of a new claim in seconds (`PASSPORT_CLAIM_LIFETIME_S`). Default:
+ * the vault's five-year cap less a day (proof-plan). A claim past its expiry
+ * verifies false and can be purged; re-proving extends it.
+ */
+function claimLifetimeS(): number | undefined {
+    const v = Number(process.env.PASSPORT_CLAIM_LIFETIME_S ?? '');
+    return Number.isFinite(v) && v > 0 ? v : undefined;
+}
 
 const CONTRACT_REF = 'attestation-vault';
 
@@ -179,10 +189,12 @@ export default class ProducerService extends cds.ApplicationService {
                 // The passport carries the anchor coordinates; without them the
                 // chain cannot be asked and the row stays unconfirmable.
                 const p: any = await SELECT.one.from(Passports)
-                    .columns('payloadHash', 'contractAddress').where({ ID: row.passport_ID });
+                    .columns('payloadHash', 'contractAddress', 'attesterId', 'passportIdHash').where({ ID: row.passport_ID });
                 if (p?.contractAddress && p?.payloadHash && row.kind === 'attest') {
-                    verdict = await verifyAttestState({ contractAddress: p.contractAddress, payloadHash: p.payloadHash })
-                        .catch(() => 'unknown' as ChainVerdict);
+                    verdict = await verifyAttestState({
+                        contractAddress: p.contractAddress, payloadHash: p.payloadHash,
+                        attesterId: p.attesterId, documentId: p.passportIdHash
+                    }).catch(() => 'unknown' as ChainVerdict);
                 }
             }
             const outcome = action.kind === 'fail'
@@ -602,10 +614,36 @@ export default class ProducerService extends cds.ApplicationService {
         return !!hit;
     }
 
+    /**
+     * The attester of the row's current record, stamping it when the chain's
+     * binding read names it (rows anchored before the stamp existed, or a
+     * wallet anchor whose callback carried none).
+     */
+    private async ensureAttesterId(row: any, contractAddress: string): Promise<string> {
+        if (row.attesterId) return String(row.attesterId);
+        const documentId = row.passportIdHash || (row.passportId ? blake2b256Hex(String(row.passportId)) : '');
+        const resolved = await resolveAnchorAttester({ contractAddress, documentId, payloadHash: row.payloadHash });
+        if (!resolved) return '';
+        row.attesterId = resolved;
+        await this.runDetached(async () => {
+            await UPDATE.entity(Passports).set({ attesterId: resolved }).where({ ID: row.ID });
+        }).catch(() => { /* best effort */ });
+        return resolved;
+    }
+
     private async passportRef(passportId: string) {
         return SELECT.one.from(Passports)
-            .columns('ID', 'passportId', 'payloadHash', 'passportIdHash', 'contractAddress', 'status')
+            .columns('ID', 'passportId', 'payloadHash', 'passportIdHash', 'attesterId', 'contractAddress', 'status')
             .where({ passportId });
+    }
+
+    /** How the state reads name this row's record: its attester, else the bound document id. */
+    private recordOf(row: { payloadHash?: string | null; attesterId?: string | null; passportIdHash?: string | null; passportId?: string }) {
+        return {
+            payloadHash: row.payloadHash,
+            attesterId: row.attesterId ?? null,
+            documentId: row.passportIdHash || (row.passportId ? blake2b256Hex(row.passportId) : null)
+        };
     }
 
     /**
@@ -805,10 +843,12 @@ export default class ProducerService extends cds.ApplicationService {
      * and acting on the AttestationVault). See settleWalletTx / verifyContractTx.
      */
     private recordWalletAttest = async (req: cds.Request) => {
-        const { passportId, txHash, identifier, contractAddress } = req.data as
-            { passportId?: string; txHash?: string; identifier?: string; contractAddress?: string };
+        const { passportId, txHash, identifier, contractAddress, attesterId } = req.data as
+            { passportId?: string; txHash?: string; identifier?: string; contractAddress?: string; attesterId?: string };
         const row: any = await this.passportRef(String(passportId ?? ''));
         if (!row) return req.reject(404, `passport '${passportId}' not found`);
+        const attester = norm(attesterId);
+        if (attester && !/^[0-9a-f]{64}$/.test(attester)) return req.reject(400, 'attesterId must be 32-byte hex (64 chars)');
         const hash = norm(txHash);
         const contract = contractAddress || row.contractAddress || this.contractAddress();
         const txRowId = cds.utils.uuid();
@@ -822,13 +862,15 @@ export default class ProducerService extends cds.ApplicationService {
         await UPDATE.entity(Passports).set({
             status: 'anchoring',
             attestationTxHash: hash || row.attestationTxHash,
-            contractAddress: contract || row.contractAddress
+            contractAddress: contract || row.contractAddress,
+            ...(attester ? { attesterId: attester } : {})
         }).where({ ID: row.ID });
 
+        const record = { ...this.recordOf(row), ...(attester ? { attesterId: attester } : {}) };
         const verdict = await this.settleWalletTx({
             txHash: hash, contractAddress: contract,
-            // Crawler-free: confirm the payload hash is anchored in the vault.
-            stateCheck: () => verifyAttestState({ contractAddress: contract, payloadHash: row.payloadHash }),
+            // Crawler-free: confirm the record is anchored in the vault.
+            stateCheck: () => verifyAttestState({ contractAddress: contract, ...record }),
             onConfirmed: async () => {
                 await UPDATE.entity(PassportTransactions).set({ status: 'succeeded' }).where({ ID: txRowId });
                 await UPDATE.entity(Passports).set({ status: 'anchored' }).where({ ID: row.ID });
@@ -871,7 +913,7 @@ export default class ProducerService extends cds.ApplicationService {
             txHash: hash, contractAddress: contract,
             // Crawler-free: reindex the on-chain disclosures ACL, then confirm this
             // grant/revoke is reflected for (contract, payloadHash, grantee).
-            stateCheck: () => verifyGrantState({ contractAddress: contract, payloadHash: row.payloadHash, grantee, op: o }),
+            stateCheck: () => verifyGrantState({ contractAddress: contract, payloadHash: row.payloadHash, attesterId: row.attesterId, grantee, op: o }),
             onConfirmed: async () => {
                 await UPDATE.entity(DisclosureGrantLog).set({ status: 'succeeded' }).where({ ID: grantLogId });
                 await UPDATE.entity(PassportTransactions).set({ status: 'succeeded' }).where({ ID: txRowId });
@@ -902,9 +944,13 @@ export default class ProducerService extends cds.ApplicationService {
         const base = {
             value: v == null ? '' : String(v), scaledValue: '', found: v != null,
             fieldKey: fieldKeyHex(field), contentRoot: '', schemaId: '', fieldSalt: '',
-            siblingsJson: '[]', dirsJson: '[]', rootDrift: false
+            siblingsJson: '[]', dirsJson: '[]', rootDrift: false,
+            attesterId: String(row.attesterId ?? ''), recordKey: ''
         };
         if (v == null) return base;
+        if (row.attesterId && row.payloadHash) {
+            base.recordKey = await recordKeyFor(String(row.attesterId), String(row.payloadHash)).catch(() => '');
+        }
 
         // Build the content root + inclusion proof from the passport's provable
         // fields, with the ANCHORED salt seed. Degrade gracefully (value still
@@ -928,8 +974,8 @@ export default class ProducerService extends cds.ApplicationService {
             // Additive return field; deployed callers ignore it.
             if (await this.contentRootAnchored(row.ID)) {
                 const verdict = await attestRootState({
-                    contractAddress: this.vaultFor(row),
-                    payloadHash: row.payloadHash, contentRoot: tree.contentRoot, schemaId: tree.schemaId
+                    contractAddress: this.vaultFor(row), ...this.recordOf(row),
+                    contentRoot: tree.contentRoot, schemaId: tree.schemaId
                 });
                 base.rootDrift = verdict === 'mismatch';
             }
@@ -967,9 +1013,13 @@ export default class ProducerService extends cds.ApplicationService {
             schemaId: '', fieldSalt: '',
             siblingsJson: '[]', dirsJson: '[]',
             setId: set.id, setLabel: set.label, setRoot: '', memberCount: 0,
-            setSiblingsJson: '[]', setDirsJson: '[]'
+            setSiblingsJson: '[]', setDirsJson: '[]',
+            attesterId: String(row.attesterId ?? ''), recordKey: ''
         };
         if (v == null) return base;
+        if (row.attesterId && row.payloadHash) {
+            base.recordKey = await recordKeyFor(String(row.attesterId), String(row.payloadHash)).catch(() => '');
+        }
 
         const memberSet = await buildMembershipSet(set.values);
         base.setRoot = memberSet.setRoot;
@@ -997,7 +1047,7 @@ export default class ProducerService extends cds.ApplicationService {
         if (await this.contentRootAnchored(row.ID)) {
             const contractAddress = this.vaultFor(row);
             const verdict = await attestRootState({
-                contractAddress, payloadHash: row.payloadHash, contentRoot: tree.contentRoot, schemaId: tree.schemaId
+                contractAddress, ...this.recordOf(row), contentRoot: tree.contentRoot, schemaId: tree.schemaId
             });
             base.rootDrift = verdict === 'mismatch';
         }
@@ -1044,7 +1094,7 @@ export default class ProducerService extends cds.ApplicationService {
         const p: any = await SELECT.one.from(Passports)
             .columns('passportId', 'model', 'manufacturerId', 'batteryCategory', 'manufactureDate',
                 'weightKg', 'performanceClass', 'qrCodeUrl', 'payloadHash', 'contractAddress',
-                'anchorNetwork', 'attestationTxHash', 'status')
+                'anchorNetwork', 'attestationTxHash', 'status', 'attesterId', 'passportIdHash')
             .where({ passportId });
         if (!p) return req.reject(404, `passport '${passportId}' not found`);
         if (p.status !== 'anchored') return req.reject(400, `passport '${passportId}' is not anchored (status: ${p.status})`);
@@ -1052,17 +1102,19 @@ export default class ProducerService extends cds.ApplicationService {
         // proof tx are public by design; the underlying value never leaves).
         const rowId: any = await SELECT.one.from(Passports).columns('ID').where({ passportId });
         const proofs: any[] = await SELECT.from(PredicateProofLog)
-            .columns('sourceField', 'predicate', 'threshold', 'unit', 'txHash', 'createdAt', 'payloadHash', 'setRoot', 'setId')
+            .columns('sourceField', 'predicate', 'threshold', 'unit', 'txHash', 'createdAt', 'payloadHash', 'setRoot', 'setId', 'attesterId', 'validUntil')
             .where({ passport_ID: rowId.ID, status: 'succeeded', result: true })
             .orderBy('createdAt');
         const claims = proofs.map((c) => {
             const common = {
                 sourceField: c.sourceField, predicate: c.predicate,
                 txHash: c.txHash ?? '', provenAt: c.createdAt ?? null,
-                // The version hash the claim was proven under, so the public
-                // instance verifies against the right version directly instead
-                // of probing the anchor history.
+                // The record the claim was proven on (version hash + attester),
+                // so the public instance verifies against the right record
+                // directly instead of probing the anchor history.
                 payloadHash: c.payloadHash ?? null,
+                attesterId: c.attesterId ?? null,
+                validUntil: c.validUntil ?? null,
             };
             if (c.predicate === 'setMembership') {
                 // The allow-list travels with the claim: it is public by
@@ -1080,11 +1132,11 @@ export default class ProducerService extends cds.ApplicationService {
         // never the archived payloadCipher), so the public explorer can show
         // the anchor history and live-verify each version.
         const versionRows: any[] = await SELECT.from(PassportAnchorVersions)
-            .columns('version', 'payloadHash', 'contractAddress', 'anchorNetwork', 'attestationTxHash', 'anchoredAt', 'reason')
+            .columns('version', 'payloadHash', 'contractAddress', 'anchorNetwork', 'attestationTxHash', 'anchoredAt', 'reason', 'attesterId')
             .where({ passport_ID: rowId.ID })
             .orderBy('version' as any);
         const anchorVersions = (versionRows ?? []).map((v) => ({
-            version: Number(v.version), payloadHash: v.payloadHash ?? null,
+            version: Number(v.version), payloadHash: v.payloadHash ?? null, attesterId: v.attesterId ?? null,
             contractAddress: v.contractAddress ?? null, anchorNetwork: v.anchorNetwork ?? null,
             attestationTxHash: v.attestationTxHash ?? null,
             anchoredAt: v.anchoredAt ?? null, reason: v.reason ?? null,
@@ -1210,17 +1262,17 @@ export default class ProducerService extends cds.ApplicationService {
      * a fabricated txHash never surfaces as a proven claim in the PAC.
      */
     private recordWalletPredicate = async (req: cds.Request) => {
-        const { passportId, sourceField, predicate, threshold, unit, txHash, result } = req.data as
-            { passportId?: string; sourceField?: string; predicate?: string; threshold?: number; unit?: string; txHash?: string; result?: boolean };
+        const { passportId, sourceField, predicate, threshold, unit, txHash, result, validUntil } = req.data as
+            { passportId?: string; sourceField?: string; predicate?: string; threshold?: number; unit?: string; txHash?: string; result?: boolean; validUntil?: number };
         const pred = predicate === 'greaterOrEqual' ? 'greaterOrEqual' : 'lessOrEqual';
         return this.recordWalletProofRow(req, {
-            passportId, sourceField, txHash, result,
+            passportId, sourceField, txHash, result, validUntil,
             logColumns: { predicate: pred, threshold: Number(threshold ?? 0), unit },
-            // Crawler-free: confirm the vault recorded a true result for this
-            // field-bound claim. The cockpit sends the already-scaled
+            // Crawler-free: confirm the vault holds this field-bound claim on
+            // the row's record. The cockpit sends the already-scaled
             // threshold the proof hashed, so it is passed straight through.
-            stateCheckFor: (contract, payloadHash) => verifyPredicateState({
-                contractAddress: contract, payloadHash,
+            stateCheckFor: (contract, payloadHash, attesterId) => verifyPredicateState({
+                contractAddress: contract, payloadHash, attesterId,
                 fieldKey: fieldKeyHex(String(sourceField)), predicate: pred, threshold: Number(threshold ?? 0)
             })
         });
@@ -1232,18 +1284,18 @@ export default class ProducerService extends cds.ApplicationService {
      * vault's field_membership_results map.
      */
     private recordWalletMembership = async (req: cds.Request) => {
-        const { passportId, sourceField, setId, setRoot, txHash, result } = req.data as
-            { passportId?: string; sourceField?: string; setId?: string; setRoot?: string; txHash?: string; result?: boolean };
+        const { passportId, sourceField, setId, setRoot, txHash, result, validUntil } = req.data as
+            { passportId?: string; sourceField?: string; setId?: string; setRoot?: string; txHash?: string; result?: boolean; validUntil?: number };
         const root = norm(setRoot).toLowerCase();
         if (!/^[0-9a-f]{64}$/.test(root)) return req.reject(400, 'setRoot must be 32-byte hex (64 chars)');
         return this.recordWalletProofRow(req, {
-            passportId, sourceField, txHash, result,
+            passportId, sourceField, txHash, result, validUntil,
             logColumns: {
                 predicate: 'setMembership', threshold: null, unit: null,
                 setRoot: root, setId: String(setId ?? '').slice(0, 60) || null
             },
-            stateCheckFor: (contract, payloadHash) => verifyPredicateState({
-                contractAddress: contract, payloadHash,
+            stateCheckFor: (contract, payloadHash, attesterId) => verifyPredicateState({
+                contractAddress: contract, payloadHash, attesterId,
                 fieldKey: fieldKeyHex(String(sourceField)), predicate: 'setMembership', setRoot: root
             })
         });
@@ -1258,9 +1310,9 @@ export default class ProducerService extends cds.ApplicationService {
      * check; everything else stays one implementation.
      */
     private async recordWalletProofRow(req: cds.Request, o: {
-        passportId?: string; sourceField?: string; txHash?: string; result?: boolean;
+        passportId?: string; sourceField?: string; txHash?: string; result?: boolean; validUntil?: number;
         logColumns: Record<string, unknown>;
-        stateCheckFor: (contract: string, payloadHash: string) => Promise<ChainVerdict>;
+        stateCheckFor: (contract: string, payloadHash: string, attesterId: string | null) => Promise<ChainVerdict>;
     }) {
         const row: any = await this.passportRef(String(o.passportId ?? ''));
         if (!row) return req.reject(404, `passport '${o.passportId}' not found`);
@@ -1272,9 +1324,11 @@ export default class ProducerService extends cds.ApplicationService {
         const contract = row.contractAddress || this.contractAddress();
         const proofLogId = cds.utils.uuid();
         const txRowId = cds.utils.uuid();
+        const until = Number(o.validUntil ?? 0);
         const logRow = {
             passport_ID: row.ID, sourceField: o.sourceField, ...o.logColumns,
-            payloadHash: row.payloadHash ?? null
+            payloadHash: row.payloadHash ?? null, attesterId: row.attesterId ?? null,
+            validUntil: Number.isFinite(until) && until > 0 ? new Date(until * 1000).toISOString() : null
         };
 
         if (o.result === false) {
@@ -1298,7 +1352,7 @@ export default class ProducerService extends cds.ApplicationService {
 
         const verdict = await this.settleWalletTx({
             txHash: hash, contractAddress: contract,
-            stateCheck: () => o.stateCheckFor(contract, row.payloadHash),
+            stateCheck: () => o.stateCheckFor(contract, row.payloadHash, row.attesterId ?? null),
             onConfirmed: async () => {
                 await UPDATE.entity(PredicateProofLog).set({ status: 'succeeded' }).where({ ID: proofLogId });
                 await UPDATE.entity(PassportTransactions).set({ status: 'succeeded' }).where({ ID: txRowId });
@@ -1377,7 +1431,7 @@ export default class ProducerService extends cds.ApplicationService {
 
     /**
      * Shared anchor entry: mark the row 'anchoring' and run the on-chain
-     * sequence (attest + bindPassport + contentRoot) DETACHED from this
+     * sequence (attest + contentRoot + bindDocument, one tx) DETACHED from this
      * request, after its transaction committed.
      *
      * Waiting inline would deadlock the very work we wait on: this handler's
@@ -1504,10 +1558,22 @@ export default class ProducerService extends cds.ApplicationService {
                     log.info(`anchor step ${s.kind} for ${passportId}: ${s.txHash}`);
                 }
             });
+            // The record is keyed by the attester (lineage 4): stamp the
+            // identity that anchored. The lane knows its own; otherwise the
+            // chain's binding read names it (a fresh anchor binds the id).
+            let attesterId = '';
+            try { attesterId = (await lane.attesterId?.()) ?? ''; } catch { attesterId = ''; }
+            if (!attesterId) {
+                attesterId = await resolveAnchorAttester({ contractAddress, documentId: passportIdHash, payloadHash }) ?? '';
+            }
+            if (!attesterId) log.warn(`passport ${passportId}: attester id could not be resolved after the anchor; claims need it`);
             await this.runDetached(async () => {
-                await UPDATE.entity(Passports).set({ status: 'anchored', attestationTxHash, contractAddress }).where({ ID });
+                await UPDATE.entity(Passports).set({
+                    status: 'anchored', attestationTxHash, contractAddress,
+                    ...(attesterId ? { attesterId } : {})
+                }).where({ ID });
             });
-            log.info(`passport ${passportId} anchored: ${attestationTxHash}`);
+            log.info(`passport ${passportId} anchored: ${attestationTxHash}${attesterId ? ` (attester ${attesterId.slice(0, 12)}...)` : ''}`);
         } catch (e) {
             // The column holds 1000 chars; an SDK error can carry a whole
             // contract state. The status flip never rides with the log row.
@@ -1665,9 +1731,11 @@ export default class ProducerService extends cds.ApplicationService {
         // would go snapshot-stale. Record a pending log row now, run the proof
         // after commit, and let the client poll the row.
         const proofLogId = cds.utils.uuid();
+        const validUntil = claimValidUntil({ lifetimeS: claimLifetimeS() });
         await INSERT.into(PredicateProofLog).entries({
             ID: proofLogId, passport_ID: row.ID, sourceField: field, predicate: pred,
-            threshold: thresholdScaled, unit: useUnit, status: 'pending', payloadHash: row.payloadHash ?? null
+            threshold: thresholdScaled, unit: useUnit, status: 'pending', payloadHash: row.payloadHash ?? null,
+            attesterId: row.attesterId ?? null, validUntil: new Date(validUntil * 1000).toISOString()
         } as any);
         // The proof circuit binds against the root in the LEDGER; the worker
         // only (idempotently) re-anchors when `contentRoot` is supplied. Our
@@ -1688,6 +1756,11 @@ export default class ProducerService extends cds.ApplicationService {
         const args = {
             payloadHash: row.payloadHash, fieldKey: proof.fieldKey, value: proof.value,
             fieldSalt: proof.salt,
+            // The claim lives on the anchoring attester's record; a session
+            // other than the attester may still prove it (no attester secret
+            // in the proof circuits), so the record is named explicitly.
+            ...(row.attesterId ? { attesterId: row.attesterId } : {}),
+            validUntil,
             ...(rootAnchored ? {} : { contentRoot: tree.contentRoot, schemaId: tree.schemaId }),
             siblingsJson: JSON.stringify(proof.siblings), dirsJson: JSON.stringify(proof.dirs),
             predicate: pred, threshold: thresholdScaled, unit: useUnit,
@@ -1775,9 +1848,22 @@ export default class ProducerService extends cds.ApplicationService {
         const planClaimOf = (e: CartEntry): ProofClaim => e.kind === 'membership'
             ? { kind: 'membership', fieldKey: e.proof.fieldKey, setRoot: e.setRoot }
             : { fieldKey: e.proof.fieldKey, threshold: e.thresholdScaled, op: e.pred === 'greaterOrEqual' ? 1 : 0 };
+        const session = await this.effectiveSession(sessionId, walletId);
+        const contractAddress = this.vaultFor(row, sessionId);
+        // The claims name the record (attester + payload). A row anchored
+        // before the attester was stamped resolves it from the chain binding
+        // once; without it the claims could never be verified. Offline
+        // (no session or vault) the plan only validates and dedupes, so a
+        // neutral key stands in.
+        const attesterId = contractAddress ? await this.ensureAttesterId(row, contractAddress) : '';
+        if (session && contractAddress && !attesterId) {
+            return req.reject(409, `passport '${row.passportId}' carries no attester id and its binding could not be read; ` +
+                're-anchor it before proving');
+        }
         let plan;
         try {
-            plan = proofCartPlan({ payloadHash: row.payloadHash, claims: entries.map(planClaimOf) });
+            const recordKey = attesterId ? await recordKeyFor(attesterId, row.payloadHash) : '0'.repeat(64);
+            plan = proofCartPlan({ recordKey, claims: entries.map(planClaimOf) });
         } catch (e: any) {
             return req.reject(400, String(e?.message ?? e));
         }
@@ -1791,8 +1877,6 @@ export default class ProducerService extends cds.ApplicationService {
             }
             : { sourceField: e.field, predicate: e.pred, threshold: e.thresholdScaled, unit: e.unit };
 
-        const session = await this.effectiveSession(sessionId, walletId);
-        const contractAddress = this.vaultFor(row, sessionId);
         if (!session || !contractAddress) {
             // Own short root tx: the tree/set builds above can take seconds
             // (first WASM load), long enough for a worker facade save to
@@ -1824,7 +1908,7 @@ export default class ProducerService extends cds.ApplicationService {
         // abort (verdict 'unknown' proceeds).
         if (rootAnchored) {
             const rootVerdict = await attestRootState({
-                contractAddress, payloadHash: row.payloadHash, contentRoot: tree.contentRoot, schemaId: tree.schemaId
+                contractAddress, ...this.recordOf(row), contentRoot: tree.contentRoot, schemaId: tree.schemaId
             });
             if (rootVerdict === 'mismatch') {
                 return req.reject(409, `the anchored content root of '${row.passportId}' predates the current ` +
@@ -1836,10 +1920,12 @@ export default class ProducerService extends cds.ApplicationService {
         // above is a live indexer read that can hold this request open long
         // enough for worker commits to stale its snapshot.
         const proofLogIds = kept.map(() => cds.utils.uuid());
+        const validUntil = claimValidUntil({ lifetimeS: claimLifetimeS() });
         await this.runDetached(async () => {
             await INSERT.into(PredicateProofLog).entries(kept.map((e, i) => ({
                 ID: proofLogIds[i], passport_ID: row.ID, ...logRowOf(e),
-                status: 'pending', payloadHash: row.payloadHash ?? null
+                status: 'pending', payloadHash: row.payloadHash ?? null,
+                attesterId: row.attesterId ?? null, validUntil: new Date(validUntil * 1000).toISOString()
             })) as any);
         });
 
@@ -1847,6 +1933,8 @@ export default class ProducerService extends cds.ApplicationService {
         const sponsorSessionId = await this.sponsorSessionIdFor(String(session), sponsorWalletId);
         const cart: ProofCartInput = {
             contractAddress, payloadHash: row.payloadHash,
+            ...(row.attesterId ? { attesterId: String(row.attesterId) } : {}),
+            validUntil,
             ...(rootAnchored ? {} : { contentRoot: tree.contentRoot, schemaId: tree.schemaId }),
             claims: kept.map((e): CartClaimArgs => (e.kind === 'membership'
                 ? {
@@ -1943,7 +2031,7 @@ export default class ProducerService extends cds.ApplicationService {
                     try {
                         const v = await lane.verifyClaimLanded({
                             key: m.key, predicateAttestationId: claimIds.get(m.key),
-                            contractAddress: cart.contractAddress, payloadHash: cart.payloadHash,
+                            contractAddress: cart.contractAddress, payloadHash: cart.payloadHash, attesterId: cart.attesterId,
                             fieldKey: m.fieldKey, predicate: m.predicate, threshold: m.threshold, setRoot: m.setRoot
                         });
                         if (v.verified) verdicts.set(m.key, v);
@@ -1990,11 +2078,14 @@ export default class ProducerService extends cds.ApplicationService {
         };
         const row: any = await SELECT.one.from(Passports)
             .columns('ID', 'passportId', 'owner', 'payloadHash', 'status', 'contractAddress',
-                'contentRoot', 'contentSchemaId', 'contentSaltSeed')
+                'contentRoot', 'contentSchemaId', 'contentSaltSeed', 'attesterId')
             .where({ passportId: String(passportId ?? '') });
         if (!row) return req.reject(404, `passport '${passportId}' not found`);
         if (row.status !== 'anchored') {
             return req.reject(400, `passport '${row.passportId}' is '${row.status}'; a version comparison needs two anchored versions`);
+        }
+        if (!row.attesterId) {
+            return req.reject(409, `the current version of '${row.passportId}' carries no attester id (anchored before vault lineage 4); re-anchor it first`);
         }
 
         // The mask IS the claim, so it is parsed and validated before anything
@@ -2012,7 +2103,7 @@ export default class ProducerService extends cds.ApplicationService {
         // Document A: an archived anchor version (default the newest).
         const versions: any[] = await SELECT.from(PassportAnchorVersions)
             .columns('version', 'payloadHash', 'payloadCipher', 'contentRoot', 'contentSchemaId',
-                'contentSaltSeed', 'contractAddress')
+                'contentSaltSeed', 'contractAddress', 'attesterId')
             .where({ passport_ID: row.ID });
         if (!versions?.length) {
             return req.reject(400, `passport '${row.passportId}' has no archived version yet; re-anchor it once to compare against`);
@@ -2033,6 +2124,10 @@ export default class ProducerService extends cds.ApplicationService {
         if (!prior.contentSaltSeed || !prior.contentRoot || !prior.contentSchemaId) {
             return req.reject(409, `version ${prior.version} of '${row.passportId}' predates the salted-leaf release ` +
                 '(no stored opening), so its content root can no longer be rebuilt');
+        }
+        if (!prior.attesterId) {
+            return req.reject(409, `version ${prior.version} of '${row.passportId}' carries no attester id ` +
+                '(anchored before vault lineage 4), so its record cannot be named in a comparison');
         }
         if (!row.contentSaltSeed || !row.contentRoot) {
             return req.reject(409, `the current version of '${row.passportId}' has no stored opening; re-anchor it first`);
@@ -2099,9 +2194,11 @@ export default class ProducerService extends cds.ApplicationService {
             minChangedSlots: k, changedSlots, claim,
             payloadHashA: String(prior.payloadHash), payloadHashB: String(row.payloadHash)
         };
+        const validUntil = claimValidUntil({ lifetimeS: claimLifetimeS() });
         const logRowBase = {
             passport_ID: row.ID, sourceField: '', threshold: null, unit: null,
-            payloadHash: String(prior.payloadHash), payloadHashB: String(row.payloadHash)
+            payloadHash: String(prior.payloadHash), payloadHashB: String(row.payloadHash),
+            attesterId: String(prior.attesterId), validUntil: new Date(validUntil * 1000).toISOString()
         };
         const integrityRow = { ...logRowBase, predicate: 'documentIntegrity', allowedMask: mask };
         // The diff claim's k rides in `allowedMask`: same column, different
@@ -2134,7 +2231,10 @@ export default class ProducerService extends cds.ApplicationService {
             schema: JSON.parse(JSON.stringify(treeA.schema)),
             openingA: treeA.opening,
             openingB: treeB.opening,
-            payloadHashB: String(row.payloadHash)
+            payloadHashB: String(row.payloadHash),
+            // Each version's record is its own attester's (a handover between
+            // the two versions changes it).
+            attesterIdB: String(row.attesterId)
         };
         const claims = [
             { predicate: 'documentIntegrity', allowedMask: mask, ...shared },
@@ -2143,6 +2243,8 @@ export default class ProducerService extends cds.ApplicationService {
         const args = {
             // Document A is the batch's payloadHash; every claim names B itself.
             payloadHash: String(prior.payloadHash),
+            attesterId: String(prior.attesterId),
+            validUntil,
             claimsJson: JSON.stringify(claims),
             sessionId: session, contractAddress, compiledArtifactRef: CONTRACT_REF,
             ...(sponsorSessionId ? { sponsorSessionId } : {})
@@ -2154,7 +2256,8 @@ export default class ProducerService extends cds.ApplicationService {
         ];
         (req as any).on('succeeded', () => {
             void detachedFromRequest(() => this.runIntegrityDetached(rows, String(row.ID), args, user, {
-                contractAddress, payloadHashA: String(prior.payloadHash), payloadHashB: String(row.payloadHash)
+                contractAddress, payloadHashA: String(prior.payloadHash), payloadHashB: String(row.payloadHash),
+                attesterIdA: String(prior.attesterId), attesterIdB: String(row.attesterId)
             })).catch((e: unknown) =>
                 cds.log('producer').error(`detached integrity runner crashed for ${row.passportId}:`, e));
         });
@@ -2174,7 +2277,7 @@ export default class ProducerService extends cds.ApplicationService {
         passportRowId: string,
         args: Record<string, unknown> & { sessionId: string; contractAddress: string },
         user: unknown,
-        pair: { contractAddress: string; payloadHashA: string; payloadHashB: string }
+        pair: { contractAddress: string; payloadHashA: string; payloadHashB: string; attesterIdA: string; attesterIdB: string }
     ): Promise<void> {
         const log = cds.log('producer');
         const logIds = rows.map((r) => r.logId);
@@ -2240,6 +2343,8 @@ export default class ProducerService extends cds.ApplicationService {
                     contractAddress: pair.contractAddress,
                     payloadHashA: pair.payloadHashA,
                     payloadHashB: pair.payloadHashB,
+                    attesterIdA: pair.attesterIdA,
+                    attesterIdB: pair.attesterIdB,
                     kind: r.kind,
                     bound: r.bound
                 }).catch(() => 'unknown' as const)));
@@ -2456,7 +2561,7 @@ export default class ProducerService extends cds.ApplicationService {
      * policy). The current anchor is archived as a PassportAnchorVersions row
      * (including its cipher, so the old canonical payload stays decryptable),
      * the row moves to the new hash + cipher, and the standard anchorRow flow
-     * runs the on-chain leg (attest of the new hash + bindPassport RE-BIND of
+     * runs the on-chain leg (attest of the new hash + bindDocument RE-BIND of
      * the same passportIdHash + fresh content root, one batched tx, detached).
      * The vault allows the re-bind only for the attester holding the current
      * binding, so this MUST run with the same wallet that anchored before; a
@@ -2553,10 +2658,11 @@ export default class ProducerService extends cds.ApplicationService {
             // it on archive and the version can still be verified as anchored,
             // but never compared against its successor again.
             const live: any = await SELECT.one.from(Passports)
-                .columns('contentRoot', 'contentSchemaId', 'contentSaltSeed').where({ ID: row.ID });
+                .columns('contentRoot', 'contentSchemaId', 'contentSaltSeed', 'attesterId').where({ ID: row.ID });
             await INSERT.into(PassportAnchorVersions).entries({
                 passport_ID: row.ID, version: archivedVersion,
                 payloadHash: row.payloadHash, payloadCipher: row.payloadCipher,
+                attesterId: live?.attesterId ?? null,
                 contentRoot: live?.contentRoot ?? null,
                 contentSchemaId: live?.contentSchemaId ?? null,
                 contentSaltSeed: live?.contentSaltSeed ?? null,

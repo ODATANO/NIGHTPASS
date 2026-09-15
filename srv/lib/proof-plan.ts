@@ -1,26 +1,32 @@
 /**
  * Shared ZK proof cart plan: the ordered circuit calls that prove N
- * field-bound claims for ONE passport, exactly as they ride in ONE batched
+ * field-bound claims on ONE record, exactly as they ride in ONE batched
  * transaction. Single source of truth for the submit paths (sibling of
  * anchor-plan.ts):
  *   - browser: app/connector/connector.mjs proveFieldPredicateBatch
  *     (wallet-signed, one approval for the whole cart)
- *   - server: producer-service provePassportValuesBatch via NIGHTGATE
- *     issueFieldPredicateAttestationBatch
+ *   - remote lane: srv/lib/lane-remote.ts (nightgate-tx prepare helpers)
+ *   - plugin lane: NIGHTGATE issueFieldPredicateAttestationBatch builds the
+ *     calls itself from the same claim list
  *
  * Two claim kinds share the cart (mixed carts ride in one tx):
- *   - predicate:  proveFieldPredicate(payload_hash, field_key, threshold, op)
- *   - membership: proveFieldMembership(payload_hash, field_key, set_root)
+ *   - predicate:  proveFieldPredicate(record_key, field_key, threshold, op, valid_until)
+ *   - membership: proveFieldMembership(record_key, field_key, set_root, valid_until)
  *     (the hidden value's digest + both Merkle paths travel as witnesses,
  *     never as circuit args)
+ *
+ * The record key names the attester's record of the payload
+ * (`recordKey(attesterId, payloadHash)`, vault lineage 4); the caller
+ * computes it with the vault's pure circuit. `valid_until` is the claim's
+ * expiry in UNIX seconds; see `claimValidUntil`.
  *
  * Dependency-free on purpose: no @sap/cds, no Node-only APIs, so the vite
  * connector build can bundle this file for the browser.
  *
- * Cart semantics (verified against the vault contract 2026-08-01):
+ * Cart semantics (verified against the vault contract):
  *   - Calls are independent; no cross-call ordering requirement exists (the
  *     consumers still submit through their deterministic-order batch path).
- *   - The vault does NOT reject duplicate claim keys (insert overwrites), so
+ *   - A repeated claim key only extends its expiry (never shortens it), so
  *     duplicates are merely wasted proving time; the plan drops exact
  *     duplicates and reports them.
  *   - A claim that does not hold fails the circuit assert at local proving
@@ -28,12 +34,36 @@
  *     on-chain effect.
  */
 
+/** The vault's cap on a claim lifetime: five years in seconds. */
+export const MAX_CLAIM_LIFETIME_S = 157_680_000;
+
+/**
+ * Default claim lifetime: the cap minus one day. The circuit only accepts a
+ * block whose time lies in (valid_until - cap, valid_until), so an expiry at
+ * exactly now + cap would need the block to land after the local clock, and a
+ * clock ahead of chain time would refuse the proof. A battery passport lives
+ * longer than five years; the claim is re-proven to extend.
+ */
+export const DEFAULT_CLAIM_LIFETIME_S = MAX_CLAIM_LIFETIME_S - 24 * 60 * 60;
+
+/**
+ * Claim expiry in UNIX seconds. `lifetimeS` above the cap is clamped to the
+ * default; a non-positive lifetime is refused.
+ */
+export function claimValidUntil(o: { lifetimeS?: number; nowMs?: number } = {}): number {
+    const now = Math.floor((o.nowMs ?? Date.now()) / 1000);
+    let life = Number(o.lifetimeS ?? DEFAULT_CLAIM_LIFETIME_S);
+    if (!Number.isFinite(life) || life <= 0) throw new Error('claim lifetime must be a positive number of seconds');
+    if (life > MAX_CLAIM_LIFETIME_S) life = DEFAULT_CLAIM_LIFETIME_S;
+    return now + Math.floor(life);
+}
+
 export interface PredicateClaim {
     /** Absent kind means predicate (legacy callers predate the union). */
     kind?: 'predicate';
     /** blake2b-256 field key (fieldKeyHex(sourceField)), 64-hex. */
     fieldKey: string;
-    /** Scaled threshold (raw x1000), non-negative integer, Uint<64>. */
+    /** Scaled threshold (raw x1000), non-negative integer, at most 2^63 - 1. */
     threshold: number | string;
     /** 0 = value <= threshold, 1 = value >= threshold. */
     op: 0 | 1;
@@ -54,15 +84,16 @@ export type ProofCartCall =
         circuit: 'proveFieldPredicate';
         /**
          * Circuit args in signature order, uniformly as strings:
-         * [payload_hash 64-hex, field_key 64-hex, threshold decimal, op '0'|'1'].
-         * Consumers convert (browser: bytes/BigInt; server: NIGHTGATE coercion).
+         * [record_key 64-hex, field_key 64-hex, threshold decimal, op '0'|'1',
+         * valid_until decimal UNIX seconds]. Consumers convert (browser:
+         * bytes/BigInt; remote lane: the prepare helpers).
          */
-        args: [string, string, string, string];
+        args: [string, string, string, string, string];
     }
     | {
         circuit: 'proveFieldMembership';
-        /** [payload_hash 64-hex, field_key 64-hex, set_root 64-hex]. */
-        args: [string, string, string];
+        /** [record_key 64-hex, field_key 64-hex, set_root 64-hex, valid_until decimal]. */
+        args: [string, string, string, string];
     };
 
 export interface ProofCartPlan {
@@ -71,9 +102,12 @@ export interface ProofCartPlan {
     claims: ProofClaim[];
     /** Exact-duplicate claims dropped from the input (wasted proving time only). */
     dropped: ProofClaim[];
+    /** The expiry every call of this cart carries (UNIX seconds). */
+    validUntil: number;
 }
 
 const HEX32 = /^[0-9a-fA-F]{64}$/;
+const MAX_THRESHOLD = 9223372036854775807n;
 
 function checkHex32(value: string, label: string): string {
     if (!HEX32.test(String(value ?? ''))) throw new Error(`${label} must be 32-byte hex (64 chars)`);
@@ -83,6 +117,7 @@ function checkHex32(value: string, label: string): string {
 function checkThreshold(value: number | string, label: string): string {
     const s = String(value ?? '');
     if (!/^\d+$/.test(s)) throw new Error(`${label} must be a non-negative integer (scaled Uint<64>)`);
+    if (BigInt(s) > MAX_THRESHOLD) throw new Error(`${label} must be at most 2^63 - 1`);
     return s;
 }
 
@@ -126,13 +161,16 @@ export function responseClaimKey(c: {
  * FALLIBLE one, and the batch pre-check refuses a guaranteed call behind a
  * fallible one (`BatchCausalityViolation`, nothing submitted). On the vault
  * `proveFieldMembership` runs guaranteed while `proveFieldPredicate` has
- * grown fallible, so a mixed cart must lead with the membership claims
- * (measured 2026-08-28: four predicates then one membership was refused).
+ * grown fallible, so a mixed cart must lead with the membership claims.
  * Same-circuit calls are unordered among themselves anyway.
  */
-export function proofCartPlan({ payloadHash, claims }: { payloadHash: string; claims: ProofClaim[] }): ProofCartPlan {
-    checkHex32(payloadHash, 'payloadHash');
+export function proofCartPlan({ recordKey, claims, validUntil }: {
+    recordKey: string; claims: ProofClaim[]; validUntil?: number;
+}): ProofCartPlan {
+    checkHex32(recordKey, 'recordKey');
     if (!Array.isArray(claims) || claims.length === 0) throw new Error('the proof cart is empty');
+    const expiry = Number(validUntil ?? claimValidUntil());
+    if (!Number.isInteger(expiry) || expiry <= 0) throw new Error('validUntil must be a positive integer (UNIX seconds)');
     const seen = new Set<string>();
     const kept: ProofClaim[] = [];
     const dropped: ProofClaim[] = [];
@@ -156,13 +194,15 @@ export function proofCartPlan({ payloadHash, claims }: { payloadHash: string; cl
         kept.push(claim);
     });
     const ordered = [...kept.filter((c) => c.kind === 'membership'), ...kept.filter((c) => c.kind !== 'membership')];
+    const until = String(expiry);
     return {
         calls: ordered.map((c): ProofCartCall => (
             c.kind === 'membership'
-                ? { circuit: 'proveFieldMembership', args: [payloadHash, c.fieldKey, c.setRoot] }
-                : { circuit: 'proveFieldPredicate', args: [payloadHash, c.fieldKey, String(c.threshold), String(c.op)] }
+                ? { circuit: 'proveFieldMembership', args: [recordKey, c.fieldKey, c.setRoot, until] }
+                : { circuit: 'proveFieldPredicate', args: [recordKey, c.fieldKey, String(c.threshold), String(c.op), until] }
         )),
         claims: ordered,
-        dropped
+        dropped,
+        validUntil: expiry
     };
 }

@@ -334,9 +334,14 @@ export default class SandboxService extends cds.ApplicationService {
             await waitForJobResult(nightgate, String(signing.prewarmJobId), sessionId, user);
         }
 
+        // The tester's attester id names every record it anchors (lineage 4);
+        // the anchor job reports it, and the verify coordinates carry it.
+        let attesterId = '';
         const submit = async (action: string, args: Record<string, unknown>): Promise<string> => {
             const job: any = await sendDetached(nightgate, action, { ...args, sessionId, sponsorSessionId, contractAddress }, user);
+            if (!attesterId && /^[0-9a-f]{64}$/i.test(String(job?.attesterId ?? ''))) attesterId = String(job.attesterId).toLowerCase();
             const res: any = await waitForJobResult(nightgate, String(job.jobId), sessionId, user, { requireChainSuccess: true });
+            if (!attesterId && /^[0-9a-f]{64}$/i.test(String(res?.attesterId ?? ''))) attesterId = String(res.attesterId).toLowerCase();
             return String(res.txHash ?? res.proof?.proofValue ?? '');
         };
 
@@ -353,6 +358,7 @@ export default class SandboxService extends cds.ApplicationService {
             };
             await anchorDoc('A', spec.documents.A);
             if (spec.documents.B) await anchorDoc('B', spec.documents.B);
+            result.attesterId = attesterId;
 
             // 2. Each claim, sponsored, against the shared vault.
             for (let i = 0; i < spec.claims.length; i++) {
@@ -360,7 +366,7 @@ export default class SandboxService extends cds.ApplicationService {
                 const stepKind = `claim:${i}:${c.kind}`;
                 await setStep(stepKind, { status: 'running' });
                 const { tx, verify } = await this.runClaim(submit, spec, c);
-                result.claims.push({ index: i, kind: c.kind, txHash: tx, verify });
+                result.claims.push({ index: i, kind: c.kind, txHash: tx, verify: { attesterId, ...verify } });
                 await setStep(stepKind, { status: 'succeeded', txHash: tx, explorerUrl: explorerTxUrl(tx) });
             }
 

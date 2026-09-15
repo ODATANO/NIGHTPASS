@@ -166,6 +166,8 @@ const HEX32_RE = /^[0-9a-fA-F]{64}$/;
 // type: it is a hand-written cast, so a future arity change compiles here and
 // only fails at run time (as the 0.15 -> 0.16 change did).
 export interface VaultPureCircuits {
+    /** Ledger key of an attester's record of a payload (lineage 4). */
+    recordKey: (owner: Uint8Array, payloadHash: Uint8Array) => Uint8Array;
     leafHash: (k: Uint8Array, v: bigint, salt: Uint8Array) => Uint8Array;
     nodeHash: (l: Uint8Array, r: Uint8Array) => Uint8Array;
     bytesLeafHash: (k: Uint8Array, valueDigest: Uint8Array, salt: Uint8Array) => Uint8Array;
@@ -182,6 +184,20 @@ export async function loadPureCircuits(): Promise<VaultPureCircuits> {
             .then((m: any) => m.pureCircuits);
     }
     return _pureCircuitsPromise;
+}
+
+/**
+ * The ledger key of an attester's record of a payload, 64 hex: what every
+ * proof circuit and the id-free state reads name. Byte-identical to the
+ * vault's `recordKey` pure circuit.
+ */
+export async function recordKeyFor(attesterId: string, payloadHash: string): Promise<string> {
+    const a = String(attesterId ?? '').replace(/^0x/, '');
+    const h = String(payloadHash ?? '').replace(/^0x/, '');
+    if (!HEX32_RE.test(a)) throw new Error('attesterId must be 32-byte hex (64 chars)');
+    if (!HEX32_RE.test(h)) throw new Error('payloadHash must be 32-byte hex (64 chars)');
+    const pc = await loadPureCircuits();
+    return Buffer.from(pc.recordKey(Buffer.from(a, 'hex'), Buffer.from(h, 'hex'))).toString('hex');
 }
 
 export type FieldMerkleProof =
@@ -584,7 +600,7 @@ export async function runChainStep<T>(kind: string, fn: () => Promise<T>): Promi
 // --- On-chain anchor sequence ------------------------------------------------
 
 export interface AnchorStep {
-    kind: 'attest' | 'bindPassport' | 'anchorContentRoot';
+    kind: 'attest' | 'bindDocument' | 'anchorContentRoot';
     jobId: string;
     txHash: string;
 }
@@ -615,17 +631,17 @@ export interface AnchorOpts {
 export const CONTRACT_REF = 'attestation-vault';
 
 /**
- * Anchor a passport on-chain through a ChainLane: `attest` alone, then
- * `anchorContentRoot` (when a root is given) + `bindPassport` as one batch.
- * The split comes from `anchorTxPlan`, the same source the browser connector
- * consumes, so the submit paths cannot drift. Returns the attest tx hash.
- * `onStep` fires once per logical step; steps sharing a batch report the
- * same jobId/txHash.
+ * Anchor a passport on-chain through a ChainLane: `attest`, then
+ * `anchorContentRoot` (when a root is given), then `bindDocument`, as ONE
+ * transaction (lineage 4). The plan comes from `anchorTxPlan`, the same
+ * source the browser connector consumes, so the submit paths cannot drift.
+ * Returns the tx hash. `onStep` fires once per circuit; the steps share the
+ * jobId/txHash of their transaction.
  */
 export async function anchorPassport(lane: ChainLane, opts: AnchorOpts): Promise<{ attestationTxHash: string }> {
     const { payloadHash, passportId, passportIdHash, contractAddress, contentRoot, schemaId, onStep } = opts;
     if (contentRoot && !schemaId) {
-        throw new Error('anchorPassport: schemaId is required alongside contentRoot (anchorContentRoot takes it since 0.16.0)');
+        throw new Error('anchorPassport: schemaId is required alongside contentRoot (the third anchorContentRoot argument)');
     }
     const txPlan = anchorTxPlan({
         payloadHash,

@@ -40,8 +40,9 @@ describe('PluginLane.submitAnchorTx', () => {
     it('sends a single call as submitContractCall with JSON args and the sponsor', async () => {
         const { svc, sent } = fakeNightgate();
         const lane = new PluginLane(svc, 'sess-1', { id: 'u' }, 'sponsor-1');
-        const [attest] = anchorTxPlan({ payloadHash: H('a'), metadataHash: H('b'), passportIdHash: H('c') });
-        const out = await lane.submitAnchorTx({ contractAddress: H('f'), tx: attest });
+        const out = await lane.submitAnchorTx({
+            contractAddress: H('f'), tx: { label: 'attest', calls: [{ circuit: 'attest', args: [H('a'), H('b')] }] }
+        });
         assert.deepEqual(out, { txHash: 'tx-job-submitContractCall', jobId: 'job-submitContractCall' });
         const call = sent.find((s) => s.event === 'submitContractCall')!;
         assert.deepEqual(call.data, {
@@ -52,17 +53,18 @@ describe('PluginLane.submitAnchorTx', () => {
         assert.deepEqual(sent.find((s) => s.event === 'getJobStatus')!.data, { jobId: 'job-submitContractCall', sessionId: 'sess-1' });
     });
 
-    it('sends a multi-call tx as submitContractCallBatch, calls JSON in plan order, no sponsor key when unsponsored', async () => {
+    it('sends the anchor plan as ONE submitContractCallBatch, calls JSON in plan order, no sponsor key when unsponsored', async () => {
         const { svc, sent } = fakeNightgate();
         const lane = new PluginLane(svc, 'sess-1');
-        const [, rest] = anchorTxPlan({ payloadHash: H('a'), metadataHash: H('b'), passportIdHash: H('c'), contentRoot: H('d'), schemaId: H('e') });
-        await lane.submitAnchorTx({ contractAddress: H('f'), tx: rest });
+        const [tx] = anchorTxPlan({ payloadHash: H('a'), metadataHash: H('b'), passportIdHash: H('c'), contentRoot: H('d'), schemaId: H('e') });
+        await lane.submitAnchorTx({ contractAddress: H('f'), tx });
         const call = sent.find((s) => s.event === 'submitContractCallBatch')!;
         assert.deepEqual(call.data, {
             contractAddress: H('f'), compiledArtifactRef: CONTRACT_REF, sessionId: 'sess-1',
             calls: JSON.stringify([
+                { circuit: 'attest', args: [H('a'), H('b')] },
                 { circuit: 'anchorContentRoot', args: [H('a'), H('d'), H('e')] },
-                { circuit: 'bindPassport', args: [H('c'), H('a')] }
+                { circuit: 'bindDocument', args: [H('c'), H('a')] }
             ])
         });
         assert.equal('sponsorSessionId' in call.data, false);
@@ -70,7 +72,7 @@ describe('PluginLane.submitAnchorTx', () => {
 });
 
 describe('anchorPassport over a lane', () => {
-    it('submits attest alone, then the batch, and reports one step per call with the shared tx', async () => {
+    it('submits the whole anchor as one transaction and reports one step per call with the shared tx', async () => {
         const submitted: string[] = [];
         const lane: ChainLane = {
             kind: 'plugin',
@@ -84,12 +86,13 @@ describe('anchorPassport over a lane', () => {
             payloadHash: H('a'), passportId: 'BAT-1', passportIdHash: H('c'), contractAddress: H('f'),
             contentRoot: H('d'), schemaId: H('e'), onStep: (s) => { steps.push(s); }
         });
-        assert.deepEqual(submitted, ['attest', 'anchorContentRoot+bindPassport']);
-        assert.equal(out.attestationTxHash, 'tx-attest');
+        const L = 'attest+anchorContentRoot+bindDocument';
+        assert.deepEqual(submitted, [L]);
+        assert.equal(out.attestationTxHash, 'tx-' + L);
         assert.deepEqual(steps, [
-            { kind: 'attest', jobId: 'job-attest', txHash: 'tx-attest' },
-            { kind: 'anchorContentRoot', jobId: 'job-anchorContentRoot+bindPassport', txHash: 'tx-anchorContentRoot+bindPassport' },
-            { kind: 'bindPassport', jobId: 'job-anchorContentRoot+bindPassport', txHash: 'tx-anchorContentRoot+bindPassport' }
+            { kind: 'attest', jobId: 'job-' + L, txHash: 'tx-' + L },
+            { kind: 'anchorContentRoot', jobId: 'job-' + L, txHash: 'tx-' + L },
+            { kind: 'bindDocument', jobId: 'job-' + L, txHash: 'tx-' + L }
         ]);
     });
 
@@ -110,19 +113,20 @@ const KEY_P = responseClaimKey({ fieldKey: H('1'), predicate: 'lessOrEqual', thr
 const KEY_M = responseClaimKey({ fieldKey: H('4'), predicate: 'setMembership', setRoot: H('9') })!;
 
 describe('PluginLane.submitProofCart', () => {
-    it('sends issueFieldPredicateAttestationBatch with claimsJson verbatim and the in-batch root', async () => {
+    it('sends issueFieldPredicateAttestationBatch with claimsJson verbatim, the record attester, the expiry and the in-batch root', async () => {
         const { svc, sent } = fakeNightgate({
             immediate: { claims: JSON.stringify([{ fieldKey: H('1'), predicate: 'lessOrEqual', threshold: 4000000, predicateAttestationId: 'pa-1' }]) },
             jobResult: { proof: { proofValue: 'tx-cart' }, claims: [{ fieldKey: H('4'), claim: { predicate: 'setMembership', setRoot: H('9') }, predicateAttestationId: 'pa-2' }] }
         });
         const lane = new PluginLane(svc, 'sess-1', undefined, 'sponsor-1');
         const out = await lane.submitProofCart({
-            contractAddress: H('f'), payloadHash: H('a'), contentRoot: H('d'), schemaId: H('e'), claims: CLAIMS, timeoutMs: 60_000
+            contractAddress: H('f'), payloadHash: H('a'), attesterId: H('0'), validUntil: 1_900_000_000,
+            contentRoot: H('d'), schemaId: H('e'), claims: CLAIMS, timeoutMs: 60_000
         });
         const call = sent.find((s) => s.event === 'issueFieldPredicateAttestationBatch')!;
         assert.deepEqual(call.data, {
-            payloadHash: H('a'), contentRoot: H('d'), schemaId: H('e'),
-            claimsJson: JSON.stringify(CLAIMS),
+            payloadHash: H('a'), attesterId: H('0'), contentRoot: H('d'), schemaId: H('e'),
+            claimsJson: JSON.stringify(CLAIMS), validUntil: 1_900_000_000,
             sessionId: 'sess-1', contractAddress: H('f'), compiledArtifactRef: CONTRACT_REF, sponsorSessionId: 'sponsor-1'
         });
         assert.equal(out.txHash, 'tx-cart');
@@ -131,13 +135,15 @@ describe('PluginLane.submitProofCart', () => {
         assert.equal(out.claimIds.get(KEY_M), 'pa-2');
     });
 
-    it('omits the root keys when the root is already anchored', async () => {
+    it('omits the root keys when the root is already anchored, the attester when unknown, and defaults the expiry', async () => {
         const { svc, sent } = fakeNightgate({ jobResult: { txHash: 'tx-x' } });
         const lane = new PluginLane(svc, 'sess-1');
         await lane.submitProofCart({ contractAddress: H('f'), payloadHash: H('a'), claims: CLAIMS, timeoutMs: 60_000 });
         const call = sent.find((s) => s.event === 'issueFieldPredicateAttestationBatch')!;
         assert.equal('contentRoot' in call.data, false);
         assert.equal('schemaId' in call.data, false);
+        assert.equal('attesterId' in call.data, false);
+        assert.ok(Number(call.data.validUntil) > Math.floor(Date.now() / 1000) + 86_400);
     });
 
     it('classifies a post-submit PARTIAL job as partial and keeps the ids it already knows', async () => {

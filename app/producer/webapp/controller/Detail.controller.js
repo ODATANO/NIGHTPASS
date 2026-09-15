@@ -786,9 +786,10 @@ sap.ui.define([
         catch (e) { return that.toast("invalid inclusion proof"); }
         that._lace("Prove field predicate with your wallet", async function (mod, api, append, vault) {
           append("proving the passport's own " + field + " (" + rawVal + ") " + (op === 0 ? "≤ " : "≥ ") + thr + ", bound to the anchored content root, value hidden…");
+          var proven;
           try {
-            await mod.proveFieldPredicate(api, {
-              contractAddress: vault, payloadHash: ph, fieldKey: res.fieldKey,
+            proven = await mod.proveFieldPredicate(api, {
+              contractAddress: vault, payloadHash: ph, attesterId: res.attesterId || "", fieldKey: res.fieldKey,
               threshold: thresholdScaled, op: op, fieldValue: res.scaledValue,
               fieldSalt: res.fieldSalt, siblings: siblings, dirs: dirs
             }, append);
@@ -807,7 +808,7 @@ sap.ui.define([
           }
           var r = await that._resolveHash(mod, append);
           append("saving proof in cockpit…");
-          await that.callAction("/recordWalletPredicate", { passportId: that._pid(), sourceField: field, predicate: predicate, threshold: thresholdScaled, unit: unit, txHash: r.hash, result: true });
+          await that.callAction("/recordWalletPredicate", { passportId: that._pid(), sourceField: field, predicate: predicate, threshold: thresholdScaled, unit: unit, txHash: r.hash, result: true, validUntil: (proven && proven.validUntil) || null });
           that._refreshAll(); append("done."); that.toast("field-bound predicate proven via wallet");
         });
       }).catch(function (e) { that.error(e); });
@@ -896,6 +897,9 @@ sap.ui.define([
           : that.callAction("/passportFieldValue", { passportId: that._pid(), sourceField: it.field });
       })).then(function (aRes) {
         var aProofs = [];
+        // The record's attester: stamped on the passport by the anchor and
+        // returned with every proof material response.
+        var recordAttester = (aRes[0] && aRes[0].attesterId) || "";
         for (var i = 0; i < aItems.length; i++) {
           var res = aRes[i];
           if (aItems[i].kind === "membership") {
@@ -946,9 +950,10 @@ sap.ui.define([
           }
           append("proving " + aProofs.length + " claims bound to the anchored content root (values hidden). "
             + "One approval, one fee; proving still runs once per claim, please wait…");
+          var cartResult;
           try {
-            await mod.proveFieldPredicateBatch(api, {
-              contractAddress: vault, payloadHash: ph,
+            cartResult = await mod.proveFieldPredicateBatch(api, {
+              contractAddress: vault, payloadHash: ph, attesterId: recordAttester,
               proofs: aProofs.map(function (p) {
                 return p.kind === "membership"
                   ? { kind: "membership", fieldKey: p.fieldKey, setRoot: p.setRoot,
@@ -976,15 +981,16 @@ sap.ui.define([
           append("saving " + aProofs.length + " proofs in cockpit…");
           for (var j = 0; j < aProofs.length; j++) {
             var p = aProofs[j];
+            var until = (cartResult && cartResult.validUntil) || null;
             if (p.kind === "membership") {
               await that.callAction("/recordWalletMembership", {
                 passportId: that._pid(), sourceField: p.item.field, setId: p.item.setId,
-                setRoot: p.setRoot, txHash: r.hash, result: true
+                setRoot: p.setRoot, txHash: r.hash, result: true, validUntil: until
               });
             } else {
               await that.callAction("/recordWalletPredicate", {
                 passportId: that._pid(), sourceField: p.item.field, predicate: p.item.predicate,
-                threshold: p.threshold, unit: p.item.unit, txHash: r.hash, result: true
+                threshold: p.threshold, unit: p.item.unit, txHash: r.hash, result: true, validUntil: until
               });
             }
           }
@@ -1126,22 +1132,24 @@ sap.ui.define([
         }
         that._lace("Attest with your wallet", async function (mod, api, append, vault) {
           // Batch path: a connector bundle with anchorBatch composes attest +
-          // bindPassport + anchorContentRoot as ONE transaction (one wallet
-          // approval), same call plan as the server's submitContractCallBatch
-          // path. Feature-detected so a stale bundle keeps the proven
-          // sequential flow (which has no bindPassport).
+          // anchorContentRoot + bindDocument as ONE transaction (one wallet
+          // approval), same call plan as the server lanes. Feature-detected
+          // so a stale bundle keeps the proven sequential flow (which has no
+          // bindDocument). The record is keyed by the wallet's attester id
+          // (lineage 4), so it is stored with the anchor.
+          var attesterId = typeof mod.attesterIdOf === "function" ? await mod.attesterIdOf(api) : "";
           if (typeof mod.anchorBatch === "function" && pidHash) {
-            append("anchoring attest + bindPassport" + (contentRoot ? " + content root" : "") + " as ONE transaction (prove -> balance -> submit)…");
+            append("anchoring attest" + (contentRoot ? " + content root" : "") + " + bindDocument as ONE transaction (prove -> balance -> submit)…");
             await mod.anchorBatch(api, { contractAddress: vault, payloadHash: ph, metadataHash: ph, passportIdHash: pidHash, contentRoot: contentRoot, schemaId: schemaId }, append);
             var r = await that._resolveHash(mod, append);
             append("saving tx in cockpit…");
-            await that.callAction("/recordWalletAttest", { passportId: that._pid(), txHash: r.hash, identifier: r.id, contractAddress: vault });
+            await that.callAction("/recordWalletAttest", { passportId: that._pid(), txHash: r.hash, identifier: r.id, contractAddress: vault, attesterId: attesterId });
           } else {
             append("attesting the passport hash on-chain (prove -> balance -> submit)…");
             await mod.attest(api, { contractAddress: vault, payloadHash: ph, metadataHash: ph }, append);
             var r2 = await that._resolveHash(mod, append);
             append("saving tx in cockpit…");
-            await that.callAction("/recordWalletAttest", { passportId: that._pid(), txHash: r2.hash, identifier: r2.id, contractAddress: vault });
+            await that.callAction("/recordWalletAttest", { passportId: that._pid(), txHash: r2.hash, identifier: r2.id, contractAddress: vault, attesterId: attesterId });
             if (contentRoot) {
               append("anchoring content root (binds passport fields for field-bound proofs)…");
               await mod.anchorContentRoot(api, { contractAddress: vault, payloadHash: ph, contentRoot: contentRoot, schemaId: schemaId }, append);

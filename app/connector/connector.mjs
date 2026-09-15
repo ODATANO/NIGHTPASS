@@ -25,7 +25,7 @@ if (typeof globalThis.global === 'undefined') globalThis.global = globalThis;
 // list the server submits via NIGHTGATE submitContractCallBatch, so the two
 // anchor paths cannot drift.
 import { anchorTxPlan } from '../../srv/lib/anchor-plan';
-import { proofCartPlan, claimKey } from '../../srv/lib/proof-plan';
+import { proofCartPlan, claimKey, claimValidUntil } from '../../srv/lib/proof-plan';
 
 // NOTE: all heavy SDK/WASM imports are LAZY (loaded inside the action functions)
 // so the page + wallet connect work even before any ZK artifact loads. Importing
@@ -220,6 +220,28 @@ async function walletStoreKey(api) {
 }
 
 let _cachedSecret = null;
+/**
+ * The attester identity of this wallet's app-managed secret, 64 hex:
+ * persistentHash(secret), byte-exact to the vault's caller_id(). Records are
+ * keyed by it (lineage 4), so the cockpit stores it next to the anchor.
+ */
+export async function attesterIdOf(api) {
+    const secret = await deriveAttesterSecret(api);
+    const rt = await import('@midnight-ntwrk/compact-runtime');
+    return toHex(rt.persistentHash(new rt.CompactTypeBytes(32), secret));
+}
+
+/**
+ * The ledger key of an attester's record of a payload (`recordKeyOf` over the
+ * vault's pure circuit). Defaults to this wallet's own attester id; pass the
+ * passport's stamped attester to prove on another attester's record.
+ */
+export async function recordKeyFor(api, payloadHash, attesterId) {
+    const [{ recordKeyOf }, vault] = await Promise.all([loadBrowserSdk(), loadVaultContract()]);
+    const owner = attesterId || await attesterIdOf(api);
+    return recordKeyOf({ pureCircuits: vault.pureCircuits, attesterId: owner, payloadHash });
+}
+
 export async function deriveAttesterSecret(api) {
     if (_cachedSecret) return _cachedSecret;
     const { deriveAttestationSecret } = await loadBrowserSdk();
@@ -497,11 +519,17 @@ export async function deployVault(api, log = console.log) {
     const witnesses = buildAttestationVaultWitnesses({ attestationSecret });
     const { fullProviders, compiledContract, contracts } = await prepareSdkContext(api, witnesses, L);
 
-    L('deploying attestation-vault (prove + balance + submit via wallet)…');
+    // Lineage 4 constructor: (registrar, recovery). The deployer's attester
+    // id becomes the registrar; a zero recovery id disables the recovery
+    // modes (a lost registrar key then locks the id registry for good).
+    const registrarId = fromHex(await attesterIdOf(api));
+    const recoveryId = new Uint8Array(32);
+    L(`deploying attestation-vault (registrar ${toHex(registrarId).slice(0, 12)}…, no recovery; prove + balance + submit via wallet)…`);
     const result = await contracts.deployContract(fullProviders, {
         compiledContract,
         privateStateId: PRIVATE_STATE_ID,
-        initialPrivateState: {}
+        initialPrivateState: {},
+        args: [registrarId, recoveryId]
     });
     const addr = result?.deployTxData?.public?.contractAddress
         ?? result?.public?.contractAddress
@@ -544,52 +572,6 @@ export async function revokeDisclosure(api, { contractAddress, payloadHash, gran
     return runPreparedCall(api, contractAddress, prepareRevokeDisclosure({ payloadHash, grantee, attestationSecret }), L);
 }
 
-// --- Predicate Attestation (value ≤ / ≥ threshold, value stays off-chain) ----
-// Two-step PAC flow on the AttestationVault:
-//   1) commitValue(payload_hash): pins a Pedersen-style commitment to
-//      the hidden value+salt on-chain (the value itself is a witness, never sent).
-//   2) provePredicate(payload_hash, threshold, op): proves value ≤ threshold
-//      (op 0) or value ≥ threshold (op 1) against that commitment in-circuit; the
-//      tx only lands if the assert holds, so a successful tx IS the proof, and
-//      the chain records predicate_results[claim]=true WITHOUT the value.
-// Both witness attested_value()+value_salt(), so the SAME value+salt must be used
-// for commit and prove (and the payload must already be attested by this wallet).
-
-/** commitValue(payload_hash): attach a hidden numeric commitment. */
-export async function commitValue(api, { contractAddress, payloadHash, value, valueSalt }, log = console.log) {
-    const L = mklog(log);
-    L('commitValue: loading browser SDK…');
-    const { buildAttestationVaultWitnesses } = await loadBrowserSdk();
-    L('commitValue: deriving app-managed attester secret…');
-    const attestationSecret = await deriveAttesterSecret(api);
-    const call = {
-        circuitId: 'commitValue',
-        args: [fromHex(payloadHash)],
-        witnesses: buildAttestationVaultWitnesses({ attestationSecret, witnessValues: { attestedValue: String(value), valueSalt } })
-    };
-    L(`committing hidden value (only its commitment goes on-chain)…`);
-    return runPreparedCall(api, contractAddress, call, L);
-}
-
-/** provePredicate(payload_hash, threshold, op): op 0 = value ≤ threshold, 1 = value ≥ threshold. */
-export async function provePredicate(api, { contractAddress, payloadHash, value, valueSalt, threshold, op }, log = console.log) {
-    const L = mklog(log);
-    L('provePredicate: loading browser SDK…');
-    const { buildAttestationVaultWitnesses } = await loadBrowserSdk();
-    L('provePredicate: deriving app-managed attester secret…');
-    const attestationSecret = await deriveAttesterSecret(api);
-    const opNum = Number(op);
-    const call = {
-        circuitId: 'provePredicate',
-        args: [fromHex(payloadHash), BigInt(threshold), BigInt(opNum)],
-        witnesses: buildAttestationVaultWitnesses({ attestationSecret, witnessValues: { attestedValue: String(value), valueSalt } })
-    };
-    L(`proving ${value} ${opNum === 0 ? '≤' : '≥'} ${threshold} in zero-knowledge (the value never leaves the browser)…`);
-    const result = await runPreparedCall(api, contractAddress, call, L);
-    L(`✓ predicate proven on-chain: ${value} ${opNum === 0 ? '≤' : '≥'} ${threshold} holds, verified without revealing ${value}.`);
-    return result;
-}
-
 // --- Field-bound Predicate (value bound to a SPECIFIC passport field) --------
 // Hardened flow that answers "is this the value from THIS passport?". The value
 // is proven to be a leaf in a Merkle content-root anchored at attest time, so it
@@ -626,13 +608,13 @@ export async function anchorContentRoot(api, { contractAddress, payloadHash, con
     return runPreparedCall(api, contractAddress, call, L);
 }
 
-// --- Batched anchor: attest + bindPassport + anchorContentRoot in ONE tx -----
+// --- Batched anchor: attest + anchorContentRoot + bindDocument in ONE tx -----
 // Ported from NIGHTGATE's server-side batch submitter (srv/midnight/
 // batch-segment-order.ts + batch-call-scope.ts, plugin >= 0.10.0).
 // midnight-js-contracts builds each circuit call via
 // Transaction.fromPartsRandomized, which RANDOMIZES the intent's segment id,
 // and the ledger applies merged intents in ascending segment order. A batch of
-// dependent calls (bindPassport asserts the attest) would only land when the
+// dependent calls (bindDocument asserts the attest) would only land when the
 // dice fell in call order. The fix window: the scope hands the merged tx to
 // the proof provider FIRST, still unbound and unproven, and ledger-v8
 // documents Transaction.intents as writable exactly then. So before proving
@@ -761,12 +743,13 @@ async function runPreparedBatch(api, contractAddress, calls, log) {
 }
 
 /**
- * Anchor a passport in ONE transaction: attest + bindPassport + optional
- * anchorContentRoot against the same vault, one wallet approval. The call
- * list comes from the shared anchorCallPlan (the same source as the server's
- * batched submitContractCallBatch path). bindPassport binds the
- * passportIdHash to this wallet's attester identity and asserts the attest,
- * which is exactly why the deterministic call order above is required.
+ * Anchor a passport in ONE transaction: attest + optional anchorContentRoot +
+ * bindDocument against the same vault, one wallet approval. The call list
+ * comes from the shared anchorTxPlan (the same source as the server lanes).
+ * bindDocument binds the passportIdHash to this wallet's record and asserts
+ * the attest, which is exactly why the deterministic call order above is
+ * required. Returns the submit result plus the attester id the record is
+ * keyed by.
  */
 export async function anchorBatch(api, { contractAddress, payloadHash, metadataHash, passportIdHash, contentRoot, schemaId }, log = console.log) {
     const L = mklog(log);
@@ -774,51 +757,48 @@ export async function anchorBatch(api, { contractAddress, payloadHash, metadataH
     const { buildAttestationVaultWitnesses } = await loadBrowserSdk();
     L('anchorBatch: deriving app-managed attester secret (no wallet popup)…');
     const attestationSecret = await deriveAttesterSecret(api);
+    const attesterId = await attesterIdOf(api);
     const witnesses = buildAttestationVaultWitnesses({ attestationSecret });
-    // The shared plan groups the calls into transactions. It is TWO since
-    // 0.16.0: attest writes the vault's attestation-sequence counter, and the
-    // ledger rejects a batch whose cell update is followed by a later intent
-    // (1010/188). So this asks for two wallet approvals; a single one would
-    // simply not land (see srv/lib/anchor-plan.ts for the measurement).
     const txs = anchorTxPlan({ payloadHash, metadataHash, passportIdHash, ...(contentRoot ? { contentRoot, schemaId } : {}) });
-    L(`anchorBatch: ${txs.length} transactions [${txs.map((t) => t.label).join(' then ')}], one approval each`);
     let last = null;
     for (let i = 0; i < txs.length; i++) {
         const calls = txs[i].calls.map((c) => ({ circuitId: c.circuit, args: c.args.map((h) => fromHex(h)), witnesses }));
         L(`anchorBatch: transaction ${i + 1}/${txs.length} [${txs[i].label}] — please approve in your wallet`);
         last = await runPreparedBatch(api, contractAddress, calls, L);
     }
-    return last;
+    return { ...(last && typeof last === 'object' ? last : { result: last }), attesterId };
 }
 
 /**
- * proveFieldPredicate(payload_hash, field_key, threshold, op): field-bound proof.
- * `merkleProof` = { fieldValue (scaled decimal string), fieldSalt (64-hex),
- * siblings (4 × 64-hex), dirs (4 booleans) }. op 0 = value ≤ threshold,
- * 1 = value ≥ threshold. The salt is the slot's share of the document salt
- * seed: leaves are salted since 0.16.0, so without it the recomputed leaf
- * never folds to the anchored root.
+ * proveFieldPredicate(record_key, field_key, threshold, op, valid_until):
+ * field-bound proof on the record `recordKey(attesterId, payloadHash)`.
+ * `attesterId` defaults to this wallet's own; pass the passport's stamped
+ * attester to prove on a record another wallet anchored (the proof circuits
+ * check no attester secret). The inclusion material is { fieldValue (scaled
+ * decimal string), fieldSalt (64-hex), siblings (4 × 64-hex), dirs (4
+ * booleans) }; op 0 = value ≤ threshold, 1 = value ≥ threshold. `validUntil`
+ * (UNIX seconds) defaults to the vault cap less a day. Returns the submit
+ * result plus the `validUntil` the claim carries.
  */
-export async function proveFieldPredicate(api, { contractAddress, payloadHash, fieldKey, threshold, op, fieldValue, fieldSalt, siblings, dirs }, log = console.log) {
+export async function proveFieldPredicate(api, { contractAddress, payloadHash, attesterId, validUntil, fieldKey, threshold, op, fieldValue, fieldSalt, siblings, dirs }, log = console.log) {
     const L = mklog(log);
-    if (!fieldSalt) throw new Error('proveFieldPredicate: fieldSalt is required (salted leaves since 0.16.0)');
+    if (!fieldSalt) throw new Error('proveFieldPredicate: fieldSalt is required (salted leaves)');
     L('proveFieldPredicate: loading browser SDK…');
-    const { buildAttestationVaultWitnesses } = await loadBrowserSdk();
+    const { prepareProveFieldPredicate } = await loadBrowserSdk();
     L('proveFieldPredicate: deriving app-managed attester secret…');
     const attestationSecret = await deriveAttesterSecret(api);
+    const recordKey = await recordKeyFor(api, payloadHash, attesterId);
+    const until = Number(validUntil || claimValidUntil());
     const opNum = Number(op);
-    const call = {
-        circuitId: 'proveFieldPredicate',
-        args: [fromHex(payloadHash), fromHex(fieldKey), BigInt(threshold), BigInt(opNum)],
-        witnesses: buildAttestationVaultWitnesses({
-            attestationSecret,
-            merkleProof: { fieldValue: String(fieldValue), fieldSalt, siblings, dirs }
-        })
-    };
+    const call = prepareProveFieldPredicate({
+        recordKey, fieldKey, threshold: BigInt(threshold), op: opNum, validUntil: until,
+        merkleProof: { fieldValue: String(fieldValue), fieldSalt, siblings, dirs },
+        attestationSecret
+    });
     L(`proving field ${fieldValue} ${opNum === 0 ? '≤' : '≥'} ${threshold}, bound to this passport's content root, value hidden…`);
     const result = await runPreparedCall(api, contractAddress, call, L);
     L(`✓ field-bound predicate proven on-chain: the passport's own value ${opNum === 0 ? '≤' : '≥'} ${threshold} holds.`);
-    return result;
+    return { ...(result && typeof result === 'object' ? result : { result }), validUntil: until };
 }
 
 /**
@@ -847,17 +827,21 @@ export async function proveFieldPredicate(api, { contractAddress, payloadHash, f
  * nothing submitted. Proving time stays additive (N proofs = N proving
  * runs); the cart amortizes approvals, balancing, fees and confirmations.
  */
-export async function proveFieldPredicateBatch(api, { contractAddress, payloadHash, proofs }, log = console.log) {
+export async function proveFieldPredicateBatch(api, { contractAddress, payloadHash, attesterId, validUntil, proofs }, log = console.log) {
     const L = mklog(log);
     if (!Array.isArray(proofs) || !proofs.length) throw new Error('proveFieldPredicateBatch: proofs must be a non-empty array');
     L('proveFieldPredicateBatch: loading browser SDK…');
     const { buildAttestationVaultWitnesses } = await loadBrowserSdk();
     L('proveFieldPredicateBatch: deriving app-managed attester secret…');
     const attestationSecret = await deriveAttesterSecret(api);
+    // The claims name the RECORD (attester + payload); the passport's stamped
+    // attester wins over this wallet's own, so a cart on a record another
+    // wallet anchored proves against the right key.
+    const recordKey = await recordKeyFor(api, payloadHash, attesterId);
     const planClaimOf = (p) => (p.kind === 'membership'
         ? { kind: 'membership', fieldKey: p.fieldKey, setRoot: p.setRoot }
         : { fieldKey: p.fieldKey, threshold: p.threshold, op: Number(p.op) });
-    const plan = proofCartPlan({ payloadHash, claims: proofs.map(planClaimOf) });
+    const plan = proofCartPlan({ recordKey, claims: proofs.map(planClaimOf), ...(validUntil ? { validUntil: Number(validUntil) } : {}) });
     if (plan.dropped.length) L(`proveFieldPredicateBatch: dropped ${plan.dropped.length} duplicate claim(s) (already in the cart)`);
     // Pre-convert each kept claim's witness data; the holder swaps between
     // calls. Claims were deduped by their canonical claim key, so matching
@@ -871,10 +855,10 @@ export async function proveFieldPredicateBatch(api, { contractAddress, payloadHa
         if (siblings.length !== 4 || dirs.length !== 4) {
             throw new Error('each proof needs a depth-4 inclusion proof (4 siblings + 4 dirs)');
         }
-        // Salted leaves (0.16.0): every field-bound circuit recomputes the leaf
-        // from value + SALT, so a cart item without its slot salt can only fail
-        // at proving time, minutes in.
-        if (!src.fieldSalt) throw new Error('each proof needs its fieldSalt (salted leaves since 0.16.0)');
+        // Salted leaves: every field-bound circuit recomputes the leaf from
+        // value + SALT, so a cart item without its slot salt can only fail at
+        // proving time, minutes in.
+        if (!src.fieldSalt) throw new Error('each proof needs its fieldSalt (salted leaves)');
         const fieldSalt = fromHex(src.fieldSalt);
         if (c.kind === 'membership') {
             const setSiblings = (src.setSiblings || []).map((h) => fromHex(h));
@@ -904,18 +888,19 @@ export async function proveFieldPredicateBatch(api, { contractAddress, payloadHa
     };
     const calls = plan.calls.map((c, i) => ({
         circuitId: c.circuit,
-        // Per-circuit arg conversion: predicate = 2 hex + 2 BigInt,
-        // membership = 3 hex (payloadHash, fieldKey, setRoot).
+        // Per-circuit arg conversion: predicate = 2 hex + 3 BigInt (threshold,
+        // op, valid_until), membership = 3 hex (recordKey, fieldKey, setRoot)
+        // + valid_until.
         args: c.circuit === 'proveFieldMembership'
-            ? [fromHex(c.args[0]), fromHex(c.args[1]), fromHex(c.args[2])]
-            : [fromHex(c.args[0]), fromHex(c.args[1]), BigInt(c.args[2]), BigInt(c.args[3])],
+            ? [fromHex(c.args[0]), fromHex(c.args[1]), fromHex(c.args[2]), BigInt(c.args[3])]
+            : [fromHex(c.args[0]), fromHex(c.args[1]), BigInt(c.args[2]), BigInt(c.args[3]), BigInt(c.args[4])],
         witnesses,
         before: () => { holder.current = converted[i]; }
     }));
     L(`proveFieldPredicateBatch: ${calls.length} proof(s) in one tx (proving runs once per claim, please wait)…`);
     const result = await runPreparedBatch(api, contractAddress, calls, L);
     L(`✓ ${calls.length} field-bound claim(s) proven on-chain in one transaction, values hidden.`);
-    return { ...(result && typeof result === 'object' ? result : { result }), claims: plan.claims, dropped: plan.dropped };
+    return { ...(result && typeof result === 'object' ? result : { result }), claims: plan.claims, dropped: plan.dropped, validUntil: plan.validUntil };
 }
 
 // --- On-chain verification (indexer scan) -----------------------------------

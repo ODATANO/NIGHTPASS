@@ -6,7 +6,7 @@ using {passport} from '../db/passport-schema';
  * Where PassportService is the read-side consumer surface (tier-gated views),
  * this is the WRITE side: a producer creates a battery passport from its Annex
  * XIII fields, saves it (draft, off-chain), runs the submit flow (attest +
- * bindPassport), manages disclosure grants, and proves the carbon-footprint
+ * bindDocument), manages disclosure grants, and proves the carbon-footprint
  * predicate in zero-knowledge, with a per-passport transaction overview.
  *
  * On-chain is offered BOTH ways: server-side automatic (the actions below, via
@@ -185,7 +185,9 @@ service ProducerService {
     action   recordWalletAttest(passportId: String,
                                 txHash: String,
                                 identifier: String,
-                                contractAddress: String)                 returns {
+                                contractAddress: String,
+                                attesterId: String // 64 hex; the wallet's attester identity the record is keyed by (lineage 4)
+    )                                                                    returns {
         ok     : Boolean;
         txHash : String;
         status : String; // pending until the tx is verified on-chain (then succeeded/failed)
@@ -216,6 +218,11 @@ service ProducerService {
         // provable-field layout changed since the anchor): every claim would
         // fail at local proving until a re-anchor. Additive field.
         rootDrift    : Boolean;
+        // The record the proof circuits name (lineage 4): the anchoring
+        // attester and recordKey(attesterId, payloadHash). Empty until the
+        // passport is anchored.
+        attesterId   : String;
+        recordKey    : String;
     };
 
     /**
@@ -247,6 +254,8 @@ service ProducerService {
         memberCount     : Integer;
         setSiblingsJson : String;
         setDirsJson     : String;
+        attesterId      : String; // the record's attester (lineage 4)
+        recordKey       : String; // recordKey(attesterId, payloadHash)
     };
 
     /** The named allow-list catalog for membership claims (public by design:
@@ -301,7 +310,7 @@ service ProducerService {
      * Re-anchor a passport after substantive content changes (re-anchoring
      * policy): recompute the payload hash from the CURRENT database state
      * (projection v2), archive the current anchor as a PassportAnchorVersions
-     * row, and anchor the new hash on-chain (attest + bindPassport re-bind +
+     * row, and anchor the new hash on-chain (attest + bindDocument re-bind +
      * content root, one batched tx, detached like submitPassport; poll the
      * Passports row). The vault keeps every attested hash forever, so the
      * archived version stays verifiable. On-chain disclosure grants are per
@@ -463,7 +472,7 @@ service ProducerService {
     function passportCredential(passportId: String)                      returns LargeString;
 
     /**
-     * Anchor an existing draft passport on-chain (attest + bindPassport +
+     * Anchor an existing draft passport on-chain (attest + bindDocument +
      * content root). Runs DETACHED: returns `mode: 'anchoring'` immediately;
      * poll the Passports row until 'anchored' or 'failed'.
      */
@@ -504,7 +513,9 @@ service ProducerService {
                                    threshold: Integer64,
                                    unit: String,
                                    txHash: String,
-                                   result: Boolean)                      returns {
+                                   result: Boolean,
+                                   validUntil: Integer64 // optional: the claim's expiry (UNIX seconds) the proof carried
+    )                                                                    returns {
         ok     : Boolean;
         txHash : String;
         status : String; // pending until the tx is verified on-chain (then succeeded/failed)
@@ -520,7 +531,9 @@ service ProducerService {
                                     setId: String,
                                     setRoot: String, // 64-hex canonical allow-list root
                                     txHash: String,
-                                    result: Boolean)                     returns {
+                                    result: Boolean,
+                                    validUntil: Integer64 // optional: the claim's expiry (UNIX seconds) the proof carried
+    )                                                                    returns {
         ok     : Boolean;
         txHash : String;
         status : String; // pending until the tx is verified on-chain (then succeeded/failed)

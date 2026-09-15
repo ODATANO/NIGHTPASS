@@ -410,7 +410,7 @@ cds.on('bootstrap', (app: any) => {
     const INGEST_FIELDS = [
         'model', 'manufacturerId', 'batteryCategory', 'manufactureDate', 'weightKg',
         'performanceClass', 'qrCodeUrl', 'payloadHash', 'contractAddress',
-        'anchorNetwork', 'attestationTxHash', 'status',
+        'anchorNetwork', 'attestationTxHash', 'status', 'attesterId', 'passportIdHash',
     ] as const;
     app.post('/api/v1/passport/ingest', express.json({ limit: '256kb' }), async (req: any, res: any) => {
         const secret = process.env.PASSPORT_INGEST_SECRET;
@@ -463,6 +463,8 @@ cds.on('bootstrap', (app: any) => {
                         status: 'succeeded', result: true,
                         ...(c.provenAt ? { createdAt: c.provenAt } : {}),
                         ...(/^[0-9a-f]{64}$/i.test(String(c.payloadHash ?? '')) ? { payloadHash: String(c.payloadHash).toLowerCase() } : {}),
+                        ...(/^[0-9a-f]{64}$/i.test(String(c.attesterId ?? '')) ? { attesterId: String(c.attesterId).toLowerCase() } : {}),
+                        ...(c.validUntil ? { validUntil: c.validUntil } : {}),
                     }));
                 if (rows.length) await INSERT.into('passport.PredicateProofLog').entries(rows);
             }
@@ -478,6 +480,7 @@ cds.on('bootstrap', (app: any) => {
                         ID: cds.utils.uuid(), passport_ID: ID,
                         version: Number(v.version),
                         payloadHash: String(v.payloadHash).toLowerCase(),
+                        attesterId: /^[0-9a-f]{64}$/i.test(String(v.attesterId ?? '')) ? String(v.attesterId).toLowerCase() : null,
                         contractAddress: v.contractAddress ? String(v.contractAddress).slice(0, 120) : null,
                         anchorNetwork: v.anchorNetwork ? String(v.anchorNetwork).slice(0, 20) : null,
                         attestationTxHash: v.attestationTxHash ? String(v.attestationTxHash).slice(0, 120) : null,
@@ -539,7 +542,7 @@ cds.on('served', () => {
     const FIELDS = [
         'model', 'manufacturerId', 'batteryCategory', 'manufactureDate', 'weightKg',
         'performanceClass', 'qrCodeUrl', 'payloadHash', 'contractAddress',
-        'anchorNetwork', 'attestationTxHash', 'status'
+        'anchorNetwork', 'attestationTxHash', 'status', 'attesterId'
     ] as const;
 
     async function syncOnce(): Promise<void> {

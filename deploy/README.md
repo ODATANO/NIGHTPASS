@@ -68,7 +68,7 @@ wallet and no NIGHT. Each run derives a throwaway seed, builds and proves
 its transactions locally (`@odatano/nightgate-tx`, proving on the internal
 proof-server) and hands the fee-unpaid bytes to the hosted NIGHTGATE
 (`api.nightgate.dev`) under an agent grant; the hosted sponsor pool pays
-the dust. Per run: attest, anchorContentRoot + bindPassport (one batch), the
+the dust. Per run: attest + anchorContentRoot + bindDocument (one batch), the
 claim cart (one batch), optionally the second-life re-anchor. Verification
 reads go through the same API with the token. Runs start immediately (no
 wallet sync). Rollout:
@@ -76,12 +76,15 @@ wallet sync). Rollout:
 1. **DNS**: A record for `demo.<your-domain>` (the wildcard already covers it
    on zkpassport.eu).
 2. **Hosted side** (operator of the NIGHTGATE API): the demo vault in the
-   sponsor policy (`allowedContracts` + `bindPassport` in `allowedCircuits`),
+   sponsor policy (`allowedContracts` + `bindDocument` in `allowedCircuits`),
    then `createAgentGrant(allowedActions: ['sponsorUnboundTransaction'],
    sponsorSessionId: <pool sentinel>, allowedContracts: [<vault>],
-   allowedCircuits: [attest, bindPassport, anchorContentRoot,
+   allowedCircuits: [attest, bindDocument, anchorContentRoot,
    proveFieldPredicate, proveFieldMembership], maxJobsPerDay: <DEMO_MAX_PER_DAY x 4>,
-   agentLabel: 'nightpass-demo')`. The token is shown once.
+   agentLabel: 'nightpass-demo')`. The token is shown once. The vault must be
+   the lineage the hosted API and the installed `@odatano/nightgate-tx` build
+   calls for (0.24 / 0.6.x: lineage 4); a grant from an earlier lineage lists
+   `bindPassport` and refuses the new circuit name.
 3. **Config**: `cp deploy/.env.demo.example deploy/.env.demo` and fill it:
    `DEMO_NIGHTGATE_AGENT_TOKEN`, `PASSPORT_CONTRACT_ADDRESS` (the vault from
    step 2), a fresh `ENCRYPTION_KEY` (payload cipher + tester seeds at rest).

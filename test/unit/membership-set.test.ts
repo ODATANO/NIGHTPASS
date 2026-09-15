@@ -4,25 +4,25 @@ import { buildMembershipSet } from '../../srv/lib/membership-set';
 import { CLAIM_SETS, claimSetById, MAX_SET_VALUES } from '../../srv/lib/claim-sets';
 import { blake2b256Hex, fromHex32, toHex, loadPureCircuits, STRING_PROVABLE_FIELDS } from '../../srv/lib/passport-anchor';
 
-// Golden vectors, recomputed for the NIGHTGATE 0.16.x vault artifact. The
-// tree rule now has ONE implementation again (we delegate to the platform's
-// set-root module), so these no longer guard two implementations against each
-// other; they guard the ARTIFACT GENERATION. In-circuit tree hashing moved to
-// the transient hash in 0.16.0, which changed every root: if a future compactc
-// or runtime upgrade moves them again, this test fails FIRST, and the
-// consequence is a vault redeploy plus re-anchor, not a silent claim mismatch.
+// Golden vectors, recomputed for the NIGHTGATE 0.24 (vault lineage 4)
+// artifact. The tree rule has ONE implementation (we delegate to the
+// platform's set-root module), so these guard the ARTIFACT GENERATION, not
+// two implementations against each other: if a future compactc or runtime
+// upgrade moves the roots again, this test fails FIRST, and the consequence
+// is a vault redeploy plus re-anchor, not a silent claim mismatch.
 //
-// Pre-0.16 roots, for the record (do not "restore" them, they belong to the
-// retired persistentHash generation):
-//   chemistry-known       0f9578be18a29a5ba5e941be2f8e7f8e80b3fc25f0389b6f4f35a83528aa94be
-//   chemistry-cobalt-free abf1bb26515d2e02ecd260687f2c9adad70ab479390843ae467d8e3d7af1a25f
+// Earlier generations, for the record (do not "restore" them):
+//   0.16.x (lineage 2/3)  chemistry-known       ef478cbb642f485da7e98494a06c334b097118f469e6d7a07f966d7537bdc500
+//                         chemistry-cobalt-free b79d32bae032f4d803bf925cb0d8cd617c00d925898f8b26a6ee92d5ac753700
+//   pre-0.16              chemistry-known       0f9578be18a29a5ba5e941be2f8e7f8e80b3fc25f0389b6f4f35a83528aa94be
+//                         chemistry-cobalt-free abf1bb26515d2e02ecd260687f2c9adad70ab479390843ae467d8e3d7af1a25f
 const GOLDEN = [
-    { setId: 'chemistry-known', memberCount: 10, setRoot: 'ef478cbb642f485da7e98494a06c334b097118f469e6d7a07f966d7537bdc500' },
-    { setId: 'chemistry-cobalt-free', memberCount: 5, setRoot: 'b79d32bae032f4d803bf925cb0d8cd617c00d925898f8b26a6ee92d5ac753700' },
+    { setId: 'chemistry-known', memberCount: 10, setRoot: '3e2d296894bf5a16be7a9179b3475b9827c48bf7f2dfb8a34b00dccad6078c00' },
+    { setId: 'chemistry-cobalt-free', memberCount: 5, setRoot: '0ff76ebc88dbb407e5f657e65a3baf220f630350a8df6f9a8d3409ef7b3f5700' },
 ];
 const SMALL_FIXTURE = {
     values: ['Li-ion LFP', 'Li-ion NMC', 'Na-ion'],
-    setRoot: 'e4a23720db4057bdb108926f163dbbb5fb623e0c6b05b674e328e51204021800',
+    setRoot: '60806051dfa1fef526ea647ad450e86a5b6816a77cf67c29aa3f4c9e870b2500',
 };
 
 describe('buildMembershipSet', () => {

@@ -12,6 +12,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { blake2b256Hex, effectiveNetwork } from './passport-anchor';
 import { buildMembershipSet } from './membership-set';
+import { claimValidUntil } from './proof-plan';
 import {
     ProofCartError,
     type AnchorTxInput, type ChainLane, type ClaimVerifyInput, type LaneTx, type ProofCartInput, type ProofCartOutcome,
@@ -35,7 +36,7 @@ export interface RemoteLaneConfig {
 }
 
 /** Circuits the demo lane proves; prover keys are fetched for these only. */
-export const REMOTE_LANE_CIRCUITS = ['attest', 'bindPassport', 'anchorContentRoot', 'proveFieldPredicate', 'proveFieldMembership'];
+export const REMOTE_LANE_CIRCUITS = ['attest', 'bindDocument', 'anchorContentRoot', 'proveFieldPredicate', 'proveFieldMembership'];
 
 /**
  * Lane config from the environment. Throws with the missing key named, so a
@@ -209,6 +210,9 @@ export function isRebuildable(err: unknown): boolean {
     const code = String(e?.code ?? e?.job?.errorCode ?? '');
     const msg = String(e?.message ?? e?.job?.errorMessage ?? e ?? '');
     if (status === 429 || status === 502 || status === 503) return true;
+    // The asset fetch inside createTxBuilder reports a gateway answer only in
+    // its message (`ensureZkAssets: GET ... -> HTTP 502`).
+    if (/->\s*HTTP (429|502|503)(?!\d)/.test(msg)) return true;
     if (/JOB_ADMISSION_BUSY|WALLET_SYNCING|WORKER_ROTATING|SPONSOR_POLICY_UNAVAILABLE/.test(code + ' ' + msg)) return true;
     return /\b1010\/(104|170|196)\b|\b1014\b|dust-race|DustDoubleSpend|InvalidDustSpendProof/i.test(msg);
 }
@@ -262,7 +266,13 @@ export class RemoteLane implements ChainLane {
         return remoteIdentity(this.cfg, this.seedHex);
     }
 
+    async attesterId(): Promise<string> {
+        return (await this.identity()).attesterId;
+    }
+
     private builder(): Promise<TxBuilderLike> {
+        // A failed build (asset fetch, provider handshake) must not poison
+        // the lane: the next attempt starts a fresh builder.
         this.builderPromise ??= (async () => {
             const [{ txbuilder, vault }, cacheDir] = await Promise.all([sdk(), artifactCacheDir(this.cfg)]);
             const t0 = Date.now();
@@ -288,7 +298,10 @@ export class RemoteLane implements ChainLane {
             });
             this.log.info(`[${this.label}] txbuilder ready in ${Date.now() - t0}ms (proving ${b.provingMode}, attester ${b.attesterId.slice(0, 12)}...)`);
             return b;
-        })();
+        })().catch((e) => {
+            this.builderPromise = null;
+            throw e;
+        });
         return this.builderPromise;
     }
 
@@ -337,29 +350,12 @@ export class RemoteLane implements ChainLane {
         throw new Error(`${label}: ${String((lastErr as Error)?.message ?? lastErr)}`, { cause: lastErr });
     }
 
-    async submitAnchorTx({ contractAddress, tx }: AnchorTxInput): Promise<LaneTx> {
-        const single = tx.calls.length === 1 ? tx.calls[0] : null;
-        // `attest` updates the vault's attestation-sequence cell, so two attests
-        // in one block conflict and the loser lands as PARTIAL_SUCCESS (fee
-        // spent, call not applied). attest is insert-once: when the state
-        // read shows the hash is not attested, a rebuild cannot double-anchor.
-        for (let attempt = 0; ; attempt++) {
-            try {
-                return await this.submitAnchorTxOnce(contractAddress, tx);
-            } catch (e) {
-                const msg = String((e as Error)?.message ?? e);
-                const collision = single?.circuit === 'attest' && attempt < 2
-                    && /PARTIAL_SUCCESS|CHAIN_EXECUTION_FAILED|OnChainStatus/i.test(msg);
-                if (!collision) throw e;
-                const attested = await this.verifyAnchor({ contractAddress, payloadHash: single!.args[0] }).catch(() => false);
-                if (attested) throw e;
-                this.log.warn(`[${this.label}] attest lost a block collision (${msg.slice(0, 60)}); rebuilding`);
-                await new Promise((r) => setTimeout(r, 10_000));
-            }
-        }
-    }
-
-    private submitAnchorTxOnce(contractAddress: string, tx: AnchorTxInput['tx']): Promise<LaneTx> {
+    /**
+     * One transaction of the anchor plan (lineage 4: the whole anchor). The
+     * record is keyed by this lane's own attester id, so no other caller can
+     * collide with it; a failure here is final for the caller to judge.
+     */
+    submitAnchorTx({ contractAddress, tx }: AnchorTxInput): Promise<LaneTx> {
         return this.buildAndSponsor(tx.label, contractAddress, async () => {
             const [{ calls: c }, b] = await Promise.all([sdk(), this.builder()]);
             const secret = b.attestationSecret;
@@ -367,8 +363,8 @@ export class RemoteLane implements ChainLane {
                 switch (call.circuit) {
                     case 'attest':
                         return c.prepareAttest({ payloadHash: call.args[0], metadataHash: call.args[1], attestationSecret: secret });
-                    case 'bindPassport':
-                        return c.prepareBindPassport({ passportId: call.args[0], payloadHash: call.args[1], attestationSecret: secret });
+                    case 'bindDocument':
+                        return c.prepareBindDocument({ documentId: call.args[0], payloadHash: call.args[1], attestationSecret: secret });
                     case 'anchorContentRoot':
                         return c.prepareAnchorContentRoot({
                             payloadHash: call.args[0], contentRoot: call.args[1], schemaId: call.args[2], attestationSecret: secret
@@ -384,15 +380,21 @@ export class RemoteLane implements ChainLane {
         let landedTx = '';
         try {
             const out = await this.buildAndSponsor('proof cart', input.contractAddress, async () => {
-                const [{ calls: c }, b] = await Promise.all([sdk(), this.builder()]);
+                const [{ calls: c, vault }, b] = await Promise.all([sdk(), this.builder()]);
                 const secret = b.attestationSecret;
+                // The claims name the attester's RECORD, not the payload: a
+                // cart on another attester's passport proves against that
+                // record (the proof circuits check no attester secret).
+                const attesterId = input.attesterId ?? b.attesterId;
+                const recordKey: string = c.recordKeyOf({ pureCircuits: vault.pureCircuits, attesterId, payloadHash: input.payloadHash });
+                const validUntil = input.validUntil ?? claimValidUntil();
                 const calls: Prepared[] = [];
                 if (input.contentRoot) {
                     calls.push(c.prepareAnchorContentRoot({
                         payloadHash: input.payloadHash, contentRoot: input.contentRoot, schemaId: input.schemaId, attestationSecret: secret
                     }));
                 }
-                for (const claim of input.claims) calls.push(await this.prepareClaim(c, secret, input.payloadHash, claim));
+                for (const claim of input.claims) calls.push(await this.prepareClaim(c, secret, recordKey, validUntil, claim));
                 return calls;
             }, {
                 // Claims write distinct keys: the builder may group them by
@@ -411,13 +413,13 @@ export class RemoteLane implements ChainLane {
         }
     }
 
-    private async prepareClaim(c: any, secret: Uint8Array, payloadHash: string, claim: CartClaimArgs): Promise<Prepared> {
+    private async prepareClaim(c: any, secret: Uint8Array, recordKey: string, validUntil: number, claim: CartClaimArgs): Promise<Prepared> {
         if (claim.predicate === 'setMembership') {
             const set = await buildMembershipSet(claim.allowedValues);
             const path = set.proofFor(claim.value);
             if (!path) throw new Error(`remote lane: '${claim.value}' is not in the allow-list`);
             return c.prepareProveFieldMembership({
-                payloadHash, fieldKey: claim.fieldKey, setRoot: set.setRoot,
+                recordKey, validUntil, fieldKey: claim.fieldKey, setRoot: set.setRoot,
                 merkleProof: {
                     fieldDigest: blake2b256Hex(claim.value), fieldSalt: claim.salt,
                     siblings: claim.siblings, dirs: claim.dirs,
@@ -427,7 +429,7 @@ export class RemoteLane implements ChainLane {
             });
         }
         return c.prepareProveFieldPredicate({
-            payloadHash, fieldKey: claim.fieldKey, threshold: claim.threshold,
+            recordKey, validUntil, fieldKey: claim.fieldKey, threshold: claim.threshold,
             op: claim.predicate === 'greaterOrEqual' ? 1 : 0,
             merkleProof: { fieldValue: claim.value, fieldSalt: claim.salt, siblings: claim.siblings, dirs: claim.dirs },
             attestationSecret: secret
@@ -438,8 +440,9 @@ export class RemoteLane implements ChainLane {
         const ng = await this.client();
         const membership = input.predicate === 'setMembership';
         if (membership && !input.setRoot) return { verified: false, txHash: '' };
+        const attesterId = input.attesterId ?? await this.attesterId();
         const res = await ng.verifyPredicate({
-            contractAddress: input.contractAddress, payloadHash: input.payloadHash, fieldKey: input.fieldKey,
+            contractAddress: input.contractAddress, attesterId, payloadHash: input.payloadHash, fieldKey: input.fieldKey,
             predicate: input.predicate,
             ...(membership ? { setRoot: input.setRoot } : { threshold: Number(input.threshold ?? 0) }),
             compiledArtifactRef: 'attestation-vault'
@@ -447,11 +450,12 @@ export class RemoteLane implements ChainLane {
         return { verified: res?.verified === true, txHash: '' };
     }
 
-    /** Anchor effect check through the hosted API (token-authenticated). */
-    async verifyAnchor(p: { contractAddress: string; payloadHash: string; contentRoot?: string; schemaId?: string }): Promise<boolean> {
+    /** Anchor effect check through the hosted API (token-authenticated); the record defaults to this lane's own. */
+    async verifyAnchor(p: { contractAddress: string; payloadHash: string; attesterId?: string; contentRoot?: string; schemaId?: string }): Promise<boolean> {
         const ng = await this.client();
+        const attesterId = p.attesterId ?? await this.attesterId();
         const res = await ng.verifyAttestation({
-            contractAddress: p.contractAddress, payloadHash: p.payloadHash,
+            contractAddress: p.contractAddress, attesterId, payloadHash: p.payloadHash,
             ...(p.contentRoot ? { contentRoot: p.contentRoot, schemaId: p.schemaId } : {}),
             compiledArtifactRef: 'attestation-vault'
         });
@@ -523,12 +527,13 @@ export function remoteLaneFor(handle: string, cfg: RemoteLaneConfig = remoteLane
 /** The remote lane's surface beyond ChainLane. */
 export interface RemoteChainLane extends ChainLane {
     identity(): Promise<{ attesterId: string; nightAddress: string; provingMode: string }>;
-    verifyAnchor(p: { contractAddress: string; payloadHash: string; contentRoot?: string; schemaId?: string }): Promise<boolean>;
+    attesterId(): Promise<string>;
+    verifyAnchor(p: { contractAddress: string; payloadHash: string; attesterId?: string; contentRoot?: string; schemaId?: string }): Promise<boolean>;
 }
 
 /** Methods the worker host forwards to its RemoteLane. */
 export const REMOTE_LANE_WORKER_METHODS: ReadonlySet<string> = new Set([
-    'identity', 'submitAnchorTx', 'submitProofCart', 'verifyClaimLanded', 'verifyAnchor', 'dispose'
+    'identity', 'attesterId', 'submitAnchorTx', 'submitProofCart', 'verifyClaimLanded', 'verifyAnchor', 'dispose'
 ]);
 
 const WORKER_FILE = __filename.replace(/lane-remote(\.[cm]?[jt]s)$/, 'lane-remote-worker$1');
@@ -634,6 +639,10 @@ export class RemoteLaneWorker implements RemoteChainLane {
         return this.call('identity');
     }
 
+    attesterId(): Promise<string> {
+        return this.call('attesterId');
+    }
+
     submitAnchorTx(input: AnchorTxInput): Promise<LaneTx> {
         return this.call('submitAnchorTx', input);
     }
@@ -647,7 +656,7 @@ export class RemoteLaneWorker implements RemoteChainLane {
         return this.call('verifyClaimLanded', input);
     }
 
-    verifyAnchor(p: { contractAddress: string; payloadHash: string; contentRoot?: string; schemaId?: string }): Promise<boolean> {
+    verifyAnchor(p: { contractAddress: string; payloadHash: string; attesterId?: string; contentRoot?: string; schemaId?: string }): Promise<boolean> {
         return this.call('verifyAnchor', p);
     }
 

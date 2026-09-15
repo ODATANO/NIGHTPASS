@@ -482,19 +482,18 @@
     return `waiting for a free slot (${running || 'busy'}${ahead})`;
   }
 
-  // The anchor is TWO Midnight transactions since the vault started
-  // sequencing attestations (see srv/lib/anchor-plan.ts): attest alone, then
-  // anchorContentRoot + bindPassport together. The timeline mirrors that:
-  // attest is its own entry, the other two form one grouped entry. Multi-claim
-  // proofs (kind "prove:<field>") stay a single batched transaction and get
-  // the same grouped treatment.
-  const BATCH_KINDS = ['anchorContentRoot', 'bindPassport'];
+  // The anchor is ONE Midnight transaction (see srv/lib/anchor-plan.ts):
+  // attest, anchorContentRoot and bindDocument together. The timeline shows
+  // the three circuits as one grouped entry. Multi-claim proofs (kind
+  // "prove:<field>") stay a single batched transaction and get the same
+  // grouped treatment.
+  const BATCH_KINDS = ['attest', 'anchorContentRoot', 'bindDocument'];
   const isProveKind = (k) => String(k || '').indexOf('prove:') === 0;
 
   const ANCHOR_GROUP = {
-    title: 'Bind passport id + anchor field root',
+    title: 'Anchor fingerprint, field root and passport id',
     badge: (n) => n + ' circuits · 1 transaction',
-    info: 'The passport id is bound to the fingerprint and the salted field tree root is anchored, both in one transaction.',
+    info: 'The fingerprint is attested, the salted field tree root is anchored and the passport id is bound to it, all in one transaction.',
     txLabel: 'tx '
   };
   const PROVE_GROUP = {

@@ -16,9 +16,15 @@ import { readState, verifyParamAvailable } from './verify-reader';
  * (`queryContractState`), so they work with the crawler disabled and verify the
  * outcome rather than the transaction mechanics (idempotent, self-healing):
  *
- *   - `verifyAttestationState`  confirms a payload hash is anchored in the vault.
+ *   - `verifyAttestationState`  confirms a record is anchored in the vault.
  *   - `reindexDisclosures`      reconciles `midnight.DisclosureGrants` from live
  *                               state, after which we read back the grant's row.
+ *
+ * Records are keyed by attester AND payload (vault lineage 4). A read names the
+ * record by `attesterId` + `payloadHash`, or resolves it through the bound
+ * document id (`passportIdHash`); the `RecordSelector` carries whichever the
+ * caller has. A row without an attester id and without a live binding cannot be
+ * read and answers `unknown`.
  *
  * Both map an on-chain effect that is present to `confirmed`, and everything else
  * (absent yet, or no live provider configured) to `unknown`, never `failed`: a
@@ -28,24 +34,44 @@ import { readState, verifyParamAvailable } from './verify-reader';
 
 const CONTRACT_REF = 'attestation-vault';
 const norm = (h?: string | null): string => String(h ?? '').replace(/^0x/, '').toLowerCase();
+const HEX64 = /^[0-9a-f]{64}$/;
 
-/**
- * Confirm an attest's effect: the passport's `payloadHash` is present in the
- * vault's attestation map (and, when `contentRoot` is given, that it is the
- * anchored root for that payload). Crawler-independent.
- */
-export async function verifyAttestState(o: {
+/** How a caller names the attester's record of a payload. */
+export interface RecordSelector {
     contractAddress?: string | null;
     payloadHash?: string | null;
-    contentRoot?: string | null;
-}): Promise<ChainVerdict> {
+    /** The record owner. Preferred: exact, independent of the binding. */
+    attesterId?: string | null;
+    /** The bound document id (blake2b of the passport id); resolves the CURRENT binding only. */
+    documentId?: string | null;
+}
+
+/**
+ * The `verifyAttestationState` argument set for a selector, or null when the
+ * record cannot be named (no attester id and no document id).
+ */
+export function recordSelectorArgs(o: RecordSelector): Record<string, string> | null {
     const contractAddress = norm(o.contractAddress);
     const payloadHash = norm(o.payloadHash);
-    if (!contractAddress || !payloadHash) return 'unknown';
+    const attesterId = norm(o.attesterId);
+    const documentId = norm(o.documentId);
+    if (!contractAddress || !payloadHash) return null;
+    if (HEX64.test(attesterId)) return { contractAddress, attesterId, payloadHash };
+    if (HEX64.test(documentId)) return { contractAddress, documentId, payloadHash };
+    return null;
+}
+
+/**
+ * Confirm an attest's effect: the record is present in the vault's attestation
+ * map (and, when `contentRoot` is given, that it is the anchored root for that
+ * record). Crawler-independent.
+ */
+export async function verifyAttestState(o: RecordSelector & { contentRoot?: string | null }): Promise<ChainVerdict> {
+    const sel = recordSelectorArgs(o);
+    if (!sel) return 'unknown';
     try {
         const res: any = await readState('verifyAttestationState', {
-            contractAddress,
-            payloadHash,
+            ...sel,
             ...(o.contentRoot ? { contentRoot: norm(o.contentRoot) } : {}),
             compiledArtifactRef: CONTRACT_REF
         });
@@ -56,10 +82,34 @@ export async function verifyAttestState(o: {
 }
 
 /**
+ * The attester id of the record a document id currently resolves to, when
+ * that record carries `payloadHash`. Used right after an anchor to stamp the
+ * row with the identity the chain saw, whichever lane signed. Null when the
+ * binding is absent, points at another payload, or the read is unavailable.
+ */
+export async function resolveAnchorAttester(o: {
+    contractAddress?: string | null; documentId?: string | null; payloadHash?: string | null;
+}): Promise<string | null> {
+    const contractAddress = norm(o.contractAddress);
+    const documentId = norm(o.documentId);
+    const payloadHash = norm(o.payloadHash);
+    if (!contractAddress || !HEX64.test(documentId) || !payloadHash) return null;
+    try {
+        const res: any = await readState('verifyAttestationState', {
+            contractAddress, documentId, payloadHash, compiledArtifactRef: CONTRACT_REF
+        });
+        const id = norm(res?.attesterId);
+        return res?.attested === true && HEX64.test(id) ? id : null;
+    } catch {
+        return null;
+    }
+}
+
+/**
  * Three-way content-root state for the drift pre-flight: does the vault's
- * anchored root for this payload match the given (freshly built) root?
- *   - 'match'    the payload is attested and the anchored root equals ours
- *   - 'mismatch' the payload is attested but the anchored root DIFFERS (the
+ * anchored root for this record match the given (freshly built) root?
+ *   - 'match'    the record is attested and the anchored root equals ours
+ *   - 'mismatch' the record is attested but the anchored root DIFFERS (the
  *                provable-field layout changed since the anchor; every claim
  *                would fail at local proving until a re-anchor)
  *   - 'unknown'  not attested here, or no live provider (callers proceed and
@@ -68,33 +118,25 @@ export async function verifyAttestState(o: {
  * never say failed on a negative read, but a drift pre-flight needs the
  * negative signal.
  */
-export async function attestRootState(o: {
-    contractAddress?: string | null;
-    payloadHash?: string | null;
+export async function attestRootState(o: RecordSelector & {
     contentRoot?: string | null;
-    /**
-     * Schema id of the provable-field layout (0.16.0). When given, a mismatch
-     * of the ANCHORED schema counts as drift too: the anchor then describes a
-     * different field panel than the one we just rebuilt, and every claim
-     * against it fails in-circuit. Skipped on a plugin without the parameter.
-     */
+    /** Schema id of the provable-field layout; a mismatch of the ANCHORED schema counts as drift too. */
     schemaId?: string | null;
 }): Promise<'match' | 'mismatch' | 'unknown'> {
-    const contractAddress = norm(o.contractAddress);
-    const payloadHash = norm(o.payloadHash);
+    const sel = recordSelectorArgs(o);
     const contentRoot = norm(o.contentRoot);
     const schemaId = norm(o.schemaId);
-    if (!contractAddress || !payloadHash || !contentRoot) return 'unknown';
+    if (!sel || !contentRoot) return 'unknown';
     const wantsSchema = !!schemaId && verifyParamAvailable('verifyAttestationState', 'schemaId');
     try {
         const res: any = await readState('verifyAttestationState', {
-            contractAddress, payloadHash, contentRoot,
+            ...sel, contentRoot,
             ...(wantsSchema ? { schemaId } : {}),
             compiledArtifactRef: CONTRACT_REF
         });
         // With a contentRoot supplied, NIGHTGATE folds the root check into
         // `verified` (verified = attested && contentRootOk), so the drift
-        // signal MUST branch on `attested` first: an attested payload whose
+        // signal MUST branch on `attested` first: an attested record whose
         // anchored root differs is exactly the mismatch this reports.
         if (res?.attested !== true) return 'unknown';
         if (res?.contentRootOk === false) return 'mismatch';
@@ -111,15 +153,18 @@ export async function attestRootState(o: {
  * grant for `(contractAddress, payloadHash, grantee)` is now active (grant) or
  * absent/inactive (revoke). The `grantee` is the Bytes<32> grantee id: the same
  * key the read gate matches on, and exactly what the cockpit's partner picker sends.
+ * With an `attesterId` the read-back is narrowed to that attester's record.
  */
 export async function verifyGrantState(o: {
     contractAddress?: string | null;
     payloadHash?: string | null;
+    attesterId?: string | null;
     grantee?: string | null;
     op: 'grant' | 'revoke';
 }): Promise<ChainVerdict> {
     const contractAddress = norm(o.contractAddress);
     const payloadHash = norm(o.payloadHash);
+    const attesterId = norm(o.attesterId);
     const grantee = String(o.grantee ?? '');
     if (!contractAddress || !payloadHash || !grantee) return 'unknown';
     try {
@@ -131,7 +176,8 @@ export async function verifyGrantState(o: {
     let active = false;
     try {
         const rows: unknown = await cds.db.read('midnight.DisclosureGrants')
-            .columns('active').where({ contractAddress, payloadHash, grantee, active: true });
+            .columns('active')
+            .where({ contractAddress, payloadHash, grantee, active: true, ...(HEX64.test(attesterId) ? { attesterId } : {}) });
         active = Array.isArray(rows) && rows.length > 0;
     } catch {
         return 'unknown'; // grants table absent
@@ -144,11 +190,12 @@ export async function verifyGrantState(o: {
 }
 
 /**
- * Confirm a CROSS-ROOT claim crawler-free: the vault recorded a true result for
- * the claim key (payloadHashA, payloadHashB, bound). The order of the two
- * hashes is part of the key, so A must be the older version. Both kinds share
- * this: integrity binds an allowed mask (upper bound on change), diff binds k
- * (lower bound).
+ * Confirm a CROSS-ROOT claim crawler-free: the vault holds an unexpired claim
+ * for the key (record A, record B, bound). The order of the two records is
+ * part of the key, so A must be the older version. Both kinds share this:
+ * integrity binds an allowed mask (upper bound on change), diff binds k
+ * (lower bound). Each record is named by its attester (the versions of one
+ * passport may carry different attesters after a handover).
  *
  * Used as the settlement check when the client's wait for the proof job runs
  * out: the cross-root circuit is the slowest one in the system, and a wait
@@ -160,6 +207,9 @@ export async function verifyCrossRootState(o: {
     contractAddress?: string | null;
     payloadHashA?: string | null;
     payloadHashB?: string | null;
+    attesterIdA?: string | null;
+    /** Document B's attester; defaults to A's. */
+    attesterIdB?: string | null;
     /** 'documentIntegrity' reads the mask as its bound, 'documentDiff' reads k. */
     kind: 'documentIntegrity' | 'documentDiff';
     bound: number;
@@ -167,12 +217,15 @@ export async function verifyCrossRootState(o: {
     const contractAddress = norm(o.contractAddress);
     const payloadHash = norm(o.payloadHashA);
     const payloadHashB = norm(o.payloadHashB);
-    if (!contractAddress || !payloadHash || !payloadHashB) return 'unknown';
+    const attesterId = norm(o.attesterIdA);
+    const attesterIdB = norm(o.attesterIdB) || attesterId;
+    if (!contractAddress || !payloadHash || !payloadHashB || !HEX64.test(attesterId)) return 'unknown';
     const needed = verifyParamAvailable('verifyPredicateState', o.kind === 'documentDiff' ? 'k' : 'allowedMask');
     if (!verifyParamAvailable('verifyPredicateState', 'payloadHashB') || !needed) return 'unknown';
     try {
         const res: any = await readState('verifyPredicateState', {
-            contractAddress, payloadHash, payloadHashB,
+            contractAddress, attesterId, payloadHash, payloadHashB,
+            ...(attesterIdB !== attesterId ? { attesterIdB } : {}),
             predicate: o.kind,
             ...(o.kind === 'documentDiff'
                 ? { k: Number(o.bound ?? 0) }
@@ -187,19 +240,22 @@ export async function verifyCrossRootState(o: {
 
 /**
  * Confirm a field-bound claim's effect crawler-free (NIGHTGATE
- * `verifyPredicateState`): the vault recorded a true result for the claim key.
- * Numeric kinds: (payloadHash, fieldKey, predicate, threshold); `threshold`
+ * `verifyPredicateState`): the vault holds an unexpired claim for the key.
+ * Numeric kinds: (record, fieldKey, predicate, threshold); `threshold`
  * must be the SAME scaled integer the circuit hashed into the claim key; the
  * cockpit builds the proof and this call from one `raw x1000` value, so it is
  * passed straight through here (do NOT scale again). Membership kind:
- * (payloadHash, fieldKey, 'setMembership', setRoot); threshold is not part of
- * the claim key and is omitted. On a plugin that predates the setMembership
- * kind (no `setRoot` param in the model), a membership check returns
- * 'unknown' instead of sending an arg the action would reject.
+ * (record, fieldKey, 'setMembership', setRoot); threshold is not part of
+ * the claim key and is omitted. The record is `attesterId` + `payloadHash`;
+ * without the attester the read cannot name it and stays 'unknown'. On a
+ * plugin that predates the setMembership kind (no `setRoot` param in the
+ * model), a membership check returns 'unknown' instead of sending an arg the
+ * action would reject.
  */
 export async function verifyPredicateState(o: {
     contractAddress?: string | null;
     payloadHash?: string | null;
+    attesterId?: string | null;
     fieldKey?: string | null;
     predicate: 'lessOrEqual' | 'greaterOrEqual' | 'setMembership';
     threshold?: number;
@@ -207,7 +263,8 @@ export async function verifyPredicateState(o: {
 }): Promise<ChainVerdict> {
     const contractAddress = norm(o.contractAddress);
     const payloadHash = norm(o.payloadHash);
-    if (!contractAddress || !payloadHash) return 'unknown';
+    const attesterId = norm(o.attesterId);
+    if (!contractAddress || !payloadHash || !HEX64.test(attesterId)) return 'unknown';
     const membership = o.predicate === 'setMembership';
     if (membership) {
         const hasSetRootParam = verifyParamAvailable('verifyPredicateState', 'setRoot');
@@ -216,6 +273,7 @@ export async function verifyPredicateState(o: {
     try {
         const res: any = await readState('verifyPredicateState', {
             contractAddress,
+            attesterId,
             payloadHash,
             ...(o.fieldKey ? { fieldKey: norm(o.fieldKey) } : {}),
             predicate: o.predicate,

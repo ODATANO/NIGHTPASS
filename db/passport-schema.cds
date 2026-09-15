@@ -38,7 +38,7 @@ type PassportStatus : String enum {
 
 /** On-chain step kinds tracked in PassportTransactions (transaction overview). */
 type TxKind : String enum {
-    attest; bindPassport; grantDisclosure; revokeDisclosure; commitValue; provePredicate; deploy; anchorDoc; registerPassport;
+    attest; bindPassport; bindDocument; grantDisclosure; revokeDisclosure; commitValue; provePredicate; deploy; anchorDoc; registerPassport;
 }
 
 /** Status of a tracked on-chain step / log row. `offline` = no session, never submitted. */
@@ -93,9 +93,15 @@ entity Passports : cuid, managed {
 
     // On-chain anchor result (written by the anchor flow after submission).
     // `payloadHash` is the blake2b-256 committed via the AttestationVault
-    // `attest` circuit and bound to `passportId` via `bindPassport`.
+    // `attest` circuit and bound to `passportId` via `bindDocument`.
     payloadHash       : String(64);          // hex, the on-chain attestationId
-    passportIdHash    : String(64);          // hex blake2b-256(passportId); on-chain bindPassport key
+    passportIdHash    : String(64);          // hex blake2b-256(passportId); on-chain bindDocument key (document id)
+    // The attester identity that anchored the CURRENT version. Vault lineage 4
+    // keys every record by (attester, payloadHash): a state read names the
+    // record by both, and every claim key embeds that record key. Stamped
+    // after the anchor lands (from the lane's identity or the chain's binding
+    // read); null on rows anchored before lineage 4.
+    attesterId        : String(64);
 
     // Content-root anchor (field-bound claims). `contentRoot` is the depth-4
     // salted Merkle root over the provable fields, `contentSchemaId` the root
@@ -115,7 +121,7 @@ entity Passports : cuid, managed {
 
     contractAddress   : String(120);         // PassportAttestation deployment
     anchorNetwork     : String(20);          // Midnight network of the anchor (preview/preprod/mainnet)
-    attestationTxHash : String(120);         // tx that anchored attest/bindPassport
+    attestationTxHash : String(120);         // tx that anchored attest/bindDocument
     status            : PassportStatus default #draft;  // producer lifecycle (draft → anchored)
 
     // On-chain anchor. Public metadata and payload hash are committed to Midnight.
@@ -267,6 +273,7 @@ entity PassportAnchorVersions : cuid, managed {
     passport          : Association to Passports;
     version           : Integer;             // 1 = first anchor; the live row is always version max+1
     payloadHash       : String(64);
+    attesterId        : String(64);          // the attester of THIS version's record (may differ after a handover)
     payloadCipher     : LargeBinary;         // canonical payload of THIS version, AES-encrypted
     contentRoot       : String(64);
     // Schema id and salt seed of THIS version's content tree. Kept per version
@@ -329,10 +336,15 @@ entity PredicateProofLog : cuid, managed {
     status                 : TxStatus default #offline;
     result                 : Boolean;        // proven true (tx SUCCESS); value stays hidden
     // The payloadHash the claim was proven under. On-chain claim keys embed the
-    // payload hash, so after a re-anchor an old claim only verifies against ITS
+    // record key, so after a re-anchor an old claim only verifies against ITS
     // version's hash, not the row's current one. Null on rows from before the
     // re-anchoring feature; verification then falls back to probing versions.
     payloadHash            : String(64);
+    // The attester of the record the claim was proven on (with payloadHash =
+    // the record key), and the claim's on-chain expiry. Both lineage 4; null
+    // on older rows.
+    attesterId             : String(64);
+    validUntil             : Timestamp;
     // Membership claims only (predicate = setMembership; threshold/unit stay
     // null): the canonical allow-list Merkle root (on-chain claim-key
     // component) and the named-set catalog id it was built from. The root is

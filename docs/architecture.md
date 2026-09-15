@@ -40,13 +40,18 @@ Two write surfaces, one contract, one read surface.
 **Write (producer):** the producer cockpit (`app/producer/webapp`, `ProducerService`)
 creates a passport from Annex XIII fields, computes the `blake2b-256` payload hash,
 AES-encrypts the payload off-chain, and anchors it on-chain. Anchoring runs three
-circuits, batched into ONE transaction with deterministic apply order since
-NIGHTGATE 0.10.0: `attest` (locks the payload hash under the attester identity),
-`bindPassport` (binds `passportId -> payloadHash` for QR resolution), and
-`anchorContentRoot` (pins the Merkle root over the provable fields). A registrar
-(the vault deployer) can pre-register a `passportId` to an attester identity, so
-a registered id can only ever be bound by its owner. Disclosure grants and
-predicate proofs are further circuit calls.
+circuits, batched into ONE transaction with deterministic apply order:
+`attest` (creates the record `recordKey(attesterId, payloadHash)`; since vault
+lineage 4 every record is keyed by the attester AND the payload, so no other
+caller can pre-empt, block or take over it), `anchorContentRoot` (pins the
+Merkle root over the provable fields plus its schema id), and `bindDocument`
+(binds `passportIdHash -> record` for QR resolution; last, because it is the
+fallible call). A registrar (the vault deployer) can pre-register a
+`passportId` to an attester identity, so a registered id can only ever be
+bound by its owner; a recovery identity named at deploy can re-point the
+registrar. The row stores the anchoring `attesterId`: every state read and
+every claim key names the record by it. Disclosure grants and predicate proofs
+are further circuit calls; the attester can `retract` its record.
 
 **Two ways to submit,** same contract, differ only in who holds the key:
 
@@ -109,16 +114,12 @@ anchor:
 database state (projection v2, `srv/lib/passport-payload.ts`: versioned
 `payloadVersion: 2` marker, normalized numerics, stable ordering), archives the
 current anchor as a `PassportAnchorVersions` row (including its cipher), and
-runs the standard anchor flow: attest of the new hash, `bindPassport` RE-BIND
-of the same passportIdHash (the vault explicitly allows same-owner rebinding),
-and a fresh content root. It takes TWO transactions: `attest` alone, then
-`anchorContentRoot` + `bindPassport` together. `attest` records an attestation
-SEQUENCE since NIGHTGATE 0.16.0, which updates a shared ledger cell, and the
-ledger's sequencing check rejects a batch whose cell update is followed by a
-later intent on populated contract state (measured: the first two three-call
-batches on a fresh vault land, every later one fails 1010/188, isolated retry
-included). The re-anchor must run with the same wallet that holds the current
-binding.
+runs the standard anchor flow: attest of the new hash, a fresh content root,
+and the `bindDocument` RE-BIND of the same passportIdHash (the vault allows a
+rebind by the registered owner, or by the owner of the currently bound record
+for unregistered ids), as ONE transaction. The re-anchor must run with the
+same wallet that holds the current binding; the archived version keeps its
+own `attesterId`, so it stays verifiable and comparable after a handover.
 
 **Version transitions (NIGHTGATE 0.16.0 cross-root proofs).** A re-anchor alone
 does not say WHAT changed: each version carries its own payload hash and its
@@ -217,10 +218,12 @@ active grant elevates a requester's tier above their login role, scoped per
 passport (by `payloadHash`), and degrades to the login role on any lookup failure.
 
 **Integrity and authorization: ZK proofs, not signatures.** On-chain writes go
-through Midnight circuits authorized by zero-knowledge proofs. Ownership-gated
-circuits (`grantDisclosure`, `bindPassport`, `anchorContentRoot`,
-`proveFieldPredicate`) assert the caller is the attester, so authorization holds
-without revealing key material or the payload.
+through Midnight circuits authorized by zero-knowledge proofs. Owner-gated
+circuits (`grantDisclosure`, `bindDocument`, `anchorContentRoot`, `retract`)
+derive the record key from the caller's own identity, so authorization holds
+without revealing key material or the payload. The proof circuits are open to
+any holder of the opening and carry an expiry (`valid_until`, at most five
+years, extend-only), so a claim outlives neither the record nor its lifetime.
 
 ## 4. Field-bound predicates
 

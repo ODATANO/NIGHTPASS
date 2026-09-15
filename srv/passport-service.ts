@@ -1,6 +1,7 @@
 import cds from '@sap/cds';
 import { Passport, Passports, PredicateProofLog, Partners } from '#cds-models/passport';
-import { effectiveNetwork, explorerTxUrl, verifyPeers, fieldKeyHex } from './lib/passport-anchor';
+import { effectiveNetwork, explorerTxUrl, verifyPeers, fieldKeyHex, blake2b256Hex } from './lib/passport-anchor';
+import { recordSelectorArgs } from './lib/state-verify';
 import { readState, verifyNetworkOverrideAvailable } from './lib/verify-reader';
 import { granteeIdForDid } from './lib/grantee';
 import { claimSetById, setLabelFor } from './lib/claim-sets';
@@ -312,13 +313,20 @@ export default class PassportService extends cds.ApplicationService {
         const passportId = String((req.data as { passportId?: string }).passportId ?? '').trim();
         if (!passportId) return req.reject(400, 'passportId is required');
         const row = await SELECT.one.from(Passports)
-            .columns('passportId', 'payloadHash', 'contractAddress', 'anchorNetwork', 'attestationTxHash', 'status')
+            .columns('passportId', 'payloadHash', 'contractAddress', 'anchorNetwork', 'attestationTxHash', 'status', 'attesterId', 'passportIdHash')
             .where({ passportId });
         if (!row) return req.reject(404, `passport '${passportId}' not found`);
 
         const norm = (h: unknown) => String(h ?? '').replace(/^0x/, '').toLowerCase();
         const payloadHash = norm(row.payloadHash);
         const contractAddress = norm(row.contractAddress);
+        // The record is named by its attester; a row without one (published
+        // before the stamp, or anchored by a wallet) resolves through the
+        // bound document id, blake2b of the passport id.
+        const selector = recordSelectorArgs({
+            contractAddress, payloadHash, attesterId: (row as any).attesterId,
+            documentId: (row as any).passportIdHash || blake2b256Hex(String(row.passportId))
+        });
 
         // A row anchored on a DIFFERENT Midnight network than this server queries
         // needs the `network` override on NIGHTGATE's verifyAttestationState.
@@ -331,17 +339,20 @@ export default class PassportService extends cds.ApplicationService {
 
         let verified = false;
         let checkedNetwork: string | null = null;
+        let attesterId: string | null = (row as any).attesterId ? norm((row as any).attesterId) : null;
+        let bindingRegistered: boolean | null = null;
         const peerBase = crossNetwork && anchorNetwork ? verifyPeers()[anchorNetwork] : undefined;
-        if (payloadHash && contractAddress && (!crossNetwork || canOverride)) {
+        if (selector && (!crossNetwork || canOverride)) {
             checkedNetwork = crossNetwork ? anchorNetwork : serverNetwork;
             try {
                 const res: any = await readState('verifyAttestationState', {
-                    contractAddress,
-                    payloadHash,
+                    ...selector,
                     compiledArtifactRef: 'attestation-vault',
                     ...(crossNetwork ? { network: anchorNetwork } : {})
                 });
                 verified = res?.verified === true;
+                if (typeof res?.attesterId === 'string' && /^[0-9a-f]{64}$/i.test(res.attesterId)) attesterId = norm(res.attesterId);
+                if (typeof res?.bindingRegistered === 'boolean') bindingRegistered = res.bindingRegistered;
             } catch { /* indexer unreachable or contract unknown: stay unverified */ }
         } else if (payloadHash && contractAddress && peerBase) {
             // No plugin-side network override, but a PEER instance configured for
@@ -377,7 +388,9 @@ export default class PassportService extends cds.ApplicationService {
             checkedNetwork,
             attestationTxHash: row.attestationTxHash ?? null,
             explorerUrl: explorerTxUrl(row.attestationTxHash, anchorNetwork),
-            checkedAt: new Date().toISOString()
+            checkedAt: new Date().toISOString(),
+            attesterId,
+            bindingRegistered
         };
     };
 
@@ -392,10 +405,10 @@ export default class PassportService extends cds.ApplicationService {
         const passportId = String(pidRaw ?? '').trim();
         if (!passportId) return req.reject(400, 'passportId is required');
         if (version == null || !Number.isInteger(Number(version))) return req.reject(400, 'version is required');
-        const row: any = await SELECT.one.from(Passports).columns('ID', 'passportId').where({ passportId });
+        const row: any = await SELECT.one.from(Passports).columns('ID', 'passportId', 'passportIdHash').where({ passportId });
         if (!row) return req.reject(404, `passport '${passportId}' not found`);
         const v: any = await SELECT.one.from('passport.PassportAnchorVersions')
-            .columns('version', 'payloadHash', 'contractAddress', 'anchorNetwork', 'attestationTxHash')
+            .columns('version', 'payloadHash', 'contractAddress', 'anchorNetwork', 'attestationTxHash', 'attesterId')
             .where({ passport_ID: row.ID, version: Number(version) });
         if (!v) return req.reject(404, `passport '${passportId}' has no anchor version ${version}`);
 
@@ -406,15 +419,21 @@ export default class PassportService extends cds.ApplicationService {
         const anchorNetwork = (v.anchorNetwork as string | null) ?? null;
         const crossNetwork = !!anchorNetwork && anchorNetwork !== serverNetwork;
         const canOverride = verifyNetworkOverrideAvailable();
+        // A superseded version is no longer the bound one, so only its
+        // attester names its record; the document-id fallback would resolve
+        // the current version and answer false (the payload differs).
+        const selector = recordSelectorArgs({
+            contractAddress, payloadHash, attesterId: v.attesterId,
+            documentId: row.passportIdHash || blake2b256Hex(String(row.passportId))
+        });
 
         let verified = false;
         let checkedNetwork: string | null = null;
-        if (payloadHash && contractAddress && (!crossNetwork || canOverride)) {
+        if (selector && (!crossNetwork || canOverride)) {
             checkedNetwork = crossNetwork ? anchorNetwork : serverNetwork;
             try {
                 const res: any = await readState('verifyAttestationState', {
-                    contractAddress,
-                    payloadHash,
+                    ...selector,
                     compiledArtifactRef: 'attestation-vault',
                     ...(crossNetwork ? { network: anchorNetwork } : {})
                 });
@@ -604,7 +623,7 @@ export default class PassportService extends cds.ApplicationService {
             return null;
         }
         const row: any = await SELECT.one.from(Passports)
-            .columns('passportId', 'contractAddress', 'anchorNetwork')
+            .columns('ID', 'passportId', 'contractAddress', 'anchorNetwork', 'payloadHash', 'attesterId')
             .where({ passportId: pid });
         if (!row) { req.reject(404, `passport '${pid}' not found`); return null; }
 
@@ -618,16 +637,27 @@ export default class PassportService extends cds.ApplicationService {
         // stay honestly unverified rather than sending args it would reject.
         const kindSupported = !!params?.payloadHashB
             && !!(o.kind === 'documentDiff' ? params?.k : params?.allowedMask);
+        // Each record is its attester's: the current row's and the archived
+        // versions' attesters, by payload hash.
+        const attesterByHash = new Map<string, string>();
+        if (row.attesterId) attesterByHash.set(norm(row.payloadHash), norm(row.attesterId));
+        const versions: any[] = await SELECT.from('passport.PassportAnchorVersions')
+            .columns('payloadHash', 'attesterId').where({ passport_ID: row.ID });
+        for (const v of versions ?? []) if (v.attesterId) attesterByHash.set(norm(v.payloadHash), norm(v.attesterId));
+        const attesterIdA = attesterByHash.get(hashA);
+        const attesterIdB = attesterByHash.get(hashB);
 
         let verified = false;
         let checkedNetwork: string | null = null;
-        if (contractAddress && kindSupported && (!crossNetwork || canOverride)) {
+        if (contractAddress && kindSupported && attesterIdA && attesterIdB && (!crossNetwork || canOverride)) {
             checkedNetwork = crossNetwork ? anchorNetwork : serverNetwork;
             try {
                 const res: any = await readState('verifyPredicateState', {
                     contractAddress,
+                    attesterId: attesterIdA,
                     payloadHash: hashA,
                     payloadHashB: hashB,
+                    ...(attesterIdB !== attesterIdA ? { attesterIdB } : {}),
                     predicate: o.kind,
                     ...(o.kind === 'documentDiff' ? { k: o.bound } : { allowedMask: o.bound }),
                     compiledArtifactRef: 'attestation-vault',
@@ -664,7 +694,7 @@ export default class PassportService extends cds.ApplicationService {
         if (!pid) { req.reject(400, 'passportId is required'); return null; }
         if (!o.sourceField) { req.reject(400, 'sourceField is required'); return null; }
         const row = await SELECT.one.from(Passports)
-            .columns('ID', 'passportId', 'payloadHash', 'contractAddress', 'anchorNetwork', 'status')
+            .columns('ID', 'passportId', 'payloadHash', 'contractAddress', 'anchorNetwork', 'status', 'attesterId')
             .where({ passportId: pid });
         if (!row) { req.reject(404, `passport '${pid}' not found`); return null; }
 
@@ -685,23 +715,31 @@ export default class PassportService extends cds.ApplicationService {
         // current contract first and then each superseded version's own
         // contract; pre-stamp rows probe hash+contract per version.
         const versions: any[] = await SELECT.from('passport.PassportAnchorVersions')
-            .columns('payloadHash', 'contractAddress')
+            .columns('payloadHash', 'contractAddress', 'attesterId')
             .where({ passport_ID: (row as any).ID }).orderBy('version desc' as any);
         const proofRow: any = await SELECT.one.from(PredicateProofLog)
-            .columns('payloadHash')
+            .columns('payloadHash', 'attesterId')
             .where({ passport_ID: (row as any).ID, sourceField: String(o.sourceField), ...o.proofLogWhere, status: 'succeeded', result: true })
             .orderBy('createdAt desc' as any);
+        // A claim key embeds the RECORD key (attester + payload): every
+        // candidate needs its attester. The stamped proof row names it
+        // directly; otherwise the row's or the version's attester applies.
+        const attesterByHash = new Map<string, string>();
+        if ((row as any).attesterId) attesterByHash.set(norm(row.payloadHash), norm((row as any).attesterId));
+        for (const v of versions ?? []) if (v.attesterId) attesterByHash.set(norm(v.payloadHash), norm(v.attesterId));
         const seen = new Set<string>();
-        const candidates: { payloadHash: string; contractAddress: string }[] = [];
-        const push = (h: string, c: string) => {
-            if (!h || !c || seen.has(`${h}|${c}`)) return;
-            seen.add(`${h}|${c}`);
-            candidates.push({ payloadHash: h, contractAddress: c });
+        const candidates: { payloadHash: string; contractAddress: string; attesterId: string }[] = [];
+        const push = (h: string, c: string, a?: string) => {
+            const attester = a || attesterByHash.get(h) || '';
+            if (!h || !c || !attester || seen.has(`${h}|${c}|${attester}`)) return;
+            seen.add(`${h}|${c}|${attester}`);
+            candidates.push({ payloadHash: h, contractAddress: c, attesterId: attester });
         };
         if (proofRow?.payloadHash) {
             const stamped = norm(proofRow.payloadHash);
-            push(stamped, contractAddress);
-            for (const v of versions ?? []) push(stamped, norm(v.contractAddress) || contractAddress);
+            const stampedAttester = proofRow.attesterId ? norm(proofRow.attesterId) : undefined;
+            push(stamped, contractAddress, stampedAttester);
+            for (const v of versions ?? []) push(stamped, norm(v.contractAddress) || contractAddress, stampedAttester);
         } else {
             push(norm(row.payloadHash), contractAddress);
             for (const v of versions ?? []) push(norm(v.payloadHash), norm(v.contractAddress) || contractAddress);
@@ -716,6 +754,7 @@ export default class PassportService extends cds.ApplicationService {
                 for (const cand of probes) {
                     const res: any = await readState('verifyPredicateState', {
                         contractAddress: cand.contractAddress,
+                        attesterId: cand.attesterId,
                         payloadHash: cand.payloadHash,
                         fieldKey: fieldKeyHex(String(o.sourceField)),
                         ...o.claimArgs,
@@ -742,7 +781,7 @@ export default class PassportService extends cds.ApplicationService {
         const rows = await SELECT.from(Passports)
             .columns('ID', 'passportId', 'model', 'manufacturerId', 'batteryCategory', 'status',
                 'manufactureDate', 'weightKg', 'performanceClass', 'qrCodeUrl',
-                'payloadHash', 'contractAddress', 'anchorNetwork', 'attestationTxHash', 'createdAt')
+                'payloadHash', 'contractAddress', 'anchorNetwork', 'attestationTxHash', 'createdAt', 'attesterId')
             .orderBy('createdAt desc');
         // Successfully proven ZK claims per passport. Public by design: claim,
         // threshold (scaled back to raw units) and proof tx; never the value.
@@ -797,6 +836,7 @@ export default class PassportService extends cds.ApplicationService {
                 contractAddress: r.contractAddress ? norm(r.contractAddress) : null,
                 anchorNetwork: r.anchorNetwork ?? null,
                 attestationTxHash: r.attestationTxHash ?? null,
+                attesterId: r.attesterId ? norm(r.attesterId) : null,
                 explorerUrl: explorerTxUrl(r.attestationTxHash as string | null, r.anchorNetwork as string | null),
                 createdAt: r.createdAt ?? null,
                 claims: (claimsByPassport.get(String(r.ID)) ?? []).map((c: any) => ({

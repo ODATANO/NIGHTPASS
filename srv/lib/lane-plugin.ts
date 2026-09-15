@@ -4,6 +4,7 @@
  */
 import type cds from '@sap/cds';
 import { CONTRACT_REF, runChainStep, sendDetached, waitForJob, waitForJobResult } from './passport-anchor';
+import { claimValidUntil } from './proof-plan';
 import {
     claimIdsByKey, ProofCartError,
     type AnchorTxInput, type ChainLane, type ClaimVerifyInput, type LaneTx, type ProofCartInput, type ProofCartOutcome
@@ -52,8 +53,10 @@ export class PluginLane implements ChainLane {
     async submitProofCart(input: ProofCartInput): Promise<ProofCartOutcome> {
         const args = {
             payloadHash: input.payloadHash,
+            ...(input.attesterId ? { attesterId: input.attesterId } : {}),
             ...(input.contentRoot ? { contentRoot: input.contentRoot, schemaId: input.schemaId } : {}),
             claimsJson: JSON.stringify(input.claims),
+            validUntil: input.validUntil ?? claimValidUntil(),
             sessionId: this.sessionId, contractAddress: input.contractAddress, compiledArtifactRef: CONTRACT_REF,
             ...this.sponsored()
         };

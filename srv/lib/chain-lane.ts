@@ -52,6 +52,14 @@ export type CartClaimArgs =
 export interface ProofCartInput {
     contractAddress: string;
     payloadHash: string;
+    /**
+     * Attester whose record of `payloadHash` carries the claims (vault
+     * lineage 4 keys records by attester and payload). Absent = the lane's
+     * own identity; the plugin lane then lets NIGHTGATE default it too.
+     */
+    attesterId?: string;
+    /** Claim expiry, UNIX seconds (default: proof-plan `claimValidUntil`). */
+    validUntil?: number;
     /** In-batch root anchor as the FIRST call, when no root is on-chain yet. */
     contentRoot?: string;
     schemaId?: string;
@@ -88,6 +96,8 @@ export interface ClaimVerifyInput {
     predicateAttestationId?: string;
     contractAddress: string;
     payloadHash: string;
+    /** The record's attester (required by the id-free state read). */
+    attesterId?: string;
     fieldKey: string;
     predicate: 'lessOrEqual' | 'greaterOrEqual' | 'setMembership';
     threshold?: number;
@@ -96,6 +106,8 @@ export interface ClaimVerifyInput {
 
 export interface ChainLane {
     readonly kind: 'plugin' | 'remote';
+    /** The attester identity this lane signs with (64 hex), when the lane knows it without a chain read. */
+    attesterId?(): Promise<string>;
     /** One transaction of the anchor plan: a single call or an ordered batch. */
     submitAnchorTx(input: AnchorTxInput): Promise<LaneTx>;
     /** The whole cart in ONE transaction. Throws ProofCartError. */

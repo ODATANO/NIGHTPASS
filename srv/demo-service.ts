@@ -488,7 +488,7 @@ export default class DemoService extends cds.ApplicationService {
             try {
                 const ng = await hostedVerifyClient(remoteLaneConfigFromEnv());
                 await ng.callFunction('verifyAttestationState', {
-                    contractAddress, payloadHash: '0'.repeat(64), compiledArtifactRef: 'attestation-vault'
+                    contractAddress, attesterId: '0'.repeat(64), payloadHash: '0'.repeat(64), compiledArtifactRef: 'attestation-vault'
                 });
                 this.hostedProbe = { state: 'ready', error: '', at: Date.now() };
             } catch (e) {
@@ -551,7 +551,7 @@ export default class DemoService extends cds.ApplicationService {
                 : []),
             { kind: 'attest', label: 'Anchor the fingerprint (attest)', status: 'pending' },
             { kind: 'anchorContentRoot', label: 'Anchor the salted field tree root', status: 'pending' },
-            { kind: 'bindPassport', label: 'Bind the passport id to the fingerprint', status: 'pending' },
+            { kind: 'bindDocument', label: 'Bind the passport id to the fingerprint', status: 'pending' },
             ...claimSteps,
             ...(secondLife
                 ? [{ kind: 'secondLife', label: 'Second life: age & repurpose (version 2)', status: 'pending' }]
@@ -917,9 +917,8 @@ export default class DemoService extends cds.ApplicationService {
                         status: 'succeeded', txHash: t.txHash, explorerUrl: explorerTxUrl(t.txHash)
                     });
                     // The next pending anchor step is now the running one.
-                    // Order follows anchorTxPlan: attest in its own tx, then
-                    // anchorContentRoot + bindPassport together.
-                    const order = ['attest', 'anchorContentRoot', 'bindPassport'];
+                    // Order follows anchorTxPlan (one transaction, lineage 4).
+                    const order = ['attest', 'anchorContentRoot', 'bindDocument'];
                     const next = order.find(k => !seen.has(k));
                     if (next) await setStep(next, { status: 'running' });
                 }
