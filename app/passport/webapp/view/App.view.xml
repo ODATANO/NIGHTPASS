@@ -9,7 +9,8 @@
     <tnt:ToolPage id="toolPage">
       <tnt:header>
         <tnt:ToolHeader>
-          <Title text="NIGHTPASS" level="H4" class="sapUiSmallMarginBegin"/>
+          <Image src="/explorer/brand/nightpass-icon.svg" width="28px" height="28px" decorative="true" class="sapUiSmallMarginBegin"/>
+          <Title text="NIGHTPASS" level="H4" class="sapUiTinyMarginBegin"/>
           <Text text="Battery Passport" class="sapUiSmallMarginBegin npHeaderSub"/>
           <ToolbarSpacer/>
           <ObjectStatus

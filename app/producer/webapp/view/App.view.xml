@@ -8,6 +8,7 @@
   <tnt:ToolPage id="toolPage">
     <tnt:header>
       <tnt:ToolHeader>
+        <Image src="/explorer/brand/nightpass-icon.svg" width="28px" height="28px" decorative="true"/>
         <Title text="NIGHTPASS · Producer Cockpit" level="H2"/>
         <ToolbarSpacer/>
         <ObjectStatus

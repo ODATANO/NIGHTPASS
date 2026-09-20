@@ -1,0 +1,65 @@
+/* ODATANO design tokens (single source for all repos).
+   Day = ODATANO / Cardano, Night = Midnight products (graphite). */
+
+:root {
+  /* Day: ODATANO / Cardano */
+  --odt-day-navy:      #001B5E;
+  --odt-day-blue:      #0C5ECF;
+  --odt-day-blue-400:  #3B8EF0;
+  --odt-day-blue-200:  #9CC6FF;
+  --odt-day-bg:        #f8f9fc;
+  --odt-day-bg-alt:    #edf1f9;
+  --odt-day-surface:   #ffffff;
+  --odt-day-border:    #dde3ef;
+  --odt-day-ink:       #1a1a2e;
+  --odt-day-ink-2:     #5a6480;
+
+  /* Night: Midnight graphite (NIGHTGATE, NIGHTPASS) */
+  --odt-night-bg:       #0e0f13;
+  --odt-night-panel:    #16181f;
+  --odt-night-panel-2:  #1b1e27;
+  --odt-night-border:   #262a35;
+  --odt-night-ink:      #e8eaf0;
+  --odt-night-ink-2:    #9aa1b2;
+  --odt-night-ink-3:    #6b7280;
+  --odt-night-accent:   #7aa2ff;
+  --odt-night-accent-2: #4f6ef7;
+
+  /* Status (both themes) */
+  --odt-good:     #0ca30c;
+  --odt-warning:  #fab219;
+  --odt-critical: #d03b3b;
+
+  /* Type */
+  --odt-font-sans:  'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --odt-font-mono:  'JetBrains Mono', ui-monospace, 'Cascadia Code', Consolas, monospace;
+  --odt-font-serif: 'Iowan Old Style', Palatino, 'Palatino Linotype', Georgia, serif;
+
+  /* Shape */
+  --odt-radius-sm: 4px;
+  --odt-radius-md: 8px;
+  --odt-radius-lg: 12px;
+  --odt-radius-xl: 18px;
+}
+
+/* Semantic aliases: set data-theme on <html> or any container */
+:root,
+[data-theme="day"] {
+  --bg:       var(--odt-day-bg);
+  --surface:  var(--odt-day-surface);
+  --border:   var(--odt-day-border);
+  --ink:      var(--odt-day-ink);
+  --ink-2:    var(--odt-day-ink-2);
+  --accent:   var(--odt-day-blue);
+  --accent-2: var(--odt-day-navy);
+}
+
+[data-theme="night"] {
+  --bg:       var(--odt-night-bg);
+  --surface:  var(--odt-night-panel);
+  --border:   var(--odt-night-border);
+  --ink:      var(--odt-night-ink);
+  --ink-2:    var(--odt-night-ink-2);
+  --accent:   var(--odt-night-accent);
+  --accent-2: var(--odt-night-accent-2);
+}

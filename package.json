@@ -10,8 +10,9 @@
   },
   "dependencies": {
     "@cap-js/postgres": "^3",
+    "@odatano/brand": "^1.0.0",
     "@odatano/dpp-sdk": "^0.1.0",
-    "@odatano/nightgate": "^0.24.0",
+    "@odatano/nightgate": "^0.24.1",
     "@odatano/nightgate-tx": "^0.6.0",
     "@sap/cds": "^10",
     "animejs": "^4.5.0",
@@ -39,8 +40,9 @@
     "@midnight-ntwrk/ledger-v8": "8.1.0"
   },
   "scripts": {
-    "postinstall": "npm run gen:types && npm run build:connector-lib && npm run vendor:explorer",
+    "postinstall": "npm run gen:types && npm run build:connector-lib && npm run vendor:explorer && npm run vendor:brand",
     "vendor:explorer": "node scripts/vendor-explorer.mjs",
+    "vendor:brand": "node scripts/vendor-brand.mjs",
     "start": "cds-tsx serve",
     "build:connector-lib": "vite build app/connector -c app/connector/vite.lib.config.mjs",
     "deploy": "node -e \"const cds=require('@sap/cds');(async()=>{await cds.plugins;const m=await cds.load('*');await cds.deploy(m).to('db');console.log('database schema deployed');process.exit(0)})().catch(e=>{console.error(e);process.exit(1)})\"",

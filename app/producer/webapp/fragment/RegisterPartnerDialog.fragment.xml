@@ -6,25 +6,25 @@
     <content>
       <f:SimpleForm editable="true" layout="ResponsiveGridLayout" labelSpanXL="4" labelSpanL="4">
         <f:content>
-          <Label text="DID / BPN"/>
-          <Input value="{register>/did}" placeholder="e.g. BPNL000000000ACME"/>
-          <Label text="Name"/>
-          <Input value="{register>/name}"/>
-          <Label text="Role"/>
+          <Label text="DID / BPN" />
+          <Input value="{register>/did}" placeholder="e.g. BPNL000000000ACME" />
+          <Label text="Name" />
+          <Input value="{register>/name}" />
+          <Label text="Role" />
           <Select selectedKey="{register>/role}">
-            <core:Item key="recycler" text="Recycler"/>
-            <core:Item key="authority" text="Authority"/>
+            <core:Item key="recycler" text="Recycler" />
+            <core:Item key="authority" text="Authority" />
           </Select>
-          <Label text="Login secret"/>
-          <Input value="{register>/secret}" type="Password"/>
+          <Label text="Login secret" />
+          <Input value="{register>/secret}" type="Password" />
         </f:content>
       </f:SimpleForm>
     </content>
     <beginButton>
-      <Button text="Register" type="Emphasized" press="onRegisterSave"/>
+      <Button text="Register" type="Emphasized" press="onRegisterSave" />
     </beginButton>
     <endButton>
-      <Button text="Cancel" press="onRegisterCancel"/>
+      <Button text="Cancel" press="onRegisterCancel" />
     </endButton>
   </Dialog>
 </core:FragmentDefinition>

@@ -1,21 +1,23 @@
+@import url("brand/tokens.css");
+
 /* NIGHTPASS Passport Explorer. Dark block-explorer aesthetic, no framework,
    no external assets (the NIGHTGATE CSP only allows same-origin + ui5 CDN).
    Status colors come from the validated dark-surface status palette and are
    always paired with a text label, never color alone. */
 
 :root {
-  --bg:        #0e0f13;
-  --panel:     #16181f;
-  --panel-2:   #1b1e27;
-  --border:    #262a35;
-  --ink:       #e8eaf0;
-  --ink-2:     #9aa1b2;
-  --ink-3:     #6b7280;
-  --accent:    #7aa2ff;
-  --accent-2:  #4f6ef7;
-  --good:      #0ca30c;
-  --warning:   #fab219;
-  --critical:  #d03b3b;
+  --bg:        var(--odt-night-bg);
+  --panel:     var(--odt-night-panel);
+  --panel-2:   var(--odt-night-panel-2);
+  --border:    var(--odt-night-border);
+  --ink:       var(--odt-night-ink);
+  --ink-2:     var(--odt-night-ink-2);
+  --ink-3:     var(--odt-night-ink-3);
+  --accent:    var(--odt-night-accent);
+  --accent-2:  var(--odt-night-accent-2);
+  --good:      var(--odt-good);
+  --warning:   var(--odt-warning);
+  --critical:  var(--odt-critical);
   --mono: ui-monospace, "Cascadia Code", "Consolas", "SF Mono", Menlo, monospace;
   --sans: ui-sans-serif, system-ui, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
   --serif: "Iowan Old Style", Palatino, "Palatino Linotype", Georgia, serif;
@@ -52,12 +54,7 @@ a:hover { text-decoration: underline; }
 }
 .brand { display: flex; align-items: center; gap: 10px; color: var(--ink); }
 .brand:hover { text-decoration: none; }
-.brand-mark {
-  width: 26px; height: 26px; border-radius: 50%;
-  background: radial-gradient(circle at 50% 50%, transparent 0 5px, var(--accent) 5px 8px, transparent 8px),
-              radial-gradient(circle at 30% 30%, #2b3350, #101218);
-  border: 1px solid var(--border);
-}
+.brand-mark { width: 26px; height: 26px; display: block; }
 .brand-name { font-weight: 700; letter-spacing: 0.04em; }
 .brand-sub { display: block; font-size: 11px; font-weight: 500; color: var(--ink-2); letter-spacing: 0.08em; text-transform: uppercase; }
 

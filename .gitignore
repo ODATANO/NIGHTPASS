@@ -97,6 +97,10 @@ docs/batterypass-ready/
 # deploy runtime artifacts (baked DB + filled env stay off the repo)
 deploy/.env
 deploy/.env.demo
+# any filled env or backup of one (deploy/.env.demo.bak-*, deploy/.env.bak-*); the .example files stay tracked
+deploy/.env.*
+!deploy/.env.example
+!deploy/.env.demo.example
 deploy/passport-demo.db
 
 # internal planning docs stay local
