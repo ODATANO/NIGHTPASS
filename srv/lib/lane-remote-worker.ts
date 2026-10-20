@@ -5,13 +5,16 @@
  * the main thread.
  */
 import { parentPort, threadId, workerData } from 'node:worker_threads';
-import { RemoteLane, serializeLaneError, REMOTE_LANE_WORKER_METHODS } from './lane-remote';
+import { RemoteLane, serializeLaneError, REMOTE_LANE_WORKER_METHODS, type RemoteLaneConfig } from './lane-remote';
 
 const port = parentPort;
 if (!port) throw new Error('lane-remote-worker: must run as a worker thread');
 
-const { cfg, seedHex, label } = workerData as { cfg: any; seedHex: string; label: string };
+const { cfg, seedHex, label } = workerData as { cfg: RemoteLaneConfig; seedHex: string; label: string };
 const lane = new RemoteLane(cfg, seedHex, label);
+
+/** Arguments arrive untyped from the message port; the method set is the only gate. */
+type LaneMethod = (...args: never[]) => Promise<unknown>;
 
 port.on('message', async (m: { id: number; method: string; args: unknown[] }) => {
     try {
@@ -20,7 +23,8 @@ port.on('message', async (m: { id: number; method: string; args: unknown[] }) =>
             return;
         }
         if (!REMOTE_LANE_WORKER_METHODS.has(m.method)) throw new Error(`lane-remote-worker: unknown method '${m.method}'`);
-        const result = await (lane as any)[m.method](...(m.args ?? []));
+        const fn = lane[m.method as keyof RemoteLane] as LaneMethod;
+        const result = await fn.apply(lane, (m.args ?? []) as never[]);
         port.postMessage({ id: m.id, ok: true, result });
     } catch (e) {
         port.postMessage({ id: m.id, ok: false, error: serializeLaneError(e) });

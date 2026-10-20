@@ -76,7 +76,8 @@ entity Partners : managed {
  */
 @assert.unique: { passportId: [ passportId ] }
 entity Passports : cuid, managed {
-    passportId       : String(64) not null;  // unique battery ID per Regulation 2023/1542 (Point 1)
+    passportId       : String(64) not null;  // unique product ID (battery: Regulation 2023/1542 Point 1)
+    profile          : String(40) default 'battery'; // product family: battery | component; picks children, panel and claim sets
     owner            : String(160);          // producer wallet identity (shielded address); scopes the cockpit list
     manufacturerId   : String(200);          // Point 1
     batteryCategory  : BatteryCategory;      // Point 1
@@ -129,10 +130,53 @@ entity Passports : cuid, managed {
     attestation      : Association to midnight.Attestations;
 
     // Compositions hold child detail. Mixed tiers are gated per field in the service.
+    // A passport fills the children of its profile; the others stay empty.
     batteries         : Composition of many Batteries        on batteries.passport = $self;
     recycledMaterials : Composition of many RecycledMaterials on recycledMaterials.passport = $self;
     diligenceDocs     : Composition of many DiligenceDoc      on diligenceDocs.passport = $self;
     attributes        : Composition of many PassportAttributes on attributes.passport = $self;
+    materialCertificates : Composition of many MaterialCertificates on materialCertificates.passport = $self;
+    qualificationTests   : Composition of many QualificationTests   on qualificationTests.passport = $self;
+    custodyRecords       : Composition of many CustodyRecords       on custodyRecords.passport = $self;
+}
+
+/**
+ * Component profile: material certificate (3.1 / 3.2 inspection certificate)
+ * of a safety-related part. Properties are legitimate interest; the supplier
+ * identity is authority only. Numeric columns are ZK-predicate fields.
+ */
+entity MaterialCertificates : cuid {
+    passport           : Association to Passports;
+    heatNumber         : String(60);
+    materialGrade      : String(60);         // membership field (approved grades)
+    supplierId         : String(60);         // AUTHORITY only; membership field (qualified supplier list)
+    supplierName       : String(200);        // AUTHORITY only
+    yieldStrengthMpa   : Decimal(10, 3);
+    tensileStrengthMpa : Decimal(10, 3);
+    hardnessHb         : Decimal(10, 3);
+    cobaltContentPpm   : Decimal(10, 3);
+    wallThicknessMm    : Decimal(10, 3);
+    certificateSha256  : String(64);         // hex; the certificate file stays off-chain
+}
+
+/** Component profile: one qualification or acceptance test of the part. */
+entity QualificationTests : cuid {
+    passport     : Association to Passports;
+    standard     : String(80);
+    testMethod   : String(20);               // membership field (approved test methods)
+    result       : String(20);               // pass | fail | conditional
+    reportSha256 : String(64);
+    inspectorId  : String(60);               // AUTHORITY only
+}
+
+/** Component profile: one handover in the chain of custody. AUTHORITY only. */
+entity CustodyRecords : cuid {
+    passport      : Association to Passports;
+    step          : Integer;
+    fromParty     : String(200);
+    toParty       : String(200);
+    transferredOn : Date;
+    recordSha256  : String(64);
 }
 
 /** Access class per the official Data Attribute Longlist (DIN DKE SPEC 99100). */

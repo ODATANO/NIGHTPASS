@@ -10,25 +10,23 @@ import { randomUUID } from 'node:crypto';
 import { Worker } from 'node:worker_threads';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import type { NightgateClient } from '@odatano/nightgate-tx/client';
+import type { PreparedCall, TxBuilder } from '@odatano/nightgate-tx/txbuilder';
 import { blake2b256Hex, effectiveNetwork } from './passport-anchor';
 import { buildMembershipSet } from './membership-set';
 import { claimValidUntil } from './proof-plan';
+import type { AnchorCall } from './anchor-plan';
 import {
     ProofCartError,
     type AnchorTxInput, type ChainLane, type ClaimVerifyInput, type LaneTx, type ProofCartInput, type ProofCartOutcome,
     type CartClaimArgs
 } from './chain-lane';
 
-/** Reserved UUID: "use the sponsor pool" (the field is Edm.Guid). */
-export const SPONSOR_POOL_SENTINEL = '00000000-0000-0000-0000-706f6f6c0000';
-
+/** The hosted NIGHTGATE API serves every chain read of the lane (contract state, transaction lookup); no indexer, no node. */
 export interface RemoteLaneConfig {
     apiUrl: string;
     agentToken: string;
     networkId: string;
-    indexerHttpUrl: string;
-    indexerWsUrl: string;
-    nodeUrl: string;
     cacheDir?: string;
     /** Our own proof server; when set, proving runs there instead of in-process wasm. */
     proofServerUrl?: string;
@@ -48,24 +46,14 @@ export function remoteLaneConfigFromEnv(env: NodeJS.ProcessEnv = process.env): R
         if (!v) throw new Error(`remote chain lane: ${k} is not set`);
         return v;
     };
-    const indexerHttpUrl = need('NIGHTGATE_INDEXER_HTTP_URL');
-    const indexerWsUrl = String(env.NIGHTGATE_INDEXER_WS_URL ?? '').trim() || deriveIndexerWsUrl(indexerHttpUrl);
     return {
         apiUrl: need('NIGHTGATE_API_URL').replace(/\/$/, ''),
         agentToken: need('DEMO_NIGHTGATE_AGENT_TOKEN'),
         networkId: String(env.NIGHTGATE_NETWORK ?? '').trim() || effectiveNetwork(),
-        indexerHttpUrl,
-        indexerWsUrl,
-        nodeUrl: need('NIGHTGATE_NODE_URL'),
         cacheDir: String(env.NIGHTGATE_ZK_CACHE_DIR ?? '').trim() || join(homedir(), '.cache', 'nightgate-txbuilder', 'attestation-vault'),
         proofServerUrl: String(env.NIGHTGATE_PROOF_SERVER_URL ?? '').trim() || undefined,
         ttlMinutes: Number(env.NIGHTGATE_TX_TTL_MINUTES ?? 0) || undefined
     };
-}
-
-/** Same rule NIGHTGATE applies: http -> ws, `/ws` suffix on the versioned path. */
-export function deriveIndexerWsUrl(httpUrl: string): string {
-    return httpUrl.replace(/^http/, 'ws').replace(/\/$/, '') + '/ws';
 }
 
 // --- signer registry ---------------------------------------------------------
@@ -104,38 +92,32 @@ export function remoteVaultFor(handle: string | null | undefined): string | unde
 
 const HASH64 = /^[0-9a-f]{64}$/i;
 
+/** The one read `resolveTxHash` needs; the connected client satisfies it. */
+export interface TxLookup {
+    transactionByIdentifier(identifier: string): Promise<{ hash: string } | null>;
+}
+
 /**
  * A sponsored job reports the wallet SDK's transaction IDENTIFIER (66 hex,
  * `00`-prefixed), not the block-level hash the explorer and the rest of this
- * app use. The indexer maps one to the other (`transactions(offset:
- * {identifier})`); a few seconds may pass between chain finality and the
- * indexer having the block, hence the bounded retry. Falls back to the
- * identifier itself, so a lookup outage never loses the reference.
+ * app use. The hosted NIGHTGATE maps one to the other once it has indexed
+ * the block, which can take a few seconds after chain finality, hence the
+ * bounded retry. Falls back to the identifier itself, so a lookup outage
+ * never loses the reference.
  */
 export async function resolveTxHash(
     identifier: string,
-    indexerHttpUrl: string,
-    o: { fetchFn?: typeof fetch; attempts?: number; delayMs?: number } = {}
+    lookup: TxLookup,
+    o: { attempts?: number; delayMs?: number } = {}
 ): Promise<string> {
     const id = String(identifier ?? '').replace(/^0x/, '');
     if (HASH64.test(id)) return id.toLowerCase();
-    const fetchFn = o.fetchFn ?? fetch;
     const attempts = o.attempts ?? 6;
     for (let i = 0; i < attempts; i++) {
         if (i > 0) await new Promise((r) => setTimeout(r, o.delayMs ?? 5000));
         try {
-            const res = await fetchFn(indexerHttpUrl, {
-                method: 'POST',
-                headers: { 'content-type': 'application/json' },
-                body: JSON.stringify({
-                    query: 'query($i:HexEncoded!){transactions(offset:{identifier:$i}){hash}}',
-                    variables: { i: id }
-                }),
-                signal: AbortSignal.timeout(20_000)
-            });
-            const json: any = await res.json();
-            const hash = json?.data?.transactions?.[0]?.hash;
-            if (typeof hash === 'string' && HASH64.test(hash)) return hash.toLowerCase();
+            const hash = (await lookup.transactionByIdentifier(id))?.hash;
+            if (typeof hash === 'string' && HASH64.test(hash.replace(/^0x/, ''))) return hash.replace(/^0x/, '').toLowerCase();
         } catch { /* retry */ }
     }
     return id;
@@ -143,8 +125,8 @@ export async function resolveTxHash(
 
 // --- prover-key cache ----------------------------------------------------------
 // The txbuilder reuses any cached file as is, and the prover keys of one vault
-// lineage prove nothing on the next (0.23 redeployed the vault). The cache is
-// therefore keyed by the artifact digest the hosted manifest reports.
+// lineage prove nothing on the next. The cache is therefore keyed by the
+// artifact digest the hosted manifest reports.
 
 export interface ContractManifestLike {
     contracts?: { name?: string; artifactHash?: string }[];
@@ -161,8 +143,7 @@ const cacheDirPromises = new Map<string, Promise<string>>();
 /**
  * Resolves the keyed cache directory once per process and API. Fail-closed:
  * without the manifest the lane does not build, because an unkeyed cache may
- * hold the keys of an earlier lineage (seen live 2026-09-08: a manifest
- * timeout under load led to "mismatched verifier keys" on the new vault).
+ * hold the keys of an earlier lineage ("mismatched verifier keys" on chain).
  */
 export function artifactCacheDir(
     cfg: RemoteLaneConfig, o: { fetchFn?: typeof fetch; attempts?: number; delayMs?: number } = {}
@@ -219,31 +200,16 @@ export function isRebuildable(err: unknown): boolean {
 
 // --- the lane ---------------------------------------------------------------
 
-type Prepared = { circuitId: string; args: unknown[]; witnesses?: object; merkleProof?: object };
-
-interface TxBuilderLike {
-    attestationSecret: Uint8Array;
-    attesterId: string;
-    provingMode: 'wasm' | 'server';
-    addresses: { night: string };
-    buildSponsorable(input: {
-        contractAddress: string; call?: Prepared; calls?: Prepared[]; bind: false;
-        /** The calls past `orderedPrefix` share no state: grouped by execution stage before proving (0.4.2). */
-        independentCalls?: boolean; orderedPrefix?: number;
-    }): Promise<{ unboundTxB64: string; serializedBytes: number }>;
-    close(): Promise<void>;
+interface Sdk {
+    txbuilder: typeof import('@odatano/nightgate-tx/txbuilder');
+    calls: typeof import('@odatano/nightgate-tx/calls');
+    client: typeof import('@odatano/nightgate-tx/client');
+    vault: typeof import('@odatano/nightgate-tx/attestation-vault');
 }
 
-interface ClientLike {
-    sponsorUnbound(p: Record<string, unknown>): Promise<Record<string, any> & { jobId: string; txHash?: string }>;
-    verifyPredicate(p: Record<string, unknown>): Promise<any>;
-    verifyAttestation(p: Record<string, unknown>): Promise<any>;
-    getHealth(): Promise<any>;
-}
-
-let sdkPromise: Promise<{ txbuilder: any; calls: any; client: any; vault: any }> | null = null;
+let sdkPromise: Promise<Sdk> | null = null;
 /** The ESM-only SDK, loaded once per process. */
-function sdk() {
+function sdk(): Promise<Sdk> {
     sdkPromise ??= Promise.all([
         import('@odatano/nightgate-tx/txbuilder'),
         import('@odatano/nightgate-tx/calls'),
@@ -255,8 +221,8 @@ function sdk() {
 
 export class RemoteLane implements ChainLane {
     readonly kind = 'remote' as const;
-    private builderPromise: Promise<TxBuilderLike> | null = null;
-    private clientPromise: Promise<ClientLike> | null = null;
+    private builderPromise: Promise<TxBuilder> | null = null;
+    private clientPromise: Promise<NightgateClient> | null = null;
     private readonly log = cds.log('remote-lane');
 
     constructor(private readonly cfg: RemoteLaneConfig, private readonly seedHex: string, private readonly label = 'remote') {}
@@ -270,27 +236,26 @@ export class RemoteLane implements ChainLane {
         return (await this.identity()).attesterId;
     }
 
-    private builder(): Promise<TxBuilderLike> {
+    private builder(): Promise<TxBuilder> {
         // A failed build (asset fetch, provider handshake) must not poison
         // the lane: the next attempt starts a fresh builder.
         this.builderPromise ??= (async () => {
-            const [{ txbuilder, vault }, cacheDir] = await Promise.all([sdk(), artifactCacheDir(this.cfg)]);
+            const [{ txbuilder, vault }, cacheDir, api] = await Promise.all([sdk(), artifactCacheDir(this.cfg), this.client()]);
             const t0 = Date.now();
-            const b: TxBuilderLike = await txbuilder.createTxBuilder({
+            const b = await txbuilder.createTxBuilder({
                 seedHex: this.seedHex,
                 networkId: this.cfg.networkId,
-                indexerHttpUrl: this.cfg.indexerHttpUrl,
-                indexerWsUrl: this.cfg.indexerWsUrl,
-                nodeUrl: this.cfg.nodeUrl,
+                // Contract state and deploy lookups go through the hosted API, same client as the sponsor calls.
+                api,
                 zkConfigBaseUrl: `${this.cfg.apiUrl}/zk-config/attestation-vault`,
                 contractClass: vault.Contract,
                 contractName: 'attestation-vault',
                 circuits: REMOTE_LANE_CIRCUITS,
                 cacheDir,
-                ...(this.cfg.proofServerUrl ? { provingMode: 'server', proofServerUrl: this.cfg.proofServerUrl } : {}),
+                ...(this.cfg.proofServerUrl ? { provingMode: 'server' as const, proofServerUrl: this.cfg.proofServerUrl } : {}),
                 ...(this.cfg.ttlMinutes ? { ttlMinutes: this.cfg.ttlMinutes } : {}),
                 // Vault circuits move no value: nothing to balance, so no
-                // wallet sync (0.4.1). A value-moving call would fail at balancing.
+                // wallet sync. A value-moving call would fail at balancing.
                 walletSync: false,
                 onProgress: (e: Record<string, unknown>) => {
                     if (e?.phase === 'fetch') this.log.info(`[${this.label}] zk asset ${String(e.file ?? e.circuit ?? '')}`);
@@ -305,16 +270,16 @@ export class RemoteLane implements ChainLane {
         return this.builderPromise;
     }
 
-    private client(): Promise<ClientLike> {
+    private client(): Promise<NightgateClient> {
         this.clientPromise ??= sdk().then(({ client }) => client.connect({
             baseUrl: this.cfg.apiUrl, agentToken: this.cfg.agentToken, timeoutMs: 180_000, pollMs: 4000
-        }) as ClientLike);
+        }));
         return this.clientPromise;
     }
 
     /** Build locally, hand the unbound bytes to the sponsor, wait for the chain. Rebuilds on the retryable classes. */
     private async buildAndSponsor(
-        label: string, contractAddress: string, prepare: () => Promise<Prepared[]>,
+        label: string, contractAddress: string, prepare: () => Promise<PreparedCall[]>,
         batch: { independentCalls?: boolean; orderedPrefix?: number } = {}
     ): Promise<LaneTx> {
         let lastErr: unknown;
@@ -330,12 +295,18 @@ export class RemoteLane implements ChainLane {
                 this.log.info(`[${this.label}] ${label}: built ${built.serializedBytes}B in ${Date.now() - t0}ms, handing to sponsor`);
                 const job = await ng.sponsorUnbound({
                     unboundTxB64: built.unboundTxB64,
-                    sponsorSessionId: SPONSOR_POOL_SENTINEL,
                     idempotencyKey: randomUUID()
                 });
                 const txId = String(job?.txHash ?? '');
                 if (!txId) throw new Error(`${label}: sponsor job ${job?.jobId ?? '?'} succeeded without a transaction hash`);
-                const txHash = await resolveTxHash(txId, this.cfg.indexerHttpUrl);
+                // The next transaction reads the contract state from the same
+                // server, so wait until it has indexed this one; a build on the
+                // older state fails in the circuit ("no content root").
+                const { txbuilder } = await sdk();
+                const landed = await txbuilder.waitLanded(txId, { api: ng, timeoutMs: 240_000, pollMs: 5_000 });
+                if (!landed) throw new Error(`${label}: transaction ${txId.slice(0, 12)}... was sponsored but the server has not indexed it after 240s`);
+                if (landed.applied === false) throw new Error(`${label}: transaction ${txId.slice(0, 12)}... landed with status ${landed.status} (failed segments ${landed.failedSegments.join(',') || 'none'})`);
+                const txHash = await resolveTxHash(txId, ng);
                 if (txHash === txId.replace(/^0x/, '') && !HASH64.test(txId)) {
                     this.log.warn(`[${this.label}] ${label}: could not resolve identifier ${txId.slice(0, 12)}... to a block hash; keeping the identifier`);
                 }
@@ -359,7 +330,7 @@ export class RemoteLane implements ChainLane {
         return this.buildAndSponsor(tx.label, contractAddress, async () => {
             const [{ calls: c }, b] = await Promise.all([sdk(), this.builder()]);
             const secret = b.attestationSecret;
-            return tx.calls.map((call): Prepared => {
+            return tx.calls.map((call): PreparedCall => {
                 switch (call.circuit) {
                     case 'attest':
                         return c.prepareAttest({ payloadHash: call.args[0], metadataHash: call.args[1], attestationSecret: secret });
@@ -370,7 +341,7 @@ export class RemoteLane implements ChainLane {
                             payloadHash: call.args[0], contentRoot: call.args[1], schemaId: call.args[2], attestationSecret: secret
                         });
                     default:
-                        throw new Error(`remote lane: unsupported anchor circuit '${String((call as any).circuit)}'`);
+                        throw new Error(`remote lane: unsupported anchor circuit '${String((call as AnchorCall).circuit)}'`);
                 }
             });
         });
@@ -386,10 +357,11 @@ export class RemoteLane implements ChainLane {
                 // cart on another attester's passport proves against that
                 // record (the proof circuits check no attester secret).
                 const attesterId = input.attesterId ?? b.attesterId;
-                const recordKey: string = c.recordKeyOf({ pureCircuits: vault.pureCircuits, attesterId, payloadHash: input.payloadHash });
+                const recordKey = c.recordKeyOf({ pureCircuits: vault.pureCircuits, attesterId, payloadHash: input.payloadHash });
                 const validUntil = input.validUntil ?? claimValidUntil();
-                const calls: Prepared[] = [];
+                const calls: PreparedCall[] = [];
                 if (input.contentRoot) {
+                    if (!input.schemaId) throw new Error('remote lane: an in-batch root anchor needs schemaId');
                     calls.push(c.prepareAnchorContentRoot({
                         payloadHash: input.payloadHash, contentRoot: input.contentRoot, schemaId: input.schemaId, attestationSecret: secret
                     }));
@@ -413,7 +385,7 @@ export class RemoteLane implements ChainLane {
         }
     }
 
-    private async prepareClaim(c: any, secret: Uint8Array, recordKey: string, validUntil: number, claim: CartClaimArgs): Promise<Prepared> {
+    private async prepareClaim(c: Sdk['calls'], secret: Uint8Array, recordKey: string, validUntil: number, claim: CartClaimArgs): Promise<PreparedCall> {
         if (claim.predicate === 'setMembership') {
             const set = await buildMembershipSet(claim.allowedValues);
             const path = set.proofFor(claim.value);
@@ -469,20 +441,16 @@ export class RemoteLane implements ChainLane {
     }
 }
 
-interface VerifyClientLike {
-    callFunction(name: string, params?: Record<string, unknown>): Promise<any>;
-    getHealth(): Promise<any>;
-}
-let hostedClientPromise: Promise<VerifyClientLike> | null = null;
+let hostedClientPromise: Promise<NightgateClient> | null = null;
 let hostedClientKey = '';
 /** A token-authenticated client for the read surface, shared per process. */
-export function hostedVerifyClient(cfg: RemoteLaneConfig): Promise<VerifyClientLike> {
+export function hostedVerifyClient(cfg: RemoteLaneConfig): Promise<NightgateClient> {
     const key = `${cfg.apiUrl}|${cfg.agentToken}`;
     if (!hostedClientPromise || hostedClientKey !== key) {
         hostedClientKey = key;
         hostedClientPromise = sdk().then(({ client }) => client.connect({
             baseUrl: cfg.apiUrl, agentToken: cfg.agentToken, timeoutMs: 120_000
-        }) as VerifyClientLike);
+        }));
     }
     return hostedClientPromise;
 }
@@ -498,13 +466,10 @@ export async function ensureRemoteZkAssets(cfg: RemoteLaneConfig = remoteLaneCon
         cacheDir,
         circuits: REMOTE_LANE_CIRCUITS
     });
-    return { fetched: Number(r?.fetched ?? 0), cached: Number(r?.cached ?? 0) };
+    return { fetched: r.fetched, cached: r.cached };
 }
 
-/**
- * Attester id and NIGHT address of a seed, derived without a builder or the
- * network (nightgate-tx 0.4.1 `deriveIdentity`).
- */
+/** Attester id and NIGHT address of a seed, derived without a builder or the network. */
 export async function remoteIdentity(cfg: RemoteLaneConfig, seedHex: string): Promise<{ attesterId: string; nightAddress: string; provingMode: string }> {
     const { txbuilder } = await sdk();
     const id = await txbuilder.deriveIdentity({ seedHex, networkId: cfg.networkId });

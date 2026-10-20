@@ -2,7 +2,9 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { buildMembershipSet } from '../../srv/lib/membership-set';
 import { CLAIM_SETS, claimSetById, MAX_SET_VALUES } from '../../srv/lib/claim-sets';
-import { blake2b256Hex, fromHex32, toHex, loadPureCircuits, STRING_PROVABLE_FIELDS } from '../../srv/lib/passport-anchor';
+import { blake2b256Hex, fromHex32, toHex, loadPureCircuits } from '../../srv/lib/passport-anchor';
+import { fieldKindOf } from '@odatano/dpp-sdk/profile';
+import { APP_PROFILES, PROFILE_IDS } from '../../srv/lib/product-profiles';
 
 // Golden vectors, recomputed for the NIGHTGATE 0.24 (vault lineage 4)
 // artifact. The tree rule has ONE implementation (we delegate to the
@@ -92,9 +94,9 @@ describe('claim-set catalog', () => {
         }
     });
 
-    it('every set targets a registered string provable field', () => {
+    it('every set targets a string provable field of one of the profiles', () => {
         for (const s of CLAIM_SETS) {
-            assert.ok((STRING_PROVABLE_FIELDS as readonly string[]).includes(s.sourceField),
+            assert.ok(PROFILE_IDS.some((id) => fieldKindOf(APP_PROFILES[id].profile, s.sourceField) === 'string'),
                 `${s.id}: '${s.sourceField}' is not a string provable field`);
         }
     });

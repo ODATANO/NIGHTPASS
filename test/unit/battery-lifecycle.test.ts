@@ -1,9 +1,11 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-    BATTERY_STATUS_VALUES, ALLOWED_TRANSITIONS,
+    BATTERY_STATUS_VALUES, BATTERY_LIFECYCLE,
     validateTransition, parseBatteryStatus, encodeBatteryStatus, dppStatusFor,
 } from '../../srv/lib/battery-lifecycle';
+
+const ALLOWED_TRANSITIONS = BATTERY_LIFECYCLE.transitions;
 import { defaultGuideAttributes } from '../../srv/lib/guide-attribute-defaults';
 
 describe('battery lifecycle transitions', () => {

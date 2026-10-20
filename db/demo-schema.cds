@@ -31,7 +31,7 @@ entity Runs : cuid, managed {
     /** JSON array of { kind, label, txHash?, explorerUrl?, status } steps. */
     stepsJson  : LargeString;
     error      : String(500);
-    /** Scaled (milli-unit) threshold of the CO2 claim. */
+    /** Scaled (milli-unit) threshold of the primary claim. */
     threshold  : Integer64;
     clientKey  : String(64);
 }

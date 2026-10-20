@@ -7,10 +7,11 @@ import {
 import {
     hashPayload, blake2b256Hex, encryptPayload, anchorPassport, waitForJob, waitForJobResult,
     detachedFromRequest, sendDetached,
-    buildContentRoot, newSaltSeed, decryptPayload, fieldKeyHex, BATTERY_PROVABLE_FIELDS, BATTERY_STRING_FIELDS,
-    DYNAMIC_PROVABLE_FIELDS, runChainStep,
+    buildContentRoot, newSaltSeed, decryptPayload, fieldKeyHex, runChainStep,
     effectiveNetwork, explorerTxUrl, recordKeyFor
 } from './lib/passport-anchor';
+import { appProfileOf, type AppProfile } from './lib/product-profiles';
+import type { AttributeRow } from '@odatano/dpp-sdk/attributes';
 import { PluginLane } from './lib/lane-plugin';
 import { remoteLaneFor, hasRemoteSigner, remoteVaultFor } from './lib/lane-remote';
 import {
@@ -20,18 +21,19 @@ import {
 import { CLAIM_SETS, claimSetById } from './lib/claim-sets';
 import {
     allowedMaskFor, fieldsFromMask, describeMask, firstUnmaskedDifference, countChangedSlots,
-    provableValuesFromPayload, SLOT_COUNT
+    provableValues, SLOT_COUNT
 } from './lib/version-integrity';
 import { buildMembershipSet } from './lib/membership-set';
-import { defaultGuideAttributes, hashableAttributes } from './lib/guide-attribute-defaults';
-import { DYNAMIC_ATTRIBUTES, encodeDynamicValue, decodeDynamicValue, dedupeUpdates, type DynamicUpdate } from './lib/attribute-update';
-import { payloadFromDb, readPayloadInputs } from './lib/passport-payload';
+import { defaultGuideAttributes } from './lib/guide-attribute-defaults';
+import { hashableAttributes } from '@odatano/dpp-sdk/attributes';
+import { DYNAMIC_ATTRIBUTES, encodeDynamicValue, dedupeUpdates, type DynamicUpdate } from './lib/attribute-update';
+import { projectPayload, readProfileRows, readPayload } from './lib/passport-payload';
 import { validateTransition, parseBatteryStatus, encodeBatteryStatus, type BatteryStatus } from './lib/battery-lifecycle';
 import { validateDiligenceUpload, decodeUpload, sha256Hex } from './lib/diligence-upload';
 import { proofCartPlan, claimKey, responseClaimKey, claimValidUntil, type ProofClaim } from './lib/proof-plan';
 import { listProducerWallets, producerWalletSecrets, feeSponsorWalletId, feeSponsorWalletIds } from './lib/producer-wallets';
 import { s4ConfigFromEnv, fetchMaterialDocuments, enrichMaster, loadProductMaster } from './lib/s4-client';
-import { buildReceiptRows } from './lib/s4-material-document';
+import { buildReceiptRows, BATTERY_MAPPING } from './lib/s4-material-document';
 import { verifyContractTx, type ChainVerdict } from './lib/chain-verify';
 import { verifyAttestState, attestRootState, verifyGrantState, verifyPredicateState, verifyCrossRootState, resolveAnchorAttester } from './lib/state-verify';
 import { sweepAction, verdictToStatus } from './lib/stuck-rows';
@@ -84,15 +86,16 @@ async function toBuffer(value: unknown): Promise<Buffer | null> {
 
 interface PassportInput {
     passportId: string;
+    /** Product family (default battery); its children ride under their payload keys. */
+    profile?: string;
     manufacturerId?: string;
     batteryCategory?: string;
     model?: string;
     manufactureDate?: string;
     weightKg?: number;
     performanceClass?: string;
-    batteries?: Record<string, unknown>[];
-    recycledMaterials?: Record<string, unknown>[];
-    diligenceDocs?: Record<string, unknown>[];
+    attributes?: AttributeRow[];
+    [child: string]: unknown;
 }
 
 /**
@@ -387,13 +390,18 @@ export default class ProducerService extends cds.ApplicationService {
                 this.s4MasterCache = { at: Date.now(), master: await enrichMaster(cfg, loadProductMaster(cfg)) };
             }
             const headers = await fetchMaterialDocuments(cfg);
-            const rows = buildReceiptRows(headers, this.s4MasterCache.master, new Set(), cfg.movementTypes);
+            const rows = buildReceiptRows(headers, this.s4MasterCache.master, new Set(), BATTERY_MAPPING, cfg.movementTypes);
             const ids = rows.map(r => r.passportId);
             const existing: any[] = ids.length
                 ? await SELECT.from('passport.Passports').columns('passportId').where({ passportId: { in: ids } })
                 : [];
             const existingIds = new Set(existing.map(r => String(r.passportId)));
-            return rows.map(r => (r.status === 'ready' && existingIds.has(r.passportId)) ? { ...r, status: 'exists' } : r);
+            // The cockpit list shows the battery category from the master's head fields.
+            return rows.map(r => ({
+                ...r,
+                batteryCategory: (r.head as Record<string, unknown> | null)?.batteryCategory ?? null,
+                status: r.status === 'ready' && existingIds.has(r.passportId) ? 'exists' : r.status,
+            }));
         } catch (e: any) {
             const msg = String(e?.message ?? e);
             return req.reject(502, msg.startsWith('S/4') ? msg : `S/4 read failed: ${msg}`);
@@ -646,39 +654,21 @@ export default class ProducerService extends cds.ApplicationService {
         };
     }
 
+    /** The product family of a passport row. */
+    private async appProfileOfRow(passportRowId: string): Promise<AppProfile> {
+        const row = await SELECT.one.from('passport.Passports')
+            .columns('profile').where({ ID: passportRowId }) as { profile?: string } | undefined;
+        return appProfileOf(row?.profile);
+    }
+
     /**
-     * Provable-field → raw-value map for a passport, read from its (first)
-     * battery. Feeds `buildContentRoot` so the on-chain content root and the
+     * Provable-field -> raw-value map for a passport, read from its profile's
+     * rows. Feeds `buildContentRoot` so the on-chain content root and the
      * inclusion proofs are built from the passport's ACTUAL field values.
-     * (Demo assumption: one provable battery per passport.)
      */
-    private async fieldValuesFor(passportRowId: string): Promise<Record<string, number | string>> {
-        const out: Record<string, number | string> = {};
-        // Battery scalar + string fields (actual Batteries columns).
-        const bat: any = await SELECT.one.from(Batteries)
-            .columns(...(BATTERY_PROVABLE_FIELDS as readonly string[]), ...(BATTERY_STRING_FIELDS as readonly string[]))
-            .where({ passport_ID: passportRowId });
-        for (const f of BATTERY_PROVABLE_FIELDS) if (bat?.[f] != null) out[f] = bat[f];
-        for (const f of BATTERY_STRING_FIELDS) if (bat?.[f] != null && bat[f] !== '') out[f] = String(bat[f]);
-        // Per-material recycled content (RecycledMaterials rows) → recycled<Material>Pct.
-        const recs: any[] = await SELECT.from(RecycledMaterials)
-            .columns('material', 'recycledPercentage')
-            .where({ passport_ID: passportRowId });
-        for (const r of recs || []) {
-            if (r?.material && r.recycledPercentage != null) out[`recycled${r.material}Pct`] = r.recycledPercentage;
-        }
-        // Dynamic (measured) slots come from the guide attribute rows, decoded
-        // back to their scalar. Absent attributes simply leave their slot
-        // absent; a category that does not carry them (e.g. a battery without
-        // a BMS) is not a special case here.
-        const dyn: any[] = await SELECT.from(PassportAttributes)
-            .columns('attribute', 'valueJson')
-            .where({ passport_ID: passportRowId, attribute: { in: [...DYNAMIC_PROVABLE_FIELDS] } });
-        for (const a of dyn || []) {
-            const n = decodeDynamicValue(String(a?.attribute), a?.valueJson);
-            if (n != null) out[String(a.attribute)] = n;
-        }
-        return out;
+    private async fieldValuesFor(passportRowId: string, app?: AppProfile): Promise<Record<string, number | string>> {
+        const a = app ?? await this.appProfileOfRow(passportRowId);
+        return provableValues(a.profile, await readProfileRows(a, passportRowId));
     }
 
     /**
@@ -710,9 +700,10 @@ export default class ProducerService extends cds.ApplicationService {
      * gated by the caller via `contentSaltSeedOf`.
      */
     private async contentTreeFor(passportRowId: string, values?: Record<string, number | string>) {
-        const vals = values ?? await this.fieldValuesFor(passportRowId);
+        const app = await this.appProfileOfRow(passportRowId);
+        const vals = values ?? await this.fieldValuesFor(passportRowId, app);
         const stored = await this.contentSaltSeedOf(passportRowId);
-        const tree = await buildContentRoot(vals, { saltSeed: stored });
+        const tree = await buildContentRoot(app.profile, vals, { saltSeed: stored });
         // Lazy materialisation: a passport without a seed gets one on FIRST use
         // and keeps it. Without this, every caller would build a tree under a
         // fresh random seed, and the browser wallet lane (which anchors a root
@@ -756,30 +747,29 @@ export default class ProducerService extends cds.ApplicationService {
             return req.reject(409, `passport '${passportId}' already exists`);
         }
 
-        // Private Annex XIII content (Points 2-4). Hashed + encrypted; never public.
-        const batteries = input.batteries ?? [];
-        const recycledMaterials = input.recycledMaterials ?? [];
-        const diligenceDocs = input.diligenceDocs ?? [];
-        // Guide-format attributes (DIN DKE SPEC 99100 longlist): caller rows or
-        // the default set; part of the anchored payload, canonically sorted.
-        const attributes = (input as any).attributes?.length
-            ? hashableAttributes((input as any).attributes)
-            : hashableAttributes(defaultGuideAttributes({
-                passportId, model: input.model, performanceClass: input.performanceClass,
-                batteryCategory: input.batteryCategory,
-            }));
-        // Hash the v2 projection (payloadFromDb) over EXACTLY the rows the
-        // insert below persists, so the drift check's recompute reproduces
-        // this hash from the DB. Hashing the raw input objects (v1) made
-        // every fresh anchor report drift until its first re-anchor. Only
-        // docType survives the create insert for diligence docs (evidence
-        // uploads come later), so only docType may enter the hash.
-        const { canonicalPayload, payloadHash } = hashPayload(payloadFromDb({
-            batteries: batteries as unknown as Record<string, unknown>[],
-            recycledMaterials: recycledMaterials as unknown as Record<string, unknown>[],
-            diligenceDocs: diligenceDocs.map((d) => ({ docType: d.docType })),
-            attributes
-        }));
+        let app: AppProfile;
+        try { app = appProfileOf(input.profile); } catch (e) { return req.reject(400, (e as Error).message); }
+
+        // Confidential content: the profile's children, hashed + encrypted,
+        // never public. Only the profile's columns are persisted and hashed, so
+        // the drift check's recompute from the DB reproduces this hash.
+        const children: Record<string, Record<string, unknown>[]> = {};
+        for (const [key, spec] of Object.entries(app.profile.children)) {
+            const list = Array.isArray(input[key]) ? (input[key] as Record<string, unknown>[]) : [];
+            children[key] = list.map((row) => Object.fromEntries(
+                Object.keys(spec.columns).filter((c) => row[c] !== undefined).map((c) => [c, row[c]])));
+        }
+        // Attribute rows: caller rows, or for batteries the guide default set
+        // (DIN DKE SPEC 99100 longlist). Part of the anchored payload.
+        const attributes: AttributeRow[] = input.attributes?.length
+            ? hashableAttributes(input.attributes)
+            : app.id === 'battery'
+                ? hashableAttributes(defaultGuideAttributes({
+                    passportId, model: input.model, performanceClass: input.performanceClass,
+                    batteryCategory: input.batteryCategory,
+                }))
+                : [];
+        const { canonicalPayload, payloadHash } = hashPayload(projectPayload(app.profile, { ...children, attributes }));
         const passportIdHash = blake2b256Hex(passportId);
         const payloadCipher = encryptPayload(canonicalPayload, passportId);
 
@@ -790,6 +780,7 @@ export default class ProducerService extends cds.ApplicationService {
         await INSERT.into(Passports).entries({
             ID,
             passportId,
+            profile: app.id,
             owner: owner || null,
             manufacturerId: input.manufacturerId,
             batteryCategory: input.batteryCategory as any,
@@ -804,9 +795,7 @@ export default class ProducerService extends cds.ApplicationService {
             contractAddress,
             anchorNetwork: contractAddress ? effectiveNetwork() : null,
             status: 'draft',
-            batteries: batteries.map((b) => ({ ...b })),
-            recycledMaterials: recycledMaterials.map((m) => ({ ...m })),
-            diligenceDocs: diligenceDocs.map((d) => ({ docType: d.docType })),
+            ...children,
             attributes: attributes.map((a) => ({ ...a }))
         } as any);
 
@@ -1092,15 +1081,23 @@ export default class ProducerService extends cds.ApplicationService {
         const secret = process.env.PASSPORT_PUBLISH_SECRET;
         if (!url || !secret) return req.reject(503, 'publishing not configured (PASSPORT_PUBLISH_URL / PASSPORT_PUBLISH_SECRET)');
         const p: any = await SELECT.one.from(Passports)
-            .columns('passportId', 'model', 'manufacturerId', 'batteryCategory', 'manufactureDate',
+            .columns('passportId', 'profile', 'model', 'manufacturerId', 'batteryCategory', 'manufactureDate',
                 'weightKg', 'performanceClass', 'qrCodeUrl', 'payloadHash', 'contractAddress',
                 'anchorNetwork', 'attestationTxHash', 'status', 'attesterId', 'passportIdHash')
             .where({ passportId });
         if (!p) return req.reject(404, `passport '${passportId}' not found`);
         if (p.status !== 'anchored') return req.reject(400, `passport '${passportId}' is not anchored (status: ${p.status})`);
+        const rowId: any = await SELECT.one.from(Passports).columns('ID').where({ passportId });
+        // The public attribute rows the family shows on the explorer travel too.
+        const shownAttributes = appProfileOf(p.profile).explorerAttributes;
+        const attributes: { attribute: string; valueJson: string }[] = shownAttributes.length
+            ? (await SELECT.from(PassportAttributes)
+                .columns('attribute', 'valueJson')
+                .where({ passport_ID: rowId.ID, accessClass: 'public', attribute: { in: [...shownAttributes] } }) as any[])
+                .map((a) => ({ attribute: String(a.attribute), valueJson: String(a.valueJson ?? '') }))
+            : [];
         // Proven ZK claims travel with the public fields (claim + threshold +
         // proof tx are public by design; the underlying value never leaves).
-        const rowId: any = await SELECT.one.from(Passports).columns('ID').where({ passportId });
         const proofs: any[] = await SELECT.from(PredicateProofLog)
             .columns('sourceField', 'predicate', 'threshold', 'unit', 'txHash', 'createdAt', 'payloadHash', 'setRoot', 'setId', 'attesterId', 'validUntil')
             .where({ passport_ID: rowId.ID, status: 'succeeded', result: true })
@@ -1145,7 +1142,7 @@ export default class ProducerService extends cds.ApplicationService {
             const res = await fetch(`${url.replace(/\/+$/, '')}/api/v1/passport/ingest`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${secret}` },
-                body: JSON.stringify({ ...p, claims, anchorVersions }),
+                body: JSON.stringify({ ...p, attributes, claims, anchorVersions }),
                 signal: AbortSignal.timeout(30000),
             });
             const body: any = await res.json().catch(() => ({}));
@@ -1477,9 +1474,10 @@ export default class ProducerService extends cds.ApplicationService {
         let contentRoot: string | undefined;
         let schemaId: string | undefined;
         try {
-            const values = await this.fieldValuesFor(ID);
+            const app = await this.appProfileOfRow(ID);
+            const values = await this.fieldValuesFor(ID, app);
             if (Object.keys(values).length) {
-                const tree = await buildContentRoot(values, { saltSeed: newSaltSeed() });
+                const tree = await buildContentRoot(app.profile, values, { saltSeed: newSaltSeed() });
                 contentRoot = tree.contentRoot;
                 schemaId = tree.schemaId;
                 await this.persistContentTree(ID, tree);
@@ -2077,10 +2075,11 @@ export default class ProducerService extends cds.ApplicationService {
             sessionId?: string; walletId?: string; sponsorWalletId?: string;
         };
         const row: any = await SELECT.one.from(Passports)
-            .columns('ID', 'passportId', 'owner', 'payloadHash', 'status', 'contractAddress',
+            .columns('ID', 'passportId', 'profile', 'owner', 'payloadHash', 'status', 'contractAddress',
                 'contentRoot', 'contentSchemaId', 'contentSaltSeed', 'attesterId')
             .where({ passportId: String(passportId ?? '') });
         if (!row) return req.reject(404, `passport '${passportId}' not found`);
+        const { profile } = appProfileOf(row.profile);
         if (row.status !== 'anchored') {
             return req.reject(400, `passport '${row.passportId}' is '${row.status}'; a version comparison needs two anchored versions`);
         }
@@ -2098,7 +2097,7 @@ export default class ProducerService extends cds.ApplicationService {
             }
         }
         let mask: number;
-        try { mask = allowedMaskFor(fields); } catch (e: any) { return req.reject(400, String(e?.message ?? e)); }
+        try { mask = allowedMaskFor(profile, fields); } catch (e: any) { return req.reject(400, String(e?.message ?? e)); }
 
         // Document A: an archived anchor version (default the newest).
         const versions: any[] = await SELECT.from(PassportAnchorVersions)
@@ -2150,7 +2149,7 @@ export default class ProducerService extends cds.ApplicationService {
             const cipherA = await toBuffer(prior.payloadCipher);
             if (!cipherA?.length) throw new Error('archived payload cipher is empty');
             const payloadA = JSON.parse(decryptPayload(cipherA, String(row.passportId)));
-            treeA = await buildContentRoot(provableValuesFromPayload(payloadA), { saltSeed: prior.contentSaltSeed });
+            treeA = await buildContentRoot(profile, provableValues(profile, payloadA), { saltSeed: prior.contentSaltSeed });
         } catch (e: any) {
             return req.reject(409, `version ${prior.version} of '${row.passportId}' cannot be reopened: ${String(e?.message ?? e)}`);
         }
@@ -2165,17 +2164,17 @@ export default class ProducerService extends cds.ApplicationService {
         }
 
         // Off-chain pre-flight of the very statement the circuit will check.
-        const broken = firstUnmaskedDifference(treeA.opening.slots, treeB.opening.slots, mask);
+        const broken = firstUnmaskedDifference(profile, treeA.opening.slots, treeB.opening.slots, mask);
         if (broken) {
             return req.reject(400, `'${broken}' changed between version ${prior.version} and the current version, ` +
-                `but the mask does not allow it (${describeMask(mask)})`);
+                `but the mask does not allow it (${describeMask(profile, mask)})`);
         }
 
         // The complementary LOWER bound. The mask says what may change, k says
         // how much did change; a periodic measurement update needs both to be
         // checkable ("specification untouched" alone is also true of a
         // re-timestamp that measured nothing).
-        const changedSlots = countChangedSlots(treeA.opening.slots, treeB.opening.slots);
+        const changedSlots = countChangedSlots(profile, treeA.opening.slots, treeB.opening.slots);
         const k = Math.max(0, Math.trunc(Number(minChangedSlots ?? 0)));
         if (k > SLOT_COUNT) return req.reject(400, `minChangedSlots must be at most ${SLOT_COUNT}`);
         if (k > changedSlots) {
@@ -2186,11 +2185,11 @@ export default class ProducerService extends cds.ApplicationService {
 
         const session = await this.effectiveSession(sessionId, walletId);
         const contractAddress = this.vaultFor(row, sessionId);
-        const claim = `versus version ${prior.version}: ${describeMask(mask)}`
+        const claim = `versus version ${prior.version}: ${describeMask(profile, mask)}`
             + (k > 0 ? `, and at least ${k} slot(s) did change` : '');
         const base = {
             fromVersion: Number(prior.version), allowedMask: mask,
-            allowedFields: JSON.stringify(fieldsFromMask(mask)),
+            allowedFields: JSON.stringify(fieldsFromMask(profile, mask)),
             minChangedSlots: k, changedSlots, claim,
             payloadHashA: String(prior.payloadHash), payloadHashB: String(row.payloadHash)
         };
@@ -2640,8 +2639,8 @@ export default class ProducerService extends cds.ApplicationService {
         let maxVersion = 0;
         for (const v of versionRows ?? []) maxVersion = Math.max(maxVersion, Number(v.version ?? 0));
 
-        const inputs = await readPayloadInputs(String(row.ID));
-        const { canonicalPayload, payloadHash: newHash } = hashPayload(payloadFromDb(inputs));
+        const app = await this.appProfileOfRow(String(row.ID));
+        const { canonicalPayload, payloadHash: newHash } = hashPayload(await readPayload(app, String(row.ID)));
 
         let archivedVersion = 0;
         if (row.status === 'anchored') {
@@ -2977,8 +2976,8 @@ export default class ProducerService extends cds.ApplicationService {
         const row: any = await SELECT.one.from(Passports)
             .columns('ID', 'passportId', 'payloadHash', 'status').where({ passportId: pid });
         if (!row) return req.reject(404, `passport '${pid}' not found`);
-        const inputs = await readPayloadInputs(String(row.ID));
-        const recomputedHash = hashPayload(payloadFromDb(inputs)).payloadHash;
+        const app = await this.appProfileOfRow(String(row.ID));
+        const recomputedHash = hashPayload(await readPayload(app, String(row.ID))).payloadHash;
         return {
             passportId: pid, status: String(row.status ?? ''),
             drifted: row.status === 'anchored' && recomputedHash !== row.payloadHash,

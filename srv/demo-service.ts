@@ -3,7 +3,10 @@ import { randomBytes, createHash } from 'node:crypto';
 import { Testers, Runs } from '#cds-models/demo';
 import { Passports, PassportTransactions, PredicateProofLog } from '#cds-models/passport';
 import { validateDemoInput, validNickname } from './lib/demo-validation';
-import { demoClaimList, demoBatteryValues, membershipSetFor, CLAIM_FIELDS, PRIMARY_CLAIM_FIELD, type ResolvedClaim } from './lib/demo-claims';
+import {
+    DEMO_PROFILES, demoProfile, demoClaimList, demoChildRows, membershipSetFor, type ResolvedClaim,
+} from './lib/demo-claims';
+import type { AttributeRow } from '@odatano/dpp-sdk/attributes';
 import { feeSponsorWalletIds, producerWalletSecrets } from './lib/producer-wallets';
 import { encryptSecret, decryptSecret } from './lib/demo-crypto';
 import { sendDetached, waitForJobResult, detachedFromRequest, explorerTxUrl, blake2b256Hex } from './lib/passport-anchor';
@@ -41,6 +44,7 @@ export default class DemoService extends cds.ApplicationService {
         this.on('demoInfo', this.demoInfo);
         this.on('demoSponsorStatus', this.demoSponsorStatus);
         this.on('demoClaimFields', this.demoClaimFields);
+        this.on('demoProfiles', this.demoProfiles);
         // Stale queued/running rows from a previous process are unrecoverable
         // (the queue is in-memory); fail them honestly on boot.
         cds.on('served', () => {
@@ -301,15 +305,20 @@ export default class DemoService extends cds.ApplicationService {
             .where({ testerId: String(data.testerId ?? '') });
         if (!tester) return req.reject(404, 'unknown testerId (start the demo first)');
 
-        // Extra claims arrive as a JSON string (CAP actions take no array-of-
+        // Head and claims arrive as JSON strings (CAP actions take no
         // struct params); a malformed body is a plain 400, not a 500.
-        let claims: unknown;
-        try { claims = data.claimsJson ? JSON.parse(String(data.claimsJson)) : undefined; }
-        catch { return req.reject(400, 'claimsJson must be valid JSON'); }
+        let claims: unknown, head: unknown;
+        try {
+            claims = data.claimsJson ? JSON.parse(String(data.claimsJson)) : [];
+            head = data.headJson ? JSON.parse(String(data.headJson)) : {};
+        } catch { return req.reject(400, 'headJson and claimsJson must be valid JSON'); }
 
-        const check = validateDemoInput({ ...data, claims });
+        const check = validateDemoInput({ profile: data.profile, head, claims, secondLife: data.secondLife });
         if (!check.ok) return req.reject(400, check.errors.join('; '));
         const input = check.value!;
+        const claimList = demoClaimList(input.profile, input.claims);
+        const primary = claimList.find((c) => c.field === input.profile.primary);
+        if (!primary || primary.predicate === 'setMembership') return req.reject(400, 'the primary claim must be numeric');
 
         // All caps + the Runs INSERT run under one in-process lock: the caps
         // are check-then-act (SELECT count, then INSERT), and without
@@ -317,9 +326,9 @@ export default class DemoService extends cds.ApplicationService {
         // count N times and every request proceeds. The INSERT sits inside
         // the lock so the next request's count already includes this run.
         const clientKey = this.clientKeyOf(req);
-        const passportId = `BAT-TRY-${new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14)}-${randomBytes(2).toString('hex').toUpperCase()}`;
+        const passportId = `${input.profile.idPrefix}-${new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14)}-${randomBytes(2).toString('hex').toUpperCase()}`;
         const runId = cds.utils.uuid();
-        const thresholdScaled = Math.round(input.proveThreshold * 1000);
+        const thresholdScaled = Math.round(primary.threshold * 1000);
         const gate = await this.withCapLock(async () => {
             // Queue-length cap: with concurrency 1 every queued run is 3-5
             // minutes of wait for the ones behind it. Beyond the cap, refuse
@@ -354,7 +363,7 @@ export default class DemoService extends cds.ApplicationService {
                     tester_ID: tester.ID,
                     passportId,
                     state: 'queued',
-                    stepsJson: JSON.stringify(this.initialSteps(input.secondLife, demoClaimList(input))),
+                    stepsJson: JSON.stringify(this.initialSteps(input.secondLife, claimList)),
                     threshold: thresholdScaled,
                     clientKey
                 } as any);
@@ -429,20 +438,31 @@ export default class DemoService extends cds.ApplicationService {
         };
     };
 
-    /** Claim catalogue for the form (see demo-service.cds). Static, DB-free. */
-    private demoClaimFields = async () => CLAIM_FIELDS.map((c) => (c.kind === 'membership'
-        ? {
-            field: c.field, label: c.label, kind: 'membership',
-            setId: c.setId, setLabel: membershipSetFor(c)?.label ?? c.setId,
-            optionsJson: JSON.stringify(membershipSetFor(c)?.values ?? []),
-            defaultOption: c.defaultValue,
-            primary: false
-        }
-        : {
-            field: c.field, label: c.label, kind: 'numeric', unit: c.unit, predicate: c.predicate,
-            min: c.min, max: c.max, defaultValue: c.defaultValue, defaultThreshold: c.defaultThreshold,
-            primary: c.field === PRIMARY_CLAIM_FIELD
-        }));
+    /** The product families and their head fields (see demo-service.cds). Static, DB-free. */
+    private demoProfiles = async () => Object.values(DEMO_PROFILES).map((p) => ({
+        id: p.id, label: p.label, tagline: p.tagline, regulation: p.regulation, idPrefix: p.idPrefix,
+        primaryField: p.primary, secondLife: p.secondLife, headJson: JSON.stringify(p.head),
+    }));
+
+    /** Claim catalogue of one family for the form (see demo-service.cds). Static, DB-free. */
+    private demoClaimFields = async (req: cds.Request) => {
+        let profile;
+        try { profile = demoProfile((req.data as { profile?: string }).profile); }
+        catch (e) { return req.reject(400, (e as Error).message); }
+        return profile.claims.map((c) => (c.kind === 'membership'
+            ? {
+                field: c.field, label: c.label, kind: 'membership',
+                setId: c.setId, setLabel: membershipSetFor(c)?.label ?? c.setId,
+                optionsJson: JSON.stringify(membershipSetFor(c)?.values ?? []),
+                defaultOption: c.defaultValue,
+                primary: false
+            }
+            : {
+                field: c.field, label: c.label, kind: 'numeric', unit: c.unit, predicate: c.predicate,
+                min: c.min, max: c.max, defaultValue: c.defaultValue, defaultThreshold: c.defaultThreshold,
+                primary: c.field === profile.primary
+            }));
+    };
 
     /**
      * Ops dust monitor: delegate to ProducerService (it owns the sponsor
@@ -488,7 +508,8 @@ export default class DemoService extends cds.ApplicationService {
             try {
                 const ng = await hostedVerifyClient(remoteLaneConfigFromEnv());
                 await ng.callFunction('verifyAttestationState', {
-                    contractAddress, attesterId: '0'.repeat(64), payloadHash: '0'.repeat(64), compiledArtifactRef: 'attestation-vault'
+                    contractAddress: contractAddress ?? undefined,
+                    attesterId: '0'.repeat(64), payloadHash: '0'.repeat(64), compiledArtifactRef: 'attestation-vault'
                 });
                 this.hostedProbe = { state: 'ready', error: '', at: Date.now() };
             } catch (e) {
@@ -543,7 +564,7 @@ export default class DemoService extends cds.ApplicationService {
             : `${c.label}: ${c.predicate === 'lessOrEqual' ? 'at most' : 'at least'} ${c.threshold} ${c.unit}`;
         const claimSteps = claims.length > 1
             ? claims.map((c) => ({ kind: `prove:${c.field}`, label: statement(c), status: 'pending' }))
-            : [{ kind: 'provePredicate', label: claims[0] ? `ZK-prove ${statement(claims[0])}` : 'ZK-prove CO2 claim', status: 'pending' }];
+            : [{ kind: 'provePredicate', label: claims[0] ? `ZK-prove ${statement(claims[0])}` : 'ZK-prove the primary claim', status: 'pending' }];
         return [
             { kind: 'sync', label: this.remoteTransport() ? 'Create passport & derive keys' : 'Create passport & sync wallet', status: 'pending' },
             ...(this.registerOwnershipEnabled() && !this.remoteTransport()
@@ -614,7 +635,8 @@ export default class DemoService extends cds.ApplicationService {
         const user = this.techUser();
         const nightgate: any = await cds.connect.to('NightgateService');
         const producer: any = await cds.connect.to('ProducerService');
-        const steps = this.initialSteps(input.secondLife, demoClaimList(input));
+        const claims = demoClaimList(input.profile, input.claims);
+        const steps = this.initialSteps(input.secondLife, claims);
         // BEST-EFFORT: the timeline is cosmetic. A stepsJson UPDATE that hits
         // write-lock contention (facade saves) must never fail a run whose
         // on-chain work succeeded; the next setStep re-writes the full array
@@ -733,24 +755,31 @@ export default class DemoService extends cds.ApplicationService {
             //    makes the sponsor pay all three anchor fees.
             await this.patchRun(runId, { state: 'anchoring' });
             await setStep('attest', { status: 'running' });
+            // Public head: the visitor's column values plus the family's fixed
+            // ones; select heads that target an attribute become public
+            // attribute rows. Confidential content: the family's child rows
+            // with the claimed values placed (demoChildRows). None of those
+            // reach the public explorer row; only the proven predicates do.
+            const today = new Date().toISOString().slice(0, 10);
+            const headColumns: Record<string, string | number> = {};
+            const headAttributes: AttributeRow[] = [];
+            for (const f of input.profile.head) {
+                const v = input.head[f.name];
+                if (f.target === 'attribute') {
+                    headAttributes.push({ section: 'Identification', attribute: f.name, valueJson: JSON.stringify(String(v)), accessClass: 'public' });
+                } else {
+                    headColumns[f.name] = v;
+                }
+            }
+            const attributes = [...headAttributes, ...input.profile.fixedAttributes];
             const passportJson = JSON.stringify({
                 passportId,
-                manufacturerId: input.manufacturer,
-                batteryCategory: 'EV',
-                model: input.model,
-                manufactureDate: new Date().toISOString().slice(0, 10),
-                weightKg: input.weightKg,
-                performanceClass: input.performanceClass,
-                batteries: [{
-                    serialNumber: `TRY-${randomBytes(4).toString('hex')}`,
-                    // cellChemistry comes from demoBatteryValues below (the
-                    // visitor's pick or the default; always populated so the
-                    // membership leaf is provable).
-                    // Confidential values: whatever the visitor chose to claim,
-                    // the rest demo defaults. None of these reach the public
-                    // explorer row; only the proven predicates do.
-                    ...demoBatteryValues(input)
-                }]
+                profile: input.profile.id,
+                ...input.profile.fixedHead,
+                ...headColumns,
+                manufactureDate: today,
+                ...(attributes.length ? { attributes } : {}),
+                ...demoChildRows(input.profile, input.claims, { nonce: randomBytes(4).toString('hex'), today }),
             });
             const created: any = await producer.tx({ user }, (tx: any) => tx.send('createPassport', {
                 passportJson, submit: true, owner: tester.shieldedAddress, sessionId,
@@ -770,7 +799,6 @@ export default class DemoService extends cds.ApplicationService {
             //    always there; the visitor can add more. ALL of them ride in
             //    ONE transaction, so N claims cost one wait and one fee.
             await this.patchRun(runId, { state: 'proving' });
-            const claims = demoClaimList(input);
             const multiClaim = claims.length > 1;
             const proveKind = (field: string) => multiClaim ? `prove:${field}` : 'provePredicate';
             await setSteps(claims.map((c) => [proveKind(c.field), { status: 'running' }] as [string, Record<string, unknown>]));

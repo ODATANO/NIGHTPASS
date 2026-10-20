@@ -2,9 +2,9 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
     artifactCacheDir, cacheDirForManifest,
-    deriveIndexerWsUrl, isRebuildable, remoteLaneConfigFromEnv, resolveTxHash,
+    isRebuildable, remoteLaneConfigFromEnv, resolveTxHash,
     registerRemoteSigner, releaseRemoteSigner, hasRemoteSigner, remoteLaneFor, remoteVaultFor,
-    SPONSOR_POOL_SENTINEL, REMOTE_LANE_CIRCUITS
+    REMOTE_LANE_CIRCUITS
 } from '../../srv/lib/lane-remote';
 
 // Network-free pins for the remote lane: configuration, retry classification
@@ -13,28 +13,25 @@ import {
 const ENV = {
     NIGHTGATE_API_URL: 'https://api.example/',
     DEMO_NIGHTGATE_AGENT_TOKEN: 'ngat_x',
-    NIGHTGATE_INDEXER_HTTP_URL: 'https://indexer.preprod.midnight.network/api/v4/graphql',
-    NIGHTGATE_NODE_URL: 'wss://rpc.preprod.midnight.network/',
     NIGHTGATE_NETWORK: 'preprod'
 };
 
 describe('remoteLaneConfigFromEnv', () => {
-    it('reads the hosted endpoint, token, network and derives the ws indexer url', () => {
+    it('reads the hosted endpoint, token and network; no indexer or node is needed', () => {
         const cfg = remoteLaneConfigFromEnv(ENV);
         assert.equal(cfg.apiUrl, 'https://api.example');
         assert.equal(cfg.agentToken, 'ngat_x');
         assert.equal(cfg.networkId, 'preprod');
-        assert.equal(cfg.indexerWsUrl, 'wss://indexer.preprod.midnight.network/api/v4/graphql/ws');
         assert.equal(cfg.proofServerUrl, undefined);
         assert.match(String(cfg.cacheDir), /nightgate-txbuilder[\\/]attestation-vault$/);
+        assert.ok(!('indexerHttpUrl' in cfg) && !('nodeUrl' in cfg));
     });
 
-    it('takes an explicit ws url, proof server and cache dir', () => {
+    it('takes a proof server, cache dir and ttl', () => {
         const cfg = remoteLaneConfigFromEnv({
-            ...ENV, NIGHTGATE_INDEXER_WS_URL: 'wss://x/ws', NIGHTGATE_PROOF_SERVER_URL: 'http://proof-server:6300',
+            ...ENV, NIGHTGATE_PROOF_SERVER_URL: 'http://proof-server:6300',
             NIGHTGATE_ZK_CACHE_DIR: '/data/zk-cache', NIGHTGATE_TX_TTL_MINUTES: '20'
         });
-        assert.equal(cfg.indexerWsUrl, 'wss://x/ws');
         assert.equal(cfg.proofServerUrl, 'http://proof-server:6300');
         assert.equal(cfg.cacheDir, '/data/zk-cache');
         assert.equal(cfg.ttlMinutes, 20);
@@ -44,10 +41,6 @@ describe('remoteLaneConfigFromEnv', () => {
         const { DEMO_NIGHTGATE_AGENT_TOKEN: _t, ...rest } = ENV;
         assert.throws(() => remoteLaneConfigFromEnv(rest), /DEMO_NIGHTGATE_AGENT_TOKEN is not set/);
         assert.throws(() => remoteLaneConfigFromEnv({ ...ENV, NIGHTGATE_API_URL: ' ' }), /NIGHTGATE_API_URL is not set/);
-    });
-
-    it('derives the ws url the way NIGHTGATE does', () => {
-        assert.equal(deriveIndexerWsUrl('http://localhost:8088/api/v4/graphql/'), 'ws://localhost:8088/api/v4/graphql/ws');
     });
 });
 
@@ -104,8 +97,7 @@ describe('remote signer registry', () => {
         assert.throws(() => registerRemoteSigner(RUN, 'abc'), /128 hex chars/);
     });
 
-    it('pins the pool sentinel and the demo circuit set', () => {
-        assert.equal(SPONSOR_POOL_SENTINEL, '00000000-0000-0000-0000-706f6f6c0000');
+    it('pins the demo circuit set', () => {
         assert.deepEqual(REMOTE_LANE_CIRCUITS, ['attest', 'bindDocument', 'anchorContentRoot', 'proveFieldPredicate', 'proveFieldMembership']);
     });
 });
@@ -113,28 +105,28 @@ describe('remote signer registry', () => {
 describe('resolveTxHash', () => {
     const HASH = 'a'.repeat(64);
     const ID = '00' + 'b'.repeat(64);
-    const fetchOk = (async (_url: any, init: any) => {
-        const body = JSON.parse(String(init.body));
-        assert.equal(body.variables.i, ID);
-        assert.match(body.query, /offset:\{identifier:\$i\}/);
-        return { json: async () => ({ data: { transactions: [{ hash: HASH }] } }) } as any;
-    }) as unknown as typeof fetch;
+    const lookupOk = {
+        async transactionByIdentifier(identifier: string) {
+            assert.equal(identifier, ID);
+            return { hash: '0x' + HASH.toUpperCase() };
+        },
+    };
 
     it('passes a 64-hex hash through untouched', async () => {
         let called = 0;
-        const f = (async () => { called++; return {} as any; }) as unknown as typeof fetch;
-        assert.equal(await resolveTxHash('0x' + HASH.toUpperCase(), 'http://x', { fetchFn: f }), HASH);
+        const lookup = { async transactionByIdentifier() { called++; return null; } };
+        assert.equal(await resolveTxHash('0x' + HASH.toUpperCase(), lookup), HASH);
         assert.equal(called, 0);
     });
 
-    it('maps a 66-char identifier to the block hash through the indexer', async () => {
-        assert.equal(await resolveTxHash(ID, 'http://indexer', { fetchFn: fetchOk }), HASH);
+    it('maps a 66-char identifier to the block hash through the hosted API', async () => {
+        assert.equal(await resolveTxHash(ID, lookupOk), HASH);
     });
 
-    it('retries an empty answer and finally keeps the identifier', async () => {
+    it('retries while the server has not indexed the block and finally keeps the identifier', async () => {
         let calls = 0;
-        const f = (async () => { calls++; return { json: async () => ({ data: { transactions: [] } }) } as any; }) as unknown as typeof fetch;
-        assert.equal(await resolveTxHash(ID, 'http://indexer', { fetchFn: f, attempts: 3, delayMs: 1 }), ID);
+        const lookup = { async transactionByIdentifier() { calls++; return null; } };
+        assert.equal(await resolveTxHash(ID, lookup, { attempts: 3, delayMs: 1 }), ID);
         assert.equal(calls, 3);
     });
 });

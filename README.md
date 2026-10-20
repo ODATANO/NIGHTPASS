@@ -1,4 +1,4 @@
-# NIGHTPASS - Digital Battery Passport on Midnight
+# NIGHTPASS - Digital Product Passport on Midnight
 
 ![alt text](/docs/readme_header.png)
 
@@ -8,34 +8,56 @@
 [![SAP CAP](https://img.shields.io/badge/SAP%20CAP-%40sap%2Fcds%20%5E10-0faaff?logo=sap)](https://cap.cloud.sap/)
 [![Midnight](https://img.shields.io/badge/Midnight-preprod-2b2b6f)](https://midnight.network/)
 
-**The battery passport that proves without revealing.**
-NIGHTPASS implements the EU Battery Regulation 2023/1542 Digital Battery Passport, mandatory from 18 February 2027. One dataset is exposed with a different view per audience (consumer, recycler, authority), and sensitive numbers (for example "recycled cobalt share is at least the legal minimum") can be **proven without revealing the value**. Only a payload hash and public metadata are anchored on Midnight; everything else stays encrypted off-chain, and the disclosure tier is enforced in the API layer. Integrates with any ERP solution, fully SAP-compatible by design.
+**The product passport that proves without revealing.**
+NIGHTPASS issues Digital Product Passports on Midnight for two product families: the EU battery passport (Regulation 2023/1542, mandatory from 18 February 2027) and the component passport for safety-related parts of regulated plants. One dataset is exposed with a different view per audience (public, legitimate interest, authority), and sensitive values (for example "recycled cobalt share is at least the legal minimum" or "cobalt content is at most 200 ppm") can be **proven without revealing the value**. Only a payload hash and public metadata are anchored on Midnight; everything else stays encrypted off-chain, and the disclosure level is enforced in the API layer. Integrates with any ERP solution, fully SAP-compatible by design.
 
 ## How it works
 
-- **Three disclosure tiers** (Annex XIII): one dataset, server-enforced views for consumer, recycler and authority. An on-chain grant raises a partner's tier per passport.
-- **Zero-knowledge proofs**: prove `carbon footprint <= threshold` without revealing the value, cryptographically bound to *this* passport's anchored fields. Batchable: prove up to 8 field values in ONE transaction (proof cart in the cockpit, one wallet approval; or a single server call).
+- **Product families**: a passport belongs to a family (`battery` or `component`). The family decides which detail tables the passport fills, which fields are provable and which allow-lists its membership claims use. Both families share the same anchor, disclosure and proof mechanics.
+- **Three disclosure levels**: one dataset, server-enforced views for public, legitimate-interest and authority readers. An on-chain grant raises a partner's level per passport.
+- **Zero-knowledge proofs**: prove `value <= threshold`, `value >= threshold` or `value is one of a published allow-list` without revealing the value, cryptographically bound to *this* passport's anchored fields. Batchable: prove up to 8 field values in ONE transaction (proof cart in the cockpit, one wallet approval; or a single server call).
 - **Only hashes on-chain**: the `attestation-vault` contract holds hashes, ownership, disclosure grants and proofs. The passport data itself never leaves your infrastructure.
 - **One transaction per anchor**: attest, id binding and content root land in a single batched tx.
 - **No crypto needed**: a fee-sponsor pool pays all fees, producers hold zero tokens, and passport ids are pre-registered on-chain so nobody can squat them.
-- **The passport lives**: telemetry streams into versioned attributes (the DPP API answers "state at date X"); substantive changes re-anchor as a new version, and every old version stays verifiable forever.
-- **Second Life**: hand the passport to a new operator on-chain; the old one is locked out, the new one updates from day one.
-- **Straight out of SAP**: a goods receipt posted in S/4HANA mints the passport with no manual step; a small bridge polls the standard Material Documents API, pulls weight and description from the live product master and anchors automatically. Proven against SAP's public API sandbox ([example passport](https://zkpassport.eu/p/BAT-MZRMC90001-50001739511)); see [docs/s4-mapping.md](docs/s4-mapping.md).
+- **Versioned anchors**: substantive changes re-anchor the passport as a new version, and every old version stays verifiable forever.
+- **Operator handover**: hand the passport to a new operator on-chain; the old one is locked out, the new one updates from day one.
 - **Sign your way**: server wallets or the user's own Lace wallet; offline-first without either.
-- **Independently conformant**: EU DPP Registry enrolled (verified economic operator, first passport registration submitted) · 11/11 official DPP API interoperability scenarios · 0 validation errors against all five official BatteryPass validation guides.
-- **Evidence on file**: due-diligence documents stay off-chain; only their sha256 is anchored, so anyone can verify they are untampered.
+- **Evidence stays off-chain**: due-diligence reports, material certificates and test reports are kept as files; only their sha256 is anchored or hashed into the passport payload, so anyone can verify they are untampered.
 - **Zero-infrastructure proving**: ZK proofs run in-process; local dev and CI need no proof server.
+
+## Product families
+
+### Battery passport
+
+The EU Battery Regulation 2023/1542 Digital Battery Passport (Annex XIII).
+
+- **Disclosure tiers per Annex XIII**: the three levels map to consumer (Point 1 public data), recycler (Points 2/3) and authority (Points 2/3 plus supplier identities and due-diligence evidence).
+- **Provable fields**: carbon footprint, usable capacity, cycle life, recycled content, round-trip efficiency, lead content; cell chemistry as a membership claim against the recognized-chemistries list.
+- **The passport lives**: telemetry streams into versioned attributes (the DPP Life Cycle API answers "state at date X"); a battery status change re-anchors immediately.
+- **Second Life**: age, repurpose and hand the battery to a new operator; all anchor versions stay verifiable.
+- **Straight out of SAP**: a goods receipt posted in S/4HANA mints the passport with no manual step; a small bridge polls the standard Material Documents API, pulls weight and description from the live product master and anchors automatically. Proven against SAP's public API sandbox ([example passport](https://zkpassport.eu/p/BAT-MZRMC90001-50001739511)); see [docs/s4-mapping.md](docs/s4-mapping.md).
+- **Independently conformant**: EU DPP Registry enrolled (verified economic operator, first passport registration submitted) · 11/11 official DPP API interoperability scenarios · 0 validation errors against all five official BatteryPass validation guides.
 - **Catena-X**: CX-0143 aspect export plus a **Predicate Attestation Credential (PAC)** with `valueDisclosed: false`, the predicate capability Tractus-X currently lacks.
+- The producer cockpit, the BMS simulator, the DPP Life Cycle API and the Catena-X export serve this family.
+
+### Component passport
+
+Safety-related engineered parts of regulated plants, for example pressure-boundary or structural components, under quality-assurance regimes such as ASME III or KTA 1401.
+
+- **Public**: designation, manufacturer, mass, safety class, component status (manufactured, qualified, installed, in service, quarantined, retired), manufacture date and the QR landing.
+- **Legitimate interest**: material certificates (heat number, material grade, yield and tensile strength, hardness, cobalt content, wall thickness, certificate hash) and qualification tests (standard, test method, result, report hash).
+- **Authority only**: supplier identity and name, inspector identity, and the chain-of-custody trail (every handover of the part with its record hash).
+- **Provable claims**: cobalt content at most a limit (for example 200 ppm), yield strength at least a minimum (for example 450 MPa), hardness at most a limit, wall thickness at least a minimum; membership claims that the material grade is one of the approved grades (or one of the austenitic grades), the supplier is on the qualified supplier list, and the test method is an approved NDT method.
 
 ## Public demo and explorer (Midnight preprod)
 
-**Try it yourself: [demo.zkpassport.eu](https://demo.zkpassport.eu)** an interactive live demo on Midnight preprod. Create a simple battery passport, get its id registered to your (generated, forever-empty) wallet on-chain, watch the whole anchor land as ONE batched transaction, and prove up to four confidential numbers in ONE proof transaction, all in about five minutes. The done screen hands you the passport's QR code.
+**Try it yourself: [demo.zkpassport.eu](https://demo.zkpassport.eu)** an interactive live demo on Midnight preprod. Pick a product family (battery or component), fill the family's public head fields, choose which confidential values to prove (the family's primary claim is always proven, the rest are optional and ride in ONE proof transaction), and watch each anchor step land with its transaction hash, all in about five minutes. Battery runs can add a second-life act (age, repurpose, re-anchor as version 2). Your wallet is generated for the run and stays empty forever; every fee is sponsored. The done screen hands you the passport's QR code.
 
-**Explorer: [zkpassport.eu](https://zkpassport.eu)** a public, block-explorer-style view (Midnight preprod) where anyone can inspect the anchored passports, see the proven ZK claims (values stay hidden) and verify them live against Midnight, no account needed. Every passport finished on the demo below shows up here automatically.
+**Explorer: [zkpassport.eu](https://zkpassport.eu)** a public, block-explorer-style view (Midnight preprod) where anyone can inspect the anchored passports of both families, see the proven ZK claims (values stay hidden) and verify them live against Midnight, no account needed. Every passport finished on the demo shows up here automatically.
 
-## Example live demo flow
+## Example live demo flow (battery)
 
-Every Demo run produces exactly three on-chain transactions. [BAT-TRY-20260724205823-7A26](https://zkpassport.eu/p/BAT-TRY-20260724205823-7A26) was anchored 2026-07-24 by an anonymous PUBLIC visitor flow: a zero-funded generated wallet, every fee sponsored, finished in 4.1 minutes and independently verified on the public explorer:
+A demo run produces three on-chain transactions (four with the battery second-life act). [BAT-TRY-20260724205823-7A26](https://zkpassport.eu/p/BAT-TRY-20260724205823-7A26) was anchored 2026-07-24 by an anonymous PUBLIC visitor flow: a zero-funded generated wallet, every fee sponsored, finished in 4.1 minutes and independently verified on the public explorer:
 
 | Step | Transaction |
 |---|---|
@@ -49,9 +71,10 @@ Every Demo run produces exactly three on-chain transactions. [BAT-TRY-2026072420
 
 | Doc | Contents |
 |---|---|
-| [docs/producer-flow.md](docs/producer-flow.md) | Step-by-step lifecycle from creation to Second Life: which steps produce transactions and why, re-anchoring and handover, how to read transactions in the explorer, glossary |
-| [docs/producer-walkthrough.md](docs/producer-walkthrough.md) | Producer cockpit with screenshots, tab by tab |
-| [docs/architecture.md](docs/architecture.md) | Layers, data flow, security model, field-bound proof construction, plugin build & deploy |
+| [docs/producer-flow.md](docs/producer-flow.md) | Step-by-step battery lifecycle from creation to Second Life: which steps produce transactions and why, re-anchoring and handover, how to read transactions in the explorer, glossary |
+| [docs/producer-walkthrough.md](docs/producer-walkthrough.md) | Producer cockpit (battery) with screenshots, tab by tab |
+| [docs/architecture.md](docs/architecture.md) | Layers, data flow, security model, product profiles, field-bound proof construction, plugin build & deploy |
+| [docs/public-demo.md](docs/public-demo.md) | Public explorer and "Try it" demo: visitor flow, deployment modes, topology, hardening |
 | [docs/s4-mapping.md](docs/s4-mapping.md) | S/4HANA integration: the goods-receipt bridge, field-by-field Annex XIII mapping, and the sandbox / S/4 Cloud / Event Mesh lanes |
 | [docs/PITCHDECK.pdf](docs/PITCHDECK.pdf) | Pitch deck: problem, market, solution, architecture, traction, go-to-market |
 | [docs/one-pager.md](docs/one-pager.md) | One-pager: problem, product, live proof points, data room |
@@ -74,7 +97,7 @@ Open http://localhost:4004/ for the launchpad.
 | Surface | Path |
 |---|---|
 | Producer cockpit (create, attest, disclose, prove; in-app Lace wallet flow) | `/producer/webapp/index.html` |
-| Consumer passport viewer (3 tiers) | `/passport/webapp/` |
+| Consumer passport viewer (three disclosure levels) | `/passport/webapp/` |
 | Passport Explorer (public, block-explorer style, live verification) | `/explorer/` |
 | BmsSimulatorService (simulated BMS telemetry) | `/api/v1/bms-sim` |
 | ProducerService | `/api/v1/producer` |

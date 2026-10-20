@@ -11,11 +11,7 @@ import { ProofCartError } from '../../srv/lib/chain-lane';
 // their settlement-relevant fields, and the proxy spawns, answers and releases
 // a real worker thread. Chain calls stay live-proven.
 
-const CFG: RemoteLaneConfig = {
-    apiUrl: 'https://api.example', agentToken: 'ngat_x', networkId: 'preprod',
-    indexerHttpUrl: 'https://indexer.example/api/v4/graphql', indexerWsUrl: 'wss://indexer.example/api/v4/graphql/ws',
-    nodeUrl: 'wss://rpc.example'
-};
+const CFG: RemoteLaneConfig = { apiUrl: 'https://api.example', agentToken: 'ngat_x', networkId: 'preprod' };
 const SEED = 'ab'.repeat(64);
 
 describe('lane error serialization', () => {

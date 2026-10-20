@@ -1,15 +1,18 @@
 # NIGHTPASS: Architecture
 
-> EU Battery Regulation 2023/1542 Digital Product Passport with selective
-> disclosure on Midnight (zero-knowledge). NIGHTPASS (`@odatano/passport`) is the
-> consumer application: it builds passports, anchors their integrity hash and a
-> field-commitment root on-chain, and serves three lawful disclosure tiers from
-> one backend.
+> Digital Product Passport with selective disclosure on Midnight
+> (zero-knowledge), for two product families: the EU Battery Regulation
+> 2023/1542 battery passport and the component passport for safety-related
+> parts of regulated plants. NIGHTPASS (`@odatano/passport`) is the consumer
+> application: it builds passports, anchors their integrity hash and a
+> field-commitment root on-chain, and serves three lawful disclosure levels
+> from one backend.
 
 ![Architecture](./architecture.png)
 
-Five sections: the layering, the data flow, the security model, the field-bound
-predicate, and how a consumer pulls the platform in as a CAP plugin.
+Six sections: the layering, the data flow, the security model, the field-bound
+predicate, the product profiles, and how a consumer pulls the platform in as a
+CAP plugin.
 
 ## 1. Three layers
 
@@ -21,7 +24,7 @@ not just batteries.
 |---|---|---|
 | Platform | `@odatano/nightgate` | The Midnight read/write bridge: OData services, indexer, wallet/proof submission, job tracking. Shipped as a CAP plugin. |
 | SDK surface | `@odatano/nightgate` (sub-path exports) | The reusable on-chain primitive, the `attestation-vault` Compact contract, the CDS schema (`midnight.*`), the submission actions, and the browser building blocks (`@odatano/nightgate/browser`). |
-| App | `@odatano/passport` | Battery-domain schema, the producer cockpit and consumer viewer, the tier gating, the QR resolver, the off-chain content-root Merkle builder. This repo. |
+| App | `@odatano/passport` | The product-family schema (battery, component) on top of `@odatano/dpp-sdk` profiles, the producer cockpit and consumer viewer, the disclosure gating, the QR resolver, the off-chain content-root Merkle builder. This repo. |
 
 The app never reaches into the plugin's internals. It configures the plugin via
 `cds.requires.nightgate` and calls it over the documented OData surface
@@ -38,7 +41,8 @@ contract was folded into `attestation-vault`).
 Two write surfaces, one contract, one read surface.
 
 **Write (producer):** the producer cockpit (`app/producer/webapp`, `ProducerService`)
-creates a passport from Annex XIII fields, computes the `blake2b-256` payload hash,
+creates a passport from the family's head fields and detail rows (for a battery
+the Annex XIII fields), computes the `blake2b-256` payload hash,
 AES-encrypts the payload off-chain, and anchors it on-chain. Anchoring runs three
 circuits, batched into ONE transaction with deterministic apply order:
 `attest` (creates the record `recordKey(attesterId, payloadHash)`; since vault
@@ -71,7 +75,7 @@ redirects into the right route.
 Only the payload hash, the `passportId` binding, the content root, disclosure
 commitments and predicate results ever reach the chain. The payload never does.
 
-**Dynamic data ingest (post-market updates).** After the battery is placed on the
+**Dynamic data ingest (post-market updates, battery family).** After the battery is placed on the
 market, its dynamic SoH attributes (capacity fade, remaining capacity, cycle
 counts, and the other Performance-and-Durability telemetry rows) keep changing.
 A BMS or telemetry source pushes updates to `POST /api/v1/passport/telemetry`,
@@ -196,17 +200,22 @@ under a per-passport key derived via HKDF-SHA256 from the app secret
 `iv(12) || authTag(16) || ciphertext`. The on-chain hash lets anyone verify
 integrity; only a key-holder can decrypt.
 
-**Disclosure tiers: the API is the Annex XIII boundary.** Disclosure is enforced
+**Disclosure levels: the API is the boundary.** Disclosure is enforced
 server-side in `srv/passport-service.ts`, not on the chain, by `after READ`
-handlers that strip fields per tier:
+handlers that strip fields per level. The vocabulary (`public` <
+`legitimateInterest` < `authority`) and the redaction rules per product profile
+come from `@odatano/dpp-sdk`; the app maps its roles onto the levels:
 
-- consumer (anonymous): Point 1 public metadata plus QR URL.
-- recycler: plus cell chemistry, capacity, recycled-content shares.
-- authority (superset of recycler): everything, including supplier identities,
-  carbon footprint, diligence docs, and on-chain lineage.
+- public (anonymous): the head fields plus QR URL. Battery: Annex XIII Point 1.
+- legitimateInterest (role `recycler`): plus the profile's children minus
+  supplier identities. Battery: cell chemistry, capacity, recycled-content
+  shares. Component: material certificates and qualification tests.
+- authority (superset): everything, including supplier identities, carbon
+  footprint, diligence docs, inspector ids, the chain of custody, and on-chain
+  lineage.
 
 The gating runs on the service projections, so it cannot be bypassed by a crafted
-`$expand` or a direct entity read. The client UI mirrors the tier for presentation
+`$expand` or a direct entity read. The client UI mirrors the level for presentation
 only; it is never the boundary.
 
 **On-chain tier entitlement.** The `attestation-vault` `disclosures` ACL
@@ -250,8 +259,8 @@ passport's actual field so a verifier knows it came from this passport.
   (`leafHash` / `bytesLeafHash` / `absentLeafHash` / `nodeHash` /
   `descriptorLeafHash` / `slotSalt`), so root and schema id are byte-identical
   to the in-circuit recompute. Builder: `srv/lib/passport-anchor.ts`
-  (`buildContentRoot`, `PROVABLE_FIELDS`), pinned against NIGHTGATE's own
-  document-proof builder by a parity test.
+  (`buildContentRoot(profile, values)` over the profile's panel), pinned
+  against NIGHTGATE's own document-proof builder by a parity test.
 - `proveFieldPredicate(payloadHash, fieldKey, threshold, op)` recomputes the field
   leaf from witnessed value plus inclusion path, folds it to a root, asserts the
   root equals the anchored content root, then asserts the predicate. The tx only
@@ -264,9 +273,11 @@ passport's actual field so a verifier knows it came from this passport.
   the canonical allow-list tree (digest, dedupe, sort, pad to 64 with the last
   member, `setLeafHash` leaves, depth 6). The allow-list itself is published
   with the claim, so any verifier recomputes the set root from the list alone.
-  Named lists live in `srv/lib/claim-sets.ts` (flagship: cell chemistry in the
-  recognized-chemistries list; chemistry is legitimate-interest tier, so the
-  claim discloses membership, never the chemistry). Local root builder:
+  The app catalog (`srv/lib/claim-sets.ts`) collects every family's named
+  lists from `@odatano/dpp-sdk` (battery: the recognized chemistries;
+  component: approved grades, austenitic grades, qualified suppliers, approved
+  NDT methods). The fields are legitimate-interest or authority level, so the
+  claim discloses membership, never the value. Local root builder:
   `srv/lib/membership-set.ts`, pinned to the platform implementation by a
   golden-vector test.
 - Cross-root claims relate TWO anchored versions instead of one field:
@@ -279,11 +290,14 @@ passport's actual field so a verifier knows it came from this passport.
   aborts the batch at local proving, nothing lands; after submit every claim
   is verified individually.
 
-Provable fields cover carbon footprint, capacity, recycled content (overall and
-per material for cobalt / lithium / nickel), cycle life, round-trip efficiency,
-lead content, and cell chemistry (membership). Each numeric field pairs with a
-regulatory or buyer-relevant bound (for example recycled cobalt at least the
-Article 8 minimum).
+Provable fields per family. Battery: carbon footprint, capacity, recycled
+content (overall and per material for cobalt / lithium / nickel), cycle life,
+round-trip efficiency, lead content, and cell chemistry (membership).
+Component: yield strength, tensile strength, hardness, cobalt content, wall
+thickness, and material grade, supplier id and test method (membership). Each
+numeric field pairs with a regulatory or buyer-relevant bound (for example
+recycled cobalt at least the Article 8 minimum, or cobalt content at most a
+contamination limit).
 
 Honest limitation: the content root corresponds to the payload hash because the
 same attester builds both from the same canonical content at anchor time. A fully
@@ -292,7 +306,48 @@ real: after hardening, a producer cannot prove a value unrelated to the anchored
 fields, cannot show different values to different verifiers, and cannot change a
 value without re-anchoring (and a new payload hash).
 
-## 5. Build and deploy: the platform as a CAP plugin
+## 5. Product profiles
+
+A profile is one product family. It binds a `ProductProfile` from
+`@odatano/dpp-sdk` (payload children with their columns, sort order and access
+rules; the provable fields and where each is sourced) to the app's own child
+tables and membership catalog (`srv/lib/product-profiles.ts`, `APP_PROFILES`).
+
+| Family | dpp-sdk profile | Child tables | Claim sets |
+|---|---|---|---|
+| `battery` | `BATTERY_PROFILE` | `Batteries`, `RecycledMaterials`, `DiligenceDoc` | `BATTERY_CLAIM_SETS` |
+| `component` | `COMPONENT_PROFILE` | `MaterialCertificates`, `QualificationTests`, `CustodyRecords` | `COMPONENT_CLAIM_SETS` |
+
+- **`Passports.profile`** names the family of a row (default `battery`; rows
+  from before the column existed are batteries). A passport fills the children
+  of its profile; the others stay empty. Every family shares the head columns
+  (`passportId`, `model`, `manufacturerId`, `weightKg`, ...) and the attribute
+  rows; the component family keeps its safety class and status as public
+  attribute rows.
+- **Payload**: `projectPayload(profile, rows)` builds the canonical payload
+  from the profile's children plus the attribute rows; the hash, cipher and
+  wire format do not depend on the family.
+- **Content tree**: the profile's panel (`panelOf(profile)`) is the ordered
+  slot list of the Merkle tree, so the schema id is per family and a claim on
+  one family's field cannot be read against another's. The battery panel and
+  the component panel each fit the 16-slot tree.
+- **Redaction**: `redactRow(profile, row, level)` strips the head row;
+  `redactChildRow(spec, row, level)` strips each child per its spec
+  (`minLevel`, for the chain of custody `authority`; `authorityColumns`, for
+  supplier and inspector identities). The service registers one `before` and
+  one `after READ` handler per child entity of every family.
+- **Membership catalog**: `ALL_CLAIM_SETS` unions the families' allow-lists;
+  set ids are unique across families, so a claim's `setId` identifies the
+  list without the family.
+- **Demo catalog** (`srv/lib/demo-claims.ts`): per family the public head
+  fields, the provable values with their directions and bounds, the primary
+  claim and whether a second-life act exists. `demoProfiles()` and
+  `demoClaimFields(profile)` serve it to the "Try it" page.
+
+The producer cockpit, the BMS simulator, the DPP Life Cycle API and the
+Catena-X export serve the battery family.
+
+## 6. Build and deploy: the platform as a CAP plugin
 
 A consumer app needs no glue code. CAP discovers the plugin and merges its CDS.
 
@@ -348,8 +403,9 @@ offline path (hash, encrypt, persist, QR, local log rows) still runs.
 
 ### At a glance
 
-- Services: `ProducerService` (`/api/v1/producer`), `PassportService` (`/api/v1/passport`), `NightgateService` (`/api/v1/nightgate`).
+- Services: `ProducerService` (`/api/v1/producer`), `PassportService` (`/api/v1/passport`), `NightgateService` (`/api/v1/nightgate`), `DemoService` (`/api/v1/demo`, only with `DEMO_ENABLED=true`).
+- Families: `battery` and `component`, one `Passports.profile` per row, profiles from `@odatano/dpp-sdk`.
 - Contract: one `attestation-vault` (plugin-shipped): tiered disclosure, passport binding, numeric predicate, and field-bound predicate.
 - Crypto: blake2b-256 integrity hash, AES-256-GCM + HKDF-SHA256 payload encryption, salted Merkle content root (the contract's transient hash), ZK-proof authorization.
-- UI: producer cockpit (with in-app Lace wallet flow), consumer viewer (three tiers), QR resolver at `/p/:passportId`.
+- UI: producer cockpit (battery, with in-app Lace wallet flow), consumer viewer (three disclosure levels), public explorer, "Try it" demo, QR resolver at `/p/:passportId`.
 - Chain: Midnight (preprod): public metadata, hash, binding, content root, disclosure and predicate results only.

@@ -1,11 +1,23 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-    allowedMaskFor, fieldsFromMask, describeMask, slotOf,
-    provableValuesFromPayload, slotsEqual, firstUnmaskedDifference,
-    REAL_SLOT_COUNT, SLOT_COUNT,
+    allowedMaskFor as allowedMaskForProfile, fieldsFromMask as fieldsFromMaskOf, describeMask as describeMaskOf,
+    slotOf as slotOfProfile, provableValues, slotsEqual, firstUnmaskedDifference as firstUnmaskedDifferenceOf,
+    realSlotCount, SLOT_COUNT,
 } from '../../srv/lib/version-integrity';
-import { PROVABLE_FIELDS, encryptPayload, decryptPayload } from '../../srv/lib/passport-anchor';
+import { encryptPayload, decryptPayload } from '../../srv/lib/passport-anchor';
+import { BATTERY_PROFILE, BATTERY_PANEL } from '@odatano/dpp-sdk/battery/profile';
+
+// Every helper takes the product profile; the battery profile is pinned here.
+const PROVABLE_FIELDS = BATTERY_PANEL;
+const REAL_SLOT_COUNT = realSlotCount(BATTERY_PROFILE);
+const allowedMaskFor = (fields?: readonly string[]) => allowedMaskForProfile(BATTERY_PROFILE, fields);
+const fieldsFromMask = (mask: number) => fieldsFromMaskOf(BATTERY_PROFILE, mask);
+const describeMask = (mask: number) => describeMaskOf(BATTERY_PROFILE, mask);
+const slotOf = (field: string) => slotOfProfile(BATTERY_PROFILE, field);
+const firstUnmaskedDifference = (a: Parameters<typeof firstUnmaskedDifferenceOf>[1], b: Parameters<typeof firstUnmaskedDifferenceOf>[2], mask: number) =>
+    firstUnmaskedDifferenceOf(BATTERY_PROFILE, a, b, mask);
+const provableValuesFromPayload = (payload: unknown) => provableValues(BATTERY_PROFILE, payload);
 
 // The mask IS the claim: "these slots may differ, every other slot holds the
 // same value". A wrong bit does not fail loudly, it silently states something

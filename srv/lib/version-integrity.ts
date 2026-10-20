@@ -8,8 +8,8 @@
  * unrelated: nobody can tell whether the operator only appended a telemetry
  * reading or quietly rewrote the carbon footprint.
  *
- * NIGHTGATE 0.16.0's `proveDocumentComparison` (mode 0, integrity) closes that
- * gap. It witnesses BOTH versions' openings plus the shared schema, recomputes
+ * The vault's `proveDocumentComparison` (mode 0, integrity) closes that gap.
+ * It witnesses BOTH versions' openings plus the shared schema, recomputes
  * both content roots in-circuit, asserts them against the anchors and then
  * asserts that every slot OUTSIDE a public 16-bit mask holds the same value.
  * The values stay hidden; only "changed / did not change, per slot" is proven.
@@ -19,23 +19,25 @@
  *     the payload hash moved, but every proven spec is identical);
  *   - a mask naming `recycledContentPct` = "only that figure was corrected".
  *
- * Slot order is the provable-field registry (PROVABLE_FIELDS); bit i frees
- * slot i. Padding slots are never freed: they are absent in both documents and
- * therefore equal anyway.
+ * Slot order is the profile's panel; bit i frees slot i. Padding slots are
+ * never freed: they are absent in both documents and therefore equal anyway.
  */
 
-import { PROVABLE_FIELDS, MERKLE_DEPTH, provableFieldKind } from './passport-anchor';
+import { collectFieldValues, panelOf, fieldKindOf, type ProductProfile, type ProfileRows } from '@odatano/dpp-sdk/profile';
+import { MERKLE_DEPTH } from './passport-anchor';
 import { decodeDynamicValue } from './attribute-update';
 
 /** Slots in the content tree (16 for a depth-4 tree). */
 export const SLOT_COUNT = 1 << MERKLE_DEPTH;
 
 /** Slots backed by a real provable field; the rest is canonical padding. */
-export const REAL_SLOT_COUNT = PROVABLE_FIELDS.length;
+export function realSlotCount(profile: ProductProfile): number {
+    return panelOf(profile).length;
+}
 
 /** Slot index of a provable field, or -1. */
-export function slotOf(fieldName: string): number {
-    return (PROVABLE_FIELDS as readonly string[]).indexOf(fieldName);
+export function slotOf(profile: ProductProfile, fieldName: string): number {
+    return panelOf(profile).indexOf(fieldName);
 }
 
 /**
@@ -44,34 +46,36 @@ export function slotOf(fieldName: string): number {
  * claim's meaning in the safe-looking direction (fewer freed slots) but leave
  * the operator believing a change was covered.
  */
-export function allowedMaskFor(fieldNames: readonly string[] = []): number {
+export function allowedMaskFor(profile: ProductProfile, fieldNames: readonly string[] = []): number {
     let mask = 0;
     for (const name of fieldNames) {
-        const idx = slotOf(String(name));
+        const idx = slotOf(profile, String(name));
         if (idx < 0) throw new Error(`'${name}' is not a provable field, so it has no slot to free`);
         mask |= (1 << idx);
     }
     // Mirrors the in-circuit guard: a mask that frees every REAL slot states
     // nothing at all ("everything may differ"). Rejecting here saves the
     // operator a proving run that ends in an opaque circuit abort.
-    if (REAL_SLOT_COUNT > 0 && (mask & ((1 << REAL_SLOT_COUNT) - 1)) === ((1 << REAL_SLOT_COUNT) - 1)) {
+    const real = realSlotCount(profile);
+    if (real > 0 && (mask & ((1 << real) - 1)) === ((1 << real) - 1)) {
         throw new Error('an allowed mask that frees every provable field claims nothing; constrain at least one field');
     }
     return mask;
 }
 
 /** The field names a mask frees, in slot order (the human form of the claim). */
-export function fieldsFromMask(mask: number): string[] {
+export function fieldsFromMask(profile: ProductProfile, mask: number): string[] {
+    const panel = panelOf(profile);
     const out: string[] = [];
-    for (let i = 0; i < REAL_SLOT_COUNT; i++) {
-        if (mask & (1 << i)) out.push(PROVABLE_FIELDS[i]);
+    for (let i = 0; i < panel.length; i++) {
+        if (mask & (1 << i)) out.push(panel[i]);
     }
     return out;
 }
 
 /** One-line description of what a mask claims, for logs and the cockpit. */
-export function describeMask(mask: number): string {
-    const freed = fieldsFromMask(mask);
+export function describeMask(profile: ProductProfile, mask: number): string {
+    const freed = fieldsFromMask(profile, mask);
     return freed.length === 0
         ? 'no provable field changed'
         : `only ${freed.join(', ')} may have changed`;
@@ -110,13 +114,15 @@ export interface SlotOpeningLike {
  * entirely on the circuit.
  */
 export function firstUnmaskedDifference(
+    profile: ProductProfile,
     slotsA: readonly SlotOpeningLike[],
     slotsB: readonly SlotOpeningLike[],
     mask: number
 ): string | null {
-    for (let i = 0; i < REAL_SLOT_COUNT; i++) {
+    const panel = panelOf(profile);
+    for (let i = 0; i < panel.length; i++) {
         if (mask & (1 << i)) continue;
-        if (!slotsEqual(slotsA[i], slotsB[i])) return PROVABLE_FIELDS[i];
+        if (!slotsEqual(slotsA[i], slotsB[i])) return panel[i];
     }
     return null;
 }
@@ -129,55 +135,39 @@ export function firstUnmaskedDifference(
  * both documents.
  */
 export function countChangedSlots(
+    profile: ProductProfile,
     slotsA: readonly SlotOpeningLike[],
     slotsB: readonly SlotOpeningLike[]
 ): number {
     let n = 0;
-    for (let i = 0; i < REAL_SLOT_COUNT; i++) {
+    for (let i = 0; i < realSlotCount(profile); i++) {
         if (!slotsEqual(slotsA[i], slotsB[i])) n++;
     }
     return n;
 }
 
 /**
- * The provable field values of an ARCHIVED version, read from its decrypted
- * canonical payload.
- *
- * Deliberately a mirror of the producer service's `fieldValuesFor`, which
- * reads the CURRENT rows: an archived version's older values survive nowhere
- * else. Both must extract the same fields the same way, or the rebuilt root of
- * version N-1 would not match what was anchored back then and the comparison
- * would fail with no useful message. The anchored root is the tripwire: the
- * caller rebuilds and compares before it proves anything.
+ * The provable field values of a passport, from its rows or from a decrypted
+ * canonical payload (both carry the same child keys). Sourced fields come
+ * from the children; measured fields (no source) ride in the attribute rows,
+ * decoded back to their scalar. The ONE extraction for the live path and for
+ * archived versions, so a rebuilt tree lands on the root that was anchored.
  */
-export function provableValuesFromPayload(payload: unknown): Record<string, number | string> {
-    const out: Record<string, number | string> = {};
-    const doc = (payload ?? {}) as Record<string, unknown>;
-    const battery = (Array.isArray(doc.batteries) ? doc.batteries[0] : undefined) as Record<string, unknown> | undefined;
-    if (battery) {
-        for (const field of PROVABLE_FIELDS) {
-            const v = battery[field];
-            if (v == null || v === '') continue;
-            out[field] = provableFieldKind(field) === 'string' ? String(v) : Number(v);
-        }
-    }
-    const recycled = Array.isArray(doc.recycledMaterials) ? doc.recycledMaterials : [];
-    for (const entry of recycled as Record<string, unknown>[]) {
-        const material = entry?.material;
-        const pct = entry?.recycledPercentage;
-        if (!material || pct == null) continue;
-        const field = `recycled${String(material)}Pct`;
-        if (slotOf(field) >= 0) out[field] = Number(pct);
-    }
-    // Dynamic (measured) slots ride in the payload's guide attribute list.
-    // Same decoder as the live path, so an archived version rebuilds to the
-    // root it was anchored under.
+export function provableValues(profile: ProductProfile, rowsOrPayload: unknown): Record<string, number | string> {
+    const doc = (rowsOrPayload && typeof rowsOrPayload === 'object' ? rowsOrPayload : {}) as ProfileRows;
+    const measured: Record<string, number> = {};
     const attributes = Array.isArray(doc.attributes) ? doc.attributes : [];
-    for (const entry of attributes as Record<string, unknown>[]) {
-        const attribute = String(entry?.attribute ?? '');
-        if (slotOf(attribute) < 0) continue;
-        const n = decodeDynamicValue(attribute, entry?.valueJson);
-        if (n != null) out[attribute] = n;
+    for (const f of profile.provableFields) {
+        if (f.source) continue;
+        const row = attributes.find((a) => String((a as { attribute?: unknown })?.attribute ?? '') === f.name);
+        if (!row) continue;
+        const n = decodeDynamicValue(f.name, (row as { valueJson?: unknown }).valueJson);
+        if (n != null) measured[f.name] = n;
+    }
+    const raw = collectFieldValues(profile, doc, measured);
+    const out: Record<string, number | string> = {};
+    for (const [field, v] of Object.entries(raw)) {
+        out[field] = fieldKindOf(profile, field) === 'string' ? String(v) : Number(v);
     }
     return out;
 }

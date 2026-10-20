@@ -88,9 +88,16 @@ try {
   check('fresh wallet identity shown (mn_addr_...)', night.startsWith('mn_addr_'));
   await page.screenshot({ path: join(OUT, 'demo-form.png') });
 
+  console.log('== pick the battery family ==');
+  await page.locator('.family-tile[data-profile="battery"]').click();
+  await page.locator('#fHead-model').waitFor({ timeout: 15000 });
+  await page.waitForFunction(() => !document.getElementById('btnCreate').disabled, { timeout: 15000 });
+  check('battery tile selected', await page.locator('.family-tile[data-profile="battery"].selected').count() === 1);
+  check('second-life block offered for batteries', !(await page.locator('#secondLifeBlock').isHidden()));
+
   console.log('== submit passport ==');
-  await page.locator('#fModel').fill('UISmoke EV-1');
-  await page.locator('#fManufacturer').fill('SmokeWorks');
+  await page.locator('#fHead-model').fill('UISmoke EV-1');
+  await page.locator('#fHead-manufacturerId').fill('SmokeWorks');
   await page.locator('#passportForm button[type=submit]').click();
   await page.locator('#viewRun:not([hidden])').waitFor({ timeout: 30000 });
   const pid = await page.locator('#runPassportId').textContent();
@@ -116,7 +123,7 @@ try {
   const ok = (k, s) => steps.find((x) => x.kind === k)?.status === s;
   check('timeline: sync succeeded', ok('sync', 'succeeded'));
   check('timeline: attest succeeded with tx', ok('attest', 'succeeded'));
-  check('timeline: bindPassport succeeded', ok('bindPassport', 'succeeded'));
+  check('timeline: bindDocument succeeded', ok('bindDocument', 'succeeded'));
   check('timeline: anchorContentRoot succeeded', ok('anchorContentRoot', 'succeeded'));
   check('timeline: provePredicate succeeded', ok('provePredicate', 'succeeded'));
   check('timeline: publish skipped (no publish env in the test)', ok('publish', 'skipped'));

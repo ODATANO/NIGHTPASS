@@ -1,7 +1,7 @@
 {
   "name": "@odatano/passport",
   "version": "0.1.0",
-  "description": "NIGHTPASS is an EU Battery Regulation 2023/1542 Digital Product Passport (Midnight ZK) consumer app. It consumes @odatano/nightgate as a CAP plugin.",
+  "description": "NIGHTPASS is a Digital Product Passport consumer app on Midnight (ZK): EU battery passports and component passports for safety-related plant parts. It consumes @odatano/nightgate as a CAP plugin.",
   "private": true,
   "author": "ODATANO",
   "repository": {
@@ -11,9 +11,9 @@
   "dependencies": {
     "@cap-js/postgres": "^3",
     "@odatano/brand": "^1.0.0",
-    "@odatano/dpp-sdk": "^0.1.0",
+    "@odatano/dpp-sdk": "^0.4.0",
     "@odatano/nightgate": "^0.24.1",
-    "@odatano/nightgate-tx": "^0.6.0",
+    "@odatano/nightgate-tx": "^0.14.1",
     "@sap/cds": "^10",
     "animejs": "^4.5.0",
     "express": "^4",

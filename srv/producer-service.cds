@@ -33,6 +33,9 @@ service ProducerService {
     entity Batteries            as projection on passport.Batteries;
     entity RecycledMaterials    as projection on passport.RecycledMaterials;
     entity DiligenceDoc         as projection on passport.DiligenceDoc;
+    entity MaterialCertificates as projection on passport.MaterialCertificates;
+    entity QualificationTests   as projection on passport.QualificationTests;
+    entity CustodyRecords       as projection on passport.CustodyRecords;
     entity PassportAttributes   as projection on passport.PassportAttributes;
 
     // Version history of dynamic attribute values (append-only; written by

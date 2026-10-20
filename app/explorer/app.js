@@ -156,6 +156,32 @@ var API = "/api/v1/passport";
     return '<button class="copy" data-copy="' + esc(value) + '" title="Copy">&#10697;</button>';
   }
 
+  // ---------- product families ----------
+
+  var FAMILY_LABELS = { battery: "Battery", component: "Component" };
+
+  /** The family of a row; rows from before the column existed are batteries. */
+  function familyOf(row) {
+    return row.profile || "battery";
+  }
+  function familyLabel(row) {
+    var id = familyOf(row);
+    return FAMILY_LABELS[id] || id;
+  }
+  function familyChip(row) {
+    var id = familyOf(row);
+    return '<span class="fam-chip fam-' + esc(id) + '">' + esc(familyLabel(row)) + "</span>";
+  }
+  /** A public attribute row's value (valueJson is a JSON-encoded string; raw text as fallback). */
+  function attributeValue(row, name) {
+    var hit = (row.attributes || []).find(function (a) { return a.attribute === name; });
+    if (!hit) return "";
+    try {
+      var v = JSON.parse(hit.valueJson);
+      return v == null ? "" : String(v);
+    } catch (e) { return String(hit.valueJson || ""); }
+  }
+
   // ---------- proven ZK claims ----------
 
   var CLAIM_FIELD_LABELS = {
@@ -168,7 +194,15 @@ var API = "/api/v1/passport";
     recycledCoPct: "Recycled cobalt share",
     recycledLiPct: "Recycled lithium share",
     recycledNiPct: "Recycled nickel share",
-    cellChemistry: "Cell chemistry"
+    cellChemistry: "Cell chemistry",
+    cobaltContentPpm: "Cobalt content",
+    yieldStrengthMpa: "Yield strength",
+    hardnessHb: "Hardness",
+    wallThicknessMm: "Wall thickness",
+    tensileStrengthMpa: "Tensile strength",
+    materialGrade: "Material grade",
+    supplierId: "Supplier",
+    testMethod: "Test method"
   };
 
   function claimLabel(field) {
@@ -294,7 +328,7 @@ var API = "/api/v1/passport";
     var q = state.query.trim().toLowerCase();
     var all = ownRows();
     return !q ? all : all.filter(function (r) {
-      return [r.passportId, r.model, r.payloadHash, r.attestationTxHash, r.status]
+      return [r.passportId, r.model, r.payloadHash, r.attestationTxHash, r.status, familyLabel(r)]
         .some(function (v) { return String(v || "").toLowerCase().indexOf(q) >= 0; });
     });
   }
@@ -341,8 +375,9 @@ var API = "/api/v1/passport";
     var share = rows.length ? anchored / rows.length : 0;
     return '<section class="hero">' +
       '<div class="hero-copy">' +
-        "<h1>Every battery.<br/><em>Anchored on Midnight.</em></h1>" +
-        '<p class="hero-sub">EU battery passports, hash-anchored in a zero-knowledge attestation vault on Midnight ' +
+        "<h1>Every product.<br/><em>Anchored on Midnight.</em></h1>" +
+        '<p class="hero-sub">Digital product passports for EV batteries and safety-related plant components, ' +
+          "hash-anchored in a zero-knowledge attestation vault on Midnight " +
           esc(state.network || "") + ". Verify any of them against the ledger. Live, right here, no account.</p>" +
       "</div>" +
       '<div class="hero-ring" id="heroRing">' + ringSvg(share) +
@@ -412,7 +447,7 @@ var API = "/api/v1/passport";
       : "";
     return "<tr data-pid=\"" + pid + "\">" +
       '<td class="mono"><a href="#/p/' + encodeURIComponent(row.passportId) + '">' + pid + "</a>" +
-        '<div class="sub">' + esc(row.model || "") + "</div></td>" +
+        '<div class="sub">' + familyChip(row) + esc(row.model || "") + "</div></td>" +
       "<td>" + chip(row.status) + claimsBadge(row) + "</td>" +
       '<td class="mono" title="' + esc(row.payloadHash || "") + '">' + esc(shortHash(row.payloadHash)) + "</td>" +
       '<td class="mono">' + (row.explorerUrl
@@ -542,6 +577,36 @@ var API = "/api/v1/passport";
     return "<div>" + esc(label) + "</div><div>" + (valueHtml || "&ndash;") + "</div>";
   }
 
+  /** "Public product information" panel, rendered per product family. */
+  function productPanelHtml(row) {
+    var urlRow = kv("Passport URL", row.qrCodeUrl
+      ? '<a href="' + esc(row.qrCodeUrl) + '" target="_blank" rel="noopener" class="mono">' + esc(row.qrCodeUrl) + "</a>"
+      : "");
+    var badge, rows;
+    if (familyOf(row) === "component") {
+      badge = '<span class="net" title="Safety-related plant component">Component passport</span>';
+      rows =
+        kv("Designation", esc(row.model)) +
+        kv("Manufacturer", esc(row.manufacturerId)) +
+        kv("Manufacture date", row.manufactureDate ? esc(row.manufactureDate) : "") +
+        kv("Mass (kg)", row.weightKg != null ? esc(String(row.weightKg)) : "") +
+        kv("Safety class", esc(attributeValue(row, "SafetyClass"))) +
+        kv("Component status", esc(attributeValue(row, "ComponentStatus")));
+    } else {
+      badge = '<span class="net" title="EU Battery Regulation 2023/1542">Annex XIII &middot; Point 1</span>';
+      rows =
+        kv("Model", esc(row.model) + (row.batteryCategory ? ' <span class="sub">(' + esc(row.batteryCategory) + ")</span>" : "")) +
+        kv("Manufacturer", esc(row.manufacturerId)) +
+        kv("Manufacture date", row.manufactureDate ? esc(row.manufactureDate) : "") +
+        kv("Weight (kg)", row.weightKg != null ? esc(String(row.weightKg)) : "") +
+        kv("Performance class", row.performanceClass ? esc(row.performanceClass) : "");
+    }
+    return '<section class="panel">' +
+      '<div class="panel-head"><h2>Public product information</h2>' + badge + "</div>" +
+      '<div class="kv">' + rows + urlRow + "</div>" +
+      "</section>";
+  }
+
   /** "Proven claims" panel: one badge per ZK-proven predicate. The exact value
    * never appears; only the claim, its bound and the on-chain proof tx. Each
    * claim can be LIVE-verified against the vault's ledger state (button). */
@@ -668,23 +733,10 @@ var API = "/api/v1/passport";
       '" target="_blank" rel="noopener">Open in Passport Viewer</a>';
     app.innerHTML =
       '<div class="crumbs"><a href="#/">&larr; All passports</a></div>' +
-      '<div class="detail-head"><h1>' + esc(row.passportId) + "</h1>" + chip(row.status) + netBadge(row.anchorNetwork) + "</div>" +
+      '<div class="detail-head"><h1>' + esc(row.passportId) + "</h1>" + familyChip(row) + chip(row.status) + netBadge(row.anchorNetwork) + "</div>" +
       '<div class="detail-grid">' +
         '<div class="col">' +
-        '<section class="panel">' +
-          '<div class="panel-head"><h2>Public product information</h2>' +
-            '<span class="net" title="EU Battery Regulation 2023/1542">Annex XIII &middot; Point 1</span></div>' +
-          '<div class="kv">' +
-            kv("Model", esc(row.model) + (row.batteryCategory ? ' <span class="sub">(' + esc(row.batteryCategory) + ")</span>" : "")) +
-            kv("Manufacturer", esc(row.manufacturerId)) +
-            kv("Manufacture date", row.manufactureDate ? esc(row.manufactureDate) : "") +
-            kv("Weight (kg)", row.weightKg != null ? esc(String(row.weightKg)) : "") +
-            kv("Performance class", row.performanceClass ? esc(row.performanceClass) : "") +
-            kv("Passport URL", row.qrCodeUrl
-              ? '<a href="' + esc(row.qrCodeUrl) + '" target="_blank" rel="noopener" class="mono">' + esc(row.qrCodeUrl) + "</a>"
-              : "") +
-          "</div>" +
-        "</section>" +
+        productPanelHtml(row) +
         '<section class="panel">' +
           '<div class="panel-head"><h2>On-chain anchor</h2>' +
             '<div class="actions"><button class="btn primary" id="verifyBtn"' + (canVerify ? "" : " disabled") + ">Verify on Midnight</button></div></div>" +

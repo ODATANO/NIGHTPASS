@@ -1,8 +1,8 @@
 /**
  * "Try it" live demo: anonymous, tightly capped public surface. A visitor
- * gets a fresh zero-funded server-side wallet, creates a 5-field passport
- * (CO2 confidential + provable) and the platform sponsor wallet pays every
- * on-chain fee (NIGHTGATE 0.8.0 per-tx sponsoring).
+ * picks a product family, gets a fresh zero-funded identity, creates a small
+ * passport with a few public head fields and confidential provable values,
+ * and the hosted sponsor pays every on-chain fee.
  *
  * No entities are exposed on purpose: tester rows carry encrypted wallet
  * secrets. The UI talks only to these actions, authorized by the opaque
@@ -18,25 +18,19 @@ service DemoService @(path: '/api/v1/demo', requires: 'any') {
     };
 
     /**
-     * Create + anchor the demo passport (queued; poll demoRunStatus).
-     * co2Kg stays confidential; the run proves co2Kg <= proveThreshold
-     * on-chain without revealing the value.
+     * Create + anchor the demo passport (queued; poll demoRunStatus). The
+     * head values are public; every claimed value stays confidential and is
+     * proven on-chain without being revealed.
      */
     action createDemoPassport(
-        testerId         : String,
-        model            : String,
-        manufacturer     : String,
-        weightKg         : Decimal,
-        performanceClass : String,    // A to E, public on the explorer
-        co2Kg            : Decimal,   // confidential, never published
-        proveThreshold   : Decimal,   // public claim bound (kg CO2)
-        secondLife       : Boolean,   // optional bonus act: age + repurpose = second anchor version
-        // Optional extra claims, JSON array of { field, value, threshold }
-        // (numeric) or { field, member } (membership). Fields come from
-        // demoClaimFields(); every value stays confidential and all claims
-        // are proven in ONE transaction together with the carbon footprint
-        // above.
-        claimsJson       : LargeString
+        testerId   : String,
+        profile    : String,       // product family from demoProfiles(); default battery
+        headJson   : LargeString,  // JSON object of the family's head fields (demoProfiles().headJson)
+        // JSON array of { field, value, threshold } (numeric) or { field, member }
+        // (membership). Fields come from demoClaimFields(profile); the family's
+        // primary claim is required. All claims are proven in ONE transaction.
+        claimsJson : LargeString,
+        secondLife : Boolean       // battery only: age + repurpose = second anchor version
     ) returns {
         runId         : UUID;
         passportId    : String;
@@ -71,12 +65,28 @@ service DemoService @(path: '/api/v1/demo', requires: 'any') {
     };
 
     /**
-     * The confidential values a visitor can prove, so the form builds itself
-     * from the server's catalogue instead of hard-coding fields and bounds.
-     * The carbon footprint is always proven; the rest are optional and ride in
-     * the same transaction.
+     * The product families a visitor can pick, with the public head fields of
+     * each (JSON array of { name, label, kind, target, options, defaultValue,
+     * min, max, hint }). Static, DB-free.
      */
-    function demoClaimFields() returns array of {
+    function demoProfiles() returns array of {
+        id           : String;
+        label        : String;
+        tagline      : String;
+        regulation   : String;
+        idPrefix     : String;
+        primaryField : String;
+        secondLife   : Boolean;
+        headJson     : LargeString;
+    };
+
+    /**
+     * The confidential values a visitor can prove for one family, so the form
+     * builds itself from the server's catalogue instead of hard-coding fields
+     * and bounds. The primary claim is always proven; the rest are optional
+     * and ride in the same transaction.
+     */
+    function demoClaimFields(profile: String) returns array of {
         field            : String;
         label            : String;
         kind             : String;  // numeric | membership
@@ -92,7 +102,7 @@ service DemoService @(path: '/api/v1/demo', requires: 'any') {
         setLabel         : String;
         optionsJson      : LargeString; // JSON array of the allow-list values
         defaultOption    : String;
-        primary          : Boolean; // always proven, driven by the co2 inputs
+        primary          : Boolean; // the family's always-proven claim
     };
 
     /**

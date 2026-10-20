@@ -1,34 +1,25 @@
 /**
  * Pure input validation for the "Try it" demo (unit-testable, no CAP).
  *
- * The model and manufacturer strings become PUBLIC explorer content, so the
- * charset is deliberately narrow. Numbers are bounded to plausible battery
- * ranges. The claim must be TRUE (co2Kg <= proveThreshold): the demo's point
- * is a succeeding proof, and the ledger would reject a false one anyway,
- * which reads as a confusing failure to a visitor.
+ * Head text becomes PUBLIC explorer content, so the charset is deliberately
+ * narrow; numbers are bounded to the catalog's plausible ranges. Every claim
+ * must be TRUE: the demo's point is a succeeding proof, and the ledger would
+ * reject a false one anyway, which reads as a confusing failure to a visitor.
  */
 
+import { demoProfile, validateClaims, HEAD_TEXT_PATTERN, type DemoClaim, type DemoProfileSpec } from './demo-claims';
+
 export interface DemoInput {
-    model: string;
-    manufacturer: string;
-    weightKg: number;
-    /** Public Annex XIII Point 1 field, shown on the explorer. A to E. */
-    performanceClass: string;
-    co2Kg: number;
-    proveThreshold: number;
+    profile: DemoProfileSpec;
+    /** Head values by field name, text and select as strings, numbers as numbers. */
+    head: Record<string, string | number>;
+    /** The claims to prove, primary included. All ride in ONE transaction. */
+    claims: DemoClaim[];
     /**
-     * Optional second act: age the battery (telemetry) and repurpose it,
-     * which re-anchors the passport as a second on-chain version. One more
-     * sponsored transaction and one or two extra minutes.
+     * Optional second act (battery only): age the battery (telemetry) and
+     * repurpose it, which re-anchors the passport as a second on-chain version.
      */
     secondLife: boolean;
-    /**
-     * Extra confidential values to prove alongside the carbon footprint. All
-     * of them ride in ONE transaction, so a visitor pays one wait for any
-     * number of claims. The footprint claim is always present (built from
-     * co2Kg/proveThreshold) and never appears here twice.
-     */
-    extraClaims: DemoClaim[];
 }
 
 export interface DemoValidation {
@@ -37,51 +28,44 @@ export interface DemoValidation {
     value?: DemoInput;
 }
 
-import { validateClaims, PRIMARY_CLAIM_FIELD, type DemoClaim } from './demo-claims';
-
-const TEXT_RE = /^[A-Za-z0-9 ._\-]{2,40}$/;
-
-function num(raw: unknown): number {
-    const n = Number(raw);
-    return Number.isFinite(n) ? n : NaN;
-}
-
 export function validateDemoInput(raw: Record<string, unknown>): DemoValidation {
     const errors: string[] = [];
 
-    const model = String(raw.model ?? '').trim();
-    const manufacturer = String(raw.manufacturer ?? '').trim();
-    if (!TEXT_RE.test(model)) errors.push('model: 2-40 chars, letters/digits/space/._- only');
-    if (!TEXT_RE.test(manufacturer)) errors.push('manufacturer: 2-40 chars, letters/digits/space/._- only');
+    let profile: DemoProfileSpec;
+    try { profile = demoProfile(raw.profile); } catch (e) { return { ok: false, errors: [(e as Error).message] }; }
 
-    const weightKg = num(raw.weightKg);
-    if (!(weightKg >= 1 && weightKg <= 5000)) errors.push('weightKg: 1 to 5000');
-    const performanceClass = String(raw.performanceClass ?? '').trim().toUpperCase();
-    if (!/^[A-E]$/.test(performanceClass)) errors.push('performanceClass: one of A, B, C, D, E');
-    const co2Kg = num(raw.co2Kg);
-    if (!(co2Kg >= 1 && co2Kg <= 100000)) errors.push('co2Kg: 1 to 100000');
-    const proveThreshold = num(raw.proveThreshold);
-    if (!(proveThreshold >= 1 && proveThreshold <= 200000)) errors.push('proveThreshold: 1 to 200000');
-    if (Number.isFinite(co2Kg) && Number.isFinite(proveThreshold) && co2Kg > proveThreshold) {
-        errors.push('proveThreshold must be >= co2Kg (the demo proves a TRUE claim)');
+    const headRaw = (raw.head && typeof raw.head === 'object' ? raw.head : {}) as Record<string, unknown>;
+    const head: Record<string, string | number> = {};
+    for (const f of profile.head) {
+        const v = headRaw[f.name];
+        if (f.kind === 'number') {
+            const n = Number(v);
+            if (!(Number.isFinite(n) && n >= (f.min ?? -Infinity) && n <= (f.max ?? Infinity))) {
+                errors.push(`${f.name}: ${f.min} to ${f.max}`);
+                continue;
+            }
+            head[f.name] = n;
+        } else if (f.kind === 'select') {
+            const s = String(v ?? '').trim();
+            const option = (f.options ?? []).find((o) => o.toLowerCase() === s.toLowerCase());
+            if (option === undefined) { errors.push(`${f.name}: one of ${(f.options ?? []).join(', ')}`); continue; }
+            head[f.name] = option;
+        } else {
+            const s = String(v ?? '').trim();
+            const re = new RegExp(`^(?:${f.pattern ?? HEAD_TEXT_PATTERN})$`);
+            if (!re.test(s)) { errors.push(`${f.name}: 2-40 chars, letters/digits/space/._- only`); continue; }
+            head[f.name] = s;
+        }
     }
+
+    const claimCheck = validateClaims(profile, raw.claims);
+    errors.push(...claimCheck.errors);
 
     const secondLife = raw.secondLife === true || raw.secondLife === 'true';
-
-    // Extra claims are optional; the footprint claim always comes from
-    // co2Kg/proveThreshold above, so a duplicate of it here is rejected.
-    const claimCheck = validateClaims(raw.claims);
-    errors.push(...claimCheck.errors);
-    const extraClaims = claimCheck.claims.filter((c) => c.field !== PRIMARY_CLAIM_FIELD);
-    if (claimCheck.claims.length !== extraClaims.length) {
-        errors.push(`${PRIMARY_CLAIM_FIELD} is proven from co2Kg/proveThreshold, do not repeat it in claims`);
-    }
+    if (secondLife && !profile.secondLife) errors.push(`secondLife is not offered for ${profile.label.toLowerCase()}s`);
 
     if (errors.length) return { ok: false, errors };
-    return {
-        ok: true, errors,
-        value: { model, manufacturer, weightKg, performanceClass, co2Kg, proveThreshold, secondLife, extraClaims }
-    };
+    return { ok: true, errors, value: { profile, head, claims: claimCheck.claims, secondLife } };
 }
 
 export function validNickname(raw: unknown): string | null {

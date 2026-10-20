@@ -29,7 +29,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {
     goodsReceiptItems, materialDocumentToPassportInput, toCloudEvent,
-    signErpEventBody, docItemKey
+    signErpEventBody, docItemKey, BATTERY_MAPPING, ERP_EVENT_TYPE
 } from '../srv/lib/s4-material-document';
 import { s4ConfigFromEnv, fetchMaterialDocuments, enrichMaster, loadProductMaster } from '../srv/lib/s4-client';
 
@@ -70,7 +70,8 @@ async function postEvent(data: ReturnType<typeof materialDocumentToPassportInput
     const event = toCloudEvent(data, {
         source: SOURCE,
         id: crypto.randomUUID(),
-        time: new Date().toISOString()
+        time: new Date().toISOString(),
+        type: ERP_EVENT_TYPE
     });
     const raw = JSON.stringify(event);
     const res = await fetch(`${NIGHTPASS_BASE}/api/v1/passport/erp-events`, {
@@ -100,7 +101,7 @@ async function cycle(state: BridgeState): Promise<void> {
         const key = docItemKey(r.item);
         if (seen.has(key)) continue;
         try {
-            const input = materialDocumentToPassportInput(r, resolvedMaster);
+            const input = materialDocumentToPassportInput(r, resolvedMaster, BATTERY_MAPPING);
             if (posted > 0 && POST_DELAY_MS > 0) await new Promise(res => setTimeout(res, POST_DELAY_MS));
             const outcome = await postEvent(input);
             console.log(`[s4-bridge] ${key} material=${r.item.Material} -> ${input.passportId}: ${outcome}`);

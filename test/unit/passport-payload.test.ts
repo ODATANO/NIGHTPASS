@@ -1,6 +1,10 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { payloadFromDb, PAYLOAD_VERSION } from '../../srv/lib/passport-payload';
+import { projectPayload } from '../../srv/lib/passport-payload';
+import { BATTERY_PROFILE } from '@odatano/dpp-sdk/battery/profile';
+
+const payloadFromDb = (rows: Parameters<typeof projectPayload>[1]) => projectPayload(BATTERY_PROFILE, rows);
+const PAYLOAD_VERSION = BATTERY_PROFILE.payloadVersion;
 import { hashPayload } from '../../srv/lib/passport-anchor';
 import { defaultGuideAttributes } from '../../srv/lib/guide-attribute-defaults';
 

@@ -23,6 +23,8 @@
 }
 
 * { box-sizing: border-box; }
+/* Author display rules would otherwise beat the UA's hidden attribute. */
+[hidden] { display: none !important; }
 html, body { margin: 0; padding: 0; }
 body {
   background: var(--bg);
@@ -130,6 +132,29 @@ a:hover { text-decoration: underline; }
 
 .identity-panel .id-row { display: flex; gap: 12px; align-items: baseline; margin: 4px 0; flex-wrap: wrap; }
 .id-label { color: var(--ink-3); font-size: 12px; min-width: 120px; text-transform: uppercase; letter-spacing: .06em; }
+
+/* ---------- Product family tiles (one per demoProfiles() entry) ---------- */
+
+.family-tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
+.family-tile {
+  display: flex; flex-direction: column; gap: 4px; text-align: left;
+  background: var(--panel); color: var(--ink);
+  border: 1px solid var(--border); border-radius: 10px;
+  padding: 14px 16px; font: inherit; cursor: pointer;
+}
+.family-tile:hover { border-color: var(--accent-2); }
+.family-tile.selected { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent) inset; }
+.family-tile:focus-visible { outline: 2px solid var(--accent-2); outline-offset: 2px; }
+.ft-label { font-weight: 700; font-size: 16px; }
+.family-tile.selected .ft-label { color: var(--accent); }
+.ft-tagline { color: var(--ink-2); font-size: 13px; }
+.ft-reg { color: var(--ink-3); font-size: 12px; margin-top: 4px; }
+
+/* The head fields are grid items of .grid2, not a nested box. */
+.head-fields { display: contents; }
+.second-life { grid-column: 1 / -1; border-top: 1px solid var(--border); padding-top: 14px; }
+.second-life .claim-line input[type="checkbox"] { margin-top: 0; }
+.second-life .hint { margin-left: 24px; }
 
 .form-panel label { display: block; margin: 0 0 4px; color: var(--ink-2); font-size: 13px; }
 .form-panel input, .form-panel select {

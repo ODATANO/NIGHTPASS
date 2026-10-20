@@ -10,8 +10,8 @@
 
 import fs from 'node:fs';
 import {
-    applyProductData,
-    type ProductMaster, type S4MaterialDocumentHeader, type S4ProductData
+    applyProductData, batteryProductMaster,
+    type BatteryMaster, type ProductMaster, type S4MaterialDocumentHeader, type S4ProductData
 } from './s4-material-document';
 
 export interface S4Config {
@@ -79,8 +79,10 @@ export async function fetchProductData(cfg: S4Config, material: string): Promise
     }
 }
 
+/** The configured battery master, converted to the mapper's product-master shape. */
 export function loadProductMaster(cfg: S4Config): ProductMaster {
-    return JSON.parse(fs.readFileSync(cfg.masterPath, 'utf8'));
+    const configured: BatteryMaster = JSON.parse(fs.readFileSync(cfg.masterPath, 'utf8'));
+    return batteryProductMaster(configured);
 }
 
 /**

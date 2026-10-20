@@ -408,7 +408,7 @@ cds.on('bootstrap', (app: any) => {
     // passportId. Verification never trusts this: verifyOnChain re-reads the
     // chain. Runs on the public read surface so producers can publish to it.
     const INGEST_FIELDS = [
-        'model', 'manufacturerId', 'batteryCategory', 'manufactureDate', 'weightKg',
+        'profile', 'model', 'manufacturerId', 'batteryCategory', 'manufactureDate', 'weightKg',
         'performanceClass', 'qrCodeUrl', 'payloadHash', 'contractAddress',
         'anchorNetwork', 'attestationTxHash', 'status', 'attesterId', 'passportIdHash',
     ] as const;
@@ -433,6 +433,7 @@ cds.on('bootstrap', (app: any) => {
                 ID = cds.utils.uuid();
                 await INSERT.into('passport.Passports').entries({ ID, passportId, ...data });
             }
+            await upsertPublicAttributes(ID, req.body.attributes);
             // Proven ZK claims (claim + threshold + proof tx, no values): replace
             // this passport's rows so re-publishes stay idempotent. Thresholds
             // arrive in RAW units and are stored scaled (milli-units), the same
@@ -525,6 +526,28 @@ cds.on('bootstrap', (app: any) => {
     });
 });
 
+/**
+ * Mirror the public attribute rows a family shows on the explorer (publish
+ * ingest and federation sync). They are public by their own access class.
+ */
+async function upsertPublicAttributes(passportRowId: string, attrs: unknown): Promise<void> {
+    if (!Array.isArray(attrs)) return;
+    for (const a of attrs as { attribute?: unknown; valueJson?: unknown }[]) {
+        const attribute = String(a?.attribute ?? '').trim().slice(0, 200);
+        if (!attribute) continue;
+        const valueJson = String(a?.valueJson ?? '').slice(0, 4000);
+        const found: any = await SELECT.one.from('passport.PassportAttributes')
+            .columns('ID').where({ passport_ID: passportRowId, attribute });
+        if (found) {
+            await UPDATE.entity('passport.PassportAttributes').set({ valueJson, accessClass: 'public' }).where({ ID: found.ID });
+        } else {
+            await INSERT.into('passport.PassportAttributes').entries({
+                ID: cds.utils.uuid(), passport_ID: passportRowId, section: 'Identification', attribute, valueJson, accessClass: 'public',
+            });
+        }
+    }
+}
+
 // --- Federation sync: aggregate anchors from producer instances ---------------
 //
 // A PUBLIC explorer instance shows passports of MANY producers. Each producer
@@ -540,7 +563,7 @@ cds.on('served', () => {
     const log = cds.log('explorer-sync');
     const intervalMs = Math.max(15000, Number(process.env.PASSPORT_SYNC_INTERVAL_MS) || 60000);
     const FIELDS = [
-        'model', 'manufacturerId', 'batteryCategory', 'manufactureDate', 'weightKg',
+        'profile', 'model', 'manufacturerId', 'batteryCategory', 'manufactureDate', 'weightKg',
         'performanceClass', 'qrCodeUrl', 'payloadHash', 'contractAddress',
         'anchorNetwork', 'attestationTxHash', 'status', 'attesterId'
     ] as const;
@@ -560,12 +583,15 @@ cds.on('served', () => {
                     for (const f of FIELDS) if (row[f] !== undefined) data[f] = row[f];
                     const existing: any = await SELECT.one.from('passport.Passports')
                         .columns('ID').where({ passportId });
+                    let rowId: string;
                     if (existing) {
-                        await UPDATE.entity('passport.Passports').set(data).where({ ID: existing.ID });
+                        rowId = String(existing.ID);
+                        await UPDATE.entity('passport.Passports').set(data).where({ ID: rowId });
                     } else {
-                        await INSERT.into('passport.Passports')
-                            .entries({ ID: cds.utils.uuid(), passportId, ...data });
+                        rowId = cds.utils.uuid();
+                        await INSERT.into('passport.Passports').entries({ ID: rowId, passportId, ...data });
                     }
+                    await upsertPublicAttributes(rowId, row.attributes);
                     n++;
                 }
                 log.info(`synced ${n} passports from '${name}' (${sources[name]})`);

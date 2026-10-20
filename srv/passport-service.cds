@@ -41,6 +41,16 @@ service PassportService {
     @readonly
     entity DiligenceDoc      as projection on passport.DiligenceDoc excluding { content };
 
+    // Component profile children; redacted per requester level like the battery ones.
+    @readonly
+    entity MaterialCertificates as projection on passport.MaterialCertificates;
+
+    @readonly
+    entity QualificationTests   as projection on passport.QualificationTests;
+
+    @readonly
+    entity CustodyRecords       as projection on passport.CustodyRecords;
+
     // Guide-format attributes (BatteryPass-Ready). Rows are filtered per
     // requester tier by their longlist accessClass in the after-READ handler.
     @readonly
@@ -296,6 +306,12 @@ service PassportService {
         attestationTxHash : String;
         explorerUrl       : String;
         createdAt         : String;
+        profile           : String;  // product family: battery | component
+        // Public attribute rows the family shows on the explorer (e.g. SafetyClass).
+        attributes        : array of {
+            attribute : String;
+            valueJson : String;
+        };
         // Successfully proven ZK claims (public by design: the claim,
         // threshold or allow-list and proof tx; the value stays confidential).
         claims            : array of {

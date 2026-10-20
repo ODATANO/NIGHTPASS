@@ -5,7 +5,7 @@
  * (batterypass-ready.gefeg.com) for the Economic Operator and TestAdapter.
  *
  * Mounted by srv/server.ts ONLY when DPP_API_ENABLED=true. State lives in the
- * in-memory DppStore (srv/lib/dpp-store.ts): the executor seeds every scenario
+ * in-memory DocumentStore (srv/lib/dpp-store.ts): the executor seeds every scenario
  * via TestSetup and resets via TestTeardown, so nothing here touches the
  * passport database.
  *
@@ -20,8 +20,8 @@ import cds from '@sap/cds';
 import { randomUUID } from 'node:crypto';
 import { mintDppToken, roleFromSignedToken } from './dpp-token';
 import {
-    DppStore, DppRole, DppVersion, filterDocumentForRole, mergePatch, splitElementPath,
-    getElement, patchElement, operatorIdOf, touchLastUpdate,
+    BATTERY_DOCUMENT, DocumentStore, DppRole, DppVersion, filterDocument, roleLevel, mergePatch,
+    splitElementPath, getElement, patchElement, operatorIdOf, touchLastUpdate,
 } from './dpp-store';
 import { buildGuideDocument, guideDppId } from './guide-document';
 import { attributesAsOf } from './attribute-update';
@@ -55,7 +55,7 @@ function pick(data: Record<string, unknown> | undefined, ...names: string[]): un
 const IS_PUBLIC_HOST = !!process.env.PASSPORT_PUBLIC_SURFACE?.trim();
 
 export function createDppApiRouter(): express.Router {
-    const store = new DppStore();
+    const store = new DocumentStore(BATTERY_DOCUMENT);
     const tokens = new Map<string, string>();
     const backupIds = new Map<string, string>(); // our dppId -> id at the Backup Provider
     let externalServices: ExternalService[] = [];
@@ -197,7 +197,7 @@ export function createDppApiRouter(): express.Router {
     /** Read view of a document for the caller (operator sees everything). */
     const view = (req: express.Request, doc: unknown): unknown => {
         const { role } = roleOf(req);
-        return role ? filterDocumentForRole(doc, role) : doc;
+        return role ? filterDocument(BATTERY_DOCUMENT, doc, roleLevel(role)) : doc;
     };
 
     // ---- TestAdapter ------------------------------------------------------
@@ -280,7 +280,7 @@ export function createDppApiRouter(): express.Router {
             const r = await callService(registry, 'POST', '/registerDPP', {
                 Product_ID: productId,
                 Backup_ID: backupIds.get(dppId) ?? '',
-                Operator_ID: operatorIdOf(doc) ?? 'EORI-DE-CELLCO-001',
+                Operator_ID: operatorIdOf(BATTERY_DOCUMENT, doc) ?? 'EORI-DE-CELLCO-001',
             });
             if (!r.ok) errors.push(`Registry ${r.error}`);
         }
@@ -305,7 +305,7 @@ export function createDppApiRouter(): express.Router {
         if (!writeGuard(req, res)) return;
         const doc = req.body;
         if (!doc || typeof doc !== 'object') return fail(res, 400, 'Request body must be a DPP JSON object');
-        const row = store.insert({ document: touchLastUpdate(doc) });
+        const row = store.insert({ document: touchLastUpdate(BATTERY_DOCUMENT,doc) });
         await persistReplace(row);
         const pushErrors = await marketDpp(row.dppId, row.productId, row.document);
         if (pushErrors.length) return fail(res, 400, `DPP stored but propagation failed: ${pushErrors.join('; ')}`);
@@ -350,7 +350,7 @@ export function createDppApiRouter(): express.Router {
             return res.status(404).end();
         }
         if (!req.body || typeof req.body !== 'object') return fail(res, 400, 'Merge patch body required');
-        const updated = store.update(req.params.dppId, touchLastUpdate(mergePatch(row.document, req.body)));
+        const updated = store.update(req.params.dppId, touchLastUpdate(BATTERY_DOCUMENT,mergePatch(row.document, req.body)));
         await persistVersion(updated!);
         await backupUpdate(req.params.dppId, updated!.document);
         res.status(200).json(updated!.document);
@@ -371,7 +371,7 @@ export function createDppApiRouter(): express.Router {
         if (roleOf(req).invalid) return fail(res, 401, 'Unknown or invalid credential');
         const doc = await resolveDoc(req.params.dppId);
         if (doc === undefined) return res.status(404).end();
-        const el = getElement(doc, splitElementPath(req.params.elementId));
+        const el = getElement(BATTERY_DOCUMENT,doc, splitElementPath(req.params.elementId));
         if (el === undefined) return res.status(404).end();
         res.status(200).json(view(req, el));
     });
@@ -384,12 +384,12 @@ export function createDppApiRouter(): express.Router {
             return res.status(404).end();
         }
         const parts = splitElementPath(req.params.elementId);
-        if (getElement(row.document, parts) === undefined) return res.status(404).end();
+        if (getElement(BATTERY_DOCUMENT,row.document, parts) === undefined) return res.status(404).end();
         if (!req.body || typeof req.body !== 'object') return fail(res, 400, 'Merge patch body required');
-        const updated = store.update(req.params.dppId, touchLastUpdate(patchElement(row.document, parts, req.body)));
+        const updated = store.update(req.params.dppId, touchLastUpdate(BATTERY_DOCUMENT,patchElement(BATTERY_DOCUMENT, row.document, parts, req.body)));
         await persistVersion(updated!);
         await backupUpdate(req.params.dppId, updated!.document);
-        res.status(200).json(getElement(updated!.document, parts));
+        res.status(200).json(getElement(BATTERY_DOCUMENT,updated!.document, parts));
     });
 
     router.get('/v1/dpps/:dppId/elements/:elementPath', async (req, res) => {
@@ -397,7 +397,7 @@ export function createDppApiRouter(): express.Router {
         const doc = await resolveDoc(req.params.dppId);
         if (doc === undefined) return res.status(404).end();
         const parts = splitElementPath(req.params.elementPath);
-        const el = getElement(doc, parts);
+        const el = getElement(BATTERY_DOCUMENT,doc, parts);
         if (el === undefined) return res.status(404).end();
         // The element is served wrapped in its attribute name (the executor's
         // reference files are {"<Attribute>": <value>} fragments).
@@ -405,7 +405,7 @@ export function createDppApiRouter(): express.Router {
         // A role that may not see the leaf attribute gets a 404, not a leak.
         const { role } = roleOf(req);
         if (role) {
-            const filtered = getElement(filterDocumentForRole(doc, role), parts);
+            const filtered = getElement(BATTERY_DOCUMENT,filterDocument(BATTERY_DOCUMENT, doc, roleLevel(role)), parts);
             if (filtered === undefined) return res.status(404).end();
             return res.status(200).json({ [leaf]: filtered });
         }
@@ -421,10 +421,10 @@ export function createDppApiRouter(): express.Router {
         }
         const parts = splitElementPath(req.params.elementPath);
         if (req.body === undefined) return fail(res, 400, 'Patch body required');
-        const updated = store.update(req.params.dppId, touchLastUpdate(patchElement(row.document, parts, req.body)));
+        const updated = store.update(req.params.dppId, touchLastUpdate(BATTERY_DOCUMENT,patchElement(BATTERY_DOCUMENT, row.document, parts, req.body)));
         await persistVersion(updated!);
         await backupUpdate(req.params.dppId, updated!.document);
-        res.status(200).json(getElement(updated!.document, parts));
+        res.status(200).json(getElement(BATTERY_DOCUMENT,updated!.document, parts));
     });
 
     router.get('/v1/dppsByProductId/:productId', async (req, res) => {

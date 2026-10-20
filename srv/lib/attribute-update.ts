@@ -1,6 +1,4 @@
-/**
- * Dynamic guide-attribute updates (telemetry encoding, as-of reconstruction).
- * Extracted to @odatano/dpp-sdk; this shim keeps the historical import path
- * stable.
- */
+/** Dynamic guide-attribute updates: battery encoding plus the generic row helpers. */
 export * from '@odatano/dpp-sdk/battery/attributes';
+export * from '@odatano/dpp-sdk/attributes';
+export type { AttributeUpdate as DynamicUpdate } from '@odatano/dpp-sdk/attributes';

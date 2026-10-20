@@ -4,11 +4,9 @@ import type { ChainLane } from './chain-lane';
 import { randomBytes } from 'node:crypto';
 import { AsyncResource } from 'node:async_hooks';
 import { sortKeys, canonicalize, blake2b256Hex, hashPayload } from '@odatano/dpp-sdk/hash';
-import {
-    BATTERY_PROVABLE_FIELDS, RECYCLED_MATERIAL_FIELDS, DYNAMIC_PROVABLE_FIELDS,
-    BATTERY_STRING_FIELDS, STRING_PROVABLE_FIELDS, PROVABLE_FIELDS, provableFieldKind,
-    VALUE_SCALE, scaleValue, fieldKeyHex, fromHex32, toHex
-} from '@odatano/dpp-sdk/fields';
+import { VALUE_SCALE, scaleValue, fieldKeyHex } from '@odatano/dpp-sdk/fields';
+import { fromHex32, toHex } from '@odatano/dpp-sdk/bytes';
+import { panelOf, fieldKindOf, type ProductProfile } from '@odatano/dpp-sdk/profile';
 import { MERKLE_DEPTH, LEAF_COUNT, buildTree, proofFor as merkleProofFor } from '@odatano/dpp-sdk/merkle';
 import {
     encryptPayload as sdkEncryptPayload,
@@ -141,22 +139,14 @@ export { sortKeys, canonicalize, blake2b256Hex, hashPayload };
 // (`@odatano/nightgate/browser/attestation-vault` → pureCircuits.leafHash /
 // nodeHash), so the off-chain root is byte-identical to the in-circuit one.
 //
-// Layout: a fixed depth-4 tree (16 leaves). Leaf i holds PROVABLE_FIELDS[i]
-// (field_key = blake2b256(fieldName), value = scaled integer); unused leaves are
-// a fixed empty leaf. Values are scaled ×1000 (milli-units) to match the
-// Uint<64> predicate encoding used by provePassportValue.
-
-// The provable-field registry, scaling and hex helpers are extracted to
-// @odatano/dpp-sdk (shared with DAYPASS: same 13-slot panel vocabulary,
-// same x1000 scaling, same field-key derivation). Changing the registry
-// changes the content root AND the schema id, so passports must be
-// re-anchored for a new layout; extend it in ONE batch with a re-anchor
-// round, never field by field.
-export {
-    BATTERY_PROVABLE_FIELDS, RECYCLED_MATERIAL_FIELDS, DYNAMIC_PROVABLE_FIELDS,
-    BATTERY_STRING_FIELDS, STRING_PROVABLE_FIELDS, PROVABLE_FIELDS, provableFieldKind,
-    VALUE_SCALE, scaleValue, fieldKeyHex, fromHex32, toHex, MERKLE_DEPTH
-};
+// Layout: a fixed depth-4 tree (16 leaves). Leaf i holds the i-th field of the
+// product profile's panel (field_key = blake2b256(fieldName), value = scaled
+// integer); unused leaves are a fixed empty leaf. Values are scaled x1000
+// (milli-units) to match the Uint<64> predicate encoding.
+//
+// The panel order is part of the anchored root and the schema id, so a
+// profile's panel only changes together with a re-anchor round.
+export { VALUE_SCALE, scaleValue, fieldKeyHex, fromHex32, toHex, MERKLE_DEPTH, panelOf, fieldKindOf, type ProductProfile };
 const HEX32_RE = /^[0-9a-fA-F]{64}$/;
 
 // Memoized dynamic import of the ESM-only compiled contract (from CJS code).
@@ -260,20 +250,22 @@ export interface ContentRoot {
 }
 
 /**
- * The ordered slot descriptors of the provable-field registry: numeric fields
- * are uint slots at VALUE_SCALE, string fields are bytes slots, and the tail
- * of the 16-slot tree is canonical padding (the contract's own empty-leaf key,
- * kind 2, scale 0). Mirrors NIGHTGATE's computeSchemaDescriptors; the padding
+ * The ordered slot descriptors of a profile's panel: numeric fields are uint
+ * slots at VALUE_SCALE, string fields are bytes slots, and the tail of the
+ * 16-slot tree is canonical padding (the contract's own empty-leaf key, kind
+ * 2, scale 0). Mirrors NIGHTGATE's computeSchemaDescriptors; the padding
  * shape is asserted IN-CIRCUIT by proveDocumentComparison, so it is not ours
  * to choose.
  */
-export function schemaDescriptors(pc: VaultPureCircuits): SchemaDescriptor[] {
+export function schemaDescriptors(pc: VaultPureCircuits, profile: ProductProfile): SchemaDescriptor[] {
+    const panel = panelOf(profile);
+    if (panel.length > LEAF_COUNT) throw new Error(`profile '${profile.id}' has ${panel.length} provable fields, the tree holds ${LEAF_COUNT}`);
     const emptyKey = toHex(pc.emptyLeafKey());
     const out: SchemaDescriptor[] = [];
     for (let i = 0; i < LEAF_COUNT; i++) {
-        const fieldName = PROVABLE_FIELDS[i];
+        const fieldName = panel[i];
         if (fieldName == null) out.push({ fieldKey: emptyKey, kind: 2, scale: '0' });
-        else if (provableFieldKind(fieldName) === 'string') out.push({ fieldKey: fieldKeyHex(fieldName), kind: 1, scale: '0' });
+        else if (fieldKindOf(profile, fieldName) === 'string') out.push({ fieldKey: fieldKeyHex(fieldName), kind: 1, scale: '0' });
         else out.push({ fieldKey: fieldKeyHex(fieldName), kind: 0, scale: String(VALUE_SCALE) });
     }
     return out;
@@ -285,13 +277,10 @@ function foldSchemaId(pc: VaultPureCircuits, schema: SchemaDescriptor[]): string
     return buildTree(leaves, pc.nodeHash).rootHex;
 }
 
-/**
- * The schema id of the CURRENT provable-field registry. Deterministic: it
- * changes only when PROVABLE_FIELDS changes (which already forces a re-anchor).
- */
-export async function contentSchemaId(): Promise<string> {
+/** The schema id of a profile's panel. Deterministic per panel layout. */
+export async function contentSchemaId(profile: ProductProfile): Promise<string> {
     const pc = await loadPureCircuits();
-    return foldSchemaId(pc, schemaDescriptors(pc));
+    return foldSchemaId(pc, schemaDescriptors(pc, profile));
 }
 
 /** Fresh 32-byte salt seed (64-hex). One per anchored version. */
@@ -300,14 +289,14 @@ export function newSaltSeed(): string {
 }
 
 /**
- * Build the content-root Merkle tree from a field → raw-value map (raw values
- * are scaled ×1000 internally). Only PROVABLE_FIELDS are placed; a field absent
- * from `values` occupies its slot as the SALTED absent leaf. Returns root,
- * schema id, opening and a `proofFor(fieldName)` that yields the inclusion path.
+ * Build the content-root Merkle tree of a profile from a field -> raw-value
+ * map (raw values are scaled x1000 internally). Only panel fields are placed;
+ * a field absent from `values` occupies its slot as the SALTED absent leaf.
+ * Returns root, schema id, opening and a `proofFor(fieldName)` that yields
+ * the inclusion path.
  *
- * v4 (NIGHTGATE 0.16.0): every leaf carries a per-slot salt derived from
- * `saltSeed` via the artifact's `slotSalt` circuit. Two consequences the
- * callers must honour:
+ * Every leaf carries a per-slot salt derived from `saltSeed` via the
+ * artifact's `slotSalt` circuit. Two consequences the callers must honour:
  *   - re-building the tree for a PROOF requires the SAME seed the anchor used
  *     (a fresh seed yields a different root and every claim aborts at local
  *     proving), so the seed is persisted with the passport/version;
@@ -316,11 +305,13 @@ export function newSaltSeed(): string {
  *     field keys are public and whose value domains are small.
  */
 export async function buildContentRoot(
+    profile: ProductProfile,
     values: Record<string, number | string | null | undefined>,
     opts: { saltSeed?: string | null } = {}
 ): Promise<ContentRoot> {
     const pc = await loadPureCircuits();
-    const schema = schemaDescriptors(pc);
+    const panel = panelOf(profile);
+    const schema = schemaDescriptors(pc, profile);
     const saltSeedHex = opts.saltSeed && HEX32_RE.test(String(opts.saltSeed))
         ? String(opts.saltSeed).toLowerCase()
         : newSaltSeed();
@@ -333,10 +324,10 @@ export async function buildContentRoot(
     for (let i = 0; i < LEAF_COUNT; i++) {
         const salt = pc.slotSalt(seed, BigInt(i));
         salts.push(salt);
-        const fieldName = PROVABLE_FIELDS[i];
+        const fieldName = panel[i];
         const raw = fieldName != null ? values[fieldName] : undefined;
         if (fieldName != null && raw != null && raw !== '') {
-            if (provableFieldKind(fieldName) === 'string') {
+            if (fieldKindOf(profile, fieldName) === 'string') {
                 const digest = blake2b256Hex(String(raw));
                 slots.push({ present: true, valueDigest: digest });
                 leaves.push(pc.bytesLeafHash(fromHex32(fieldKeyHex(fieldName)), fromHex32(digest), salt));
@@ -364,13 +355,13 @@ export async function buildContentRoot(
         schema,
         opening: { saltSeed: saltSeedHex, slots },
         proofFor(fieldName: string): FieldMerkleProof | null {
-            const idx = PROVABLE_FIELDS.indexOf(fieldName as typeof PROVABLE_FIELDS[number]);
+            const idx = panel.indexOf(fieldName);
             if (idx < 0) return null;
             const raw = values[fieldName];
             if (raw == null || raw === '') return null;
             const { siblings, dirs } = merkleProofFor(levels, idx);
             const salt = toHex(salts[idx]);
-            if (provableFieldKind(fieldName) === 'string') {
+            if (fieldKindOf(profile, fieldName) === 'string') {
                 return {
                     kind: 'string',
                     fieldKey: fieldKeyHex(fieldName),

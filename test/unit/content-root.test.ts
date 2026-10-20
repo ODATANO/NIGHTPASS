@@ -3,11 +3,18 @@ import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 import path from 'node:path';
 import {
-    buildContentRoot, provableFieldKind, fieldKeyHex, blake2b256Hex,
+    buildContentRoot, fieldKeyHex, blake2b256Hex,
     fromHex32, toHex, loadPureCircuits, schemaDescriptors, contentSchemaId, newSaltSeed,
-    PROVABLE_FIELDS, BATTERY_PROVABLE_FIELDS, RECYCLED_MATERIAL_FIELDS, DYNAMIC_PROVABLE_FIELDS,
-    STRING_PROVABLE_FIELDS, MERKLE_DEPTH, VALUE_SCALE,
+    MERKLE_DEPTH, VALUE_SCALE,
 } from '../../srv/lib/passport-anchor';
+import { fieldKindOf } from '@odatano/dpp-sdk/profile';
+import {
+    BATTERY_PROFILE, BATTERY_PANEL, BATTERY_PROVABLE_FIELDS, RECYCLED_MATERIAL_FIELDS,
+    DYNAMIC_PROVABLE_FIELDS, BATTERY_STRING_FIELDS,
+} from '@odatano/dpp-sdk/battery/profile';
+
+const PROVABLE_FIELDS = BATTERY_PANEL;
+const provableFieldKind = (f: string) => fieldKindOf(BATTERY_PROFILE, f);
 
 // The content tree carries three leaf encodings since NIGHTGATE 0.16.0 (v4):
 // numeric leaves (leafHash(fieldKey, scaledValue, salt)), string leaves
@@ -30,7 +37,7 @@ describe('provable-field registry', () => {
             + DYNAMIC_PROVABLE_FIELDS.length;
         assert.deepEqual(
             PROVABLE_FIELDS.slice(numericCount),
-            STRING_PROVABLE_FIELDS,
+            BATTERY_STRING_FIELDS,
             'string fields must stay appended AFTER the numeric leaves'
         );
         assert.ok(PROVABLE_FIELDS.length <= (1 << MERKLE_DEPTH));
@@ -44,7 +51,7 @@ describe('provable-field registry', () => {
 describe('schema descriptors', () => {
     it('describes every slot: uint fields, bytes fields, canonical padding', async () => {
         const pc = await loadPureCircuits();
-        const schema = schemaDescriptors(pc);
+        const schema = schemaDescriptors(pc, BATTERY_PROFILE);
         assert.equal(schema.length, 1 << MERKLE_DEPTH);
         assert.deepEqual(schema[0], { fieldKey: fieldKeyHex('carbonFootprintKgCO2'), kind: 0, scale: String(VALUE_SCALE) });
         const chemIdx = PROVABLE_FIELDS.indexOf('cellChemistry');
@@ -56,8 +63,8 @@ describe('schema descriptors', () => {
     });
 
     it('the schema id is deterministic and matches the built tree', async () => {
-        const tree = await buildContentRoot(NUMERIC_VALUES, { saltSeed: SEED });
-        assert.equal(tree.schemaId, await contentSchemaId());
+        const tree = await buildContentRoot(BATTERY_PROFILE, NUMERIC_VALUES, { saltSeed: SEED });
+        assert.equal(tree.schemaId, await contentSchemaId(BATTERY_PROFILE));
         assert.match(tree.schemaId, /^[0-9a-f]{64}$/);
     });
 });
@@ -66,7 +73,7 @@ describe('buildContentRoot (v4 salted)', () => {
     it('folds to the manually built 16-leaf tree with per-slot salts', async () => {
         const pc = await loadPureCircuits();
         const seed = fromHex32(SEED);
-        const schema = schemaDescriptors(pc);
+        const schema = schemaDescriptors(pc, BATTERY_PROFILE);
         const leaves: Uint8Array[] = [];
         for (let i = 0; i < (1 << MERKLE_DEPTH); i++) {
             const salt = pc.slotSalt(seed, BigInt(i));
@@ -81,29 +88,29 @@ describe('buildContentRoot (v4 salted)', () => {
             for (let i = 0; i < level.length; i += 2) next.push(pc.nodeHash(level[i], level[i + 1]));
             level = next;
         }
-        const tree = await buildContentRoot(NUMERIC_VALUES, { saltSeed: SEED });
+        const tree = await buildContentRoot(BATTERY_PROFILE, NUMERIC_VALUES, { saltSeed: SEED });
         assert.equal(tree.contentRoot, toHex(level[0]));
     });
 
     it('the same seed reproduces the root; a different seed does not', async () => {
-        const a = await buildContentRoot(NUMERIC_VALUES, { saltSeed: SEED });
-        const b = await buildContentRoot(NUMERIC_VALUES, { saltSeed: SEED });
+        const a = await buildContentRoot(BATTERY_PROFILE, NUMERIC_VALUES, { saltSeed: SEED });
+        const b = await buildContentRoot(BATTERY_PROFILE, NUMERIC_VALUES, { saltSeed: SEED });
         assert.equal(b.contentRoot, a.contentRoot);
         assert.equal(b.saltSeed, SEED);
 
-        const other = await buildContentRoot(NUMERIC_VALUES, { saltSeed: 'b'.repeat(64) });
+        const other = await buildContentRoot(BATTERY_PROFILE, NUMERIC_VALUES, { saltSeed: 'b'.repeat(64) });
         assert.notEqual(other.contentRoot, a.contentRoot,
             'a fresh seed must yield a different root (that is why the anchor persists it)');
 
         // No seed given: a random one is generated and reported back.
-        const rnd = await buildContentRoot(NUMERIC_VALUES);
+        const rnd = await buildContentRoot(BATTERY_PROFILE, NUMERIC_VALUES);
         assert.match(rnd.saltSeed, /^[0-9a-f]{64}$/);
         assert.notEqual(rnd.saltSeed, SEED);
     });
 
     it('adding a chemistry changes the root; its proof is the string variant and folds back', async () => {
-        const bare = await buildContentRoot(NUMERIC_VALUES, { saltSeed: SEED });
-        const withChem = await buildContentRoot({ ...NUMERIC_VALUES, cellChemistry: 'Li-ion NMC' }, { saltSeed: SEED });
+        const bare = await buildContentRoot(BATTERY_PROFILE, NUMERIC_VALUES, { saltSeed: SEED });
+        const withChem = await buildContentRoot(BATTERY_PROFILE, { ...NUMERIC_VALUES, cellChemistry: 'Li-ion NMC' }, { saltSeed: SEED });
         assert.notEqual(withChem.contentRoot, bare.contentRoot);
 
         const proof = withChem.proofFor('cellChemistry');
@@ -134,7 +141,7 @@ describe('buildContentRoot (v4 salted)', () => {
     });
 
     it('the opening covers all 16 slots in slot order, absent ones marked', async () => {
-        const tree = await buildContentRoot({ ...NUMERIC_VALUES, cellChemistry: 'Li-ion NMC' }, { saltSeed: SEED });
+        const tree = await buildContentRoot(BATTERY_PROFILE, { ...NUMERIC_VALUES, cellChemistry: 'Li-ion NMC' }, { saltSeed: SEED });
         assert.equal(tree.opening.saltSeed, SEED);
         assert.equal(tree.opening.slots.length, 1 << MERKLE_DEPTH);
         assert.deepEqual(tree.opening.slots[0], { present: true, value: String(3500 * VALUE_SCALE) });
@@ -145,7 +152,7 @@ describe('buildContentRoot (v4 salted)', () => {
 
     it('rejects a non-numeric value on a numeric field with a named error', async () => {
         await assert.rejects(
-            () => buildContentRoot({ ...NUMERIC_VALUES, capacityKwh: 'not-a-number' }, { saltSeed: SEED }),
+            () => buildContentRoot(BATTERY_PROFILE, { ...NUMERIC_VALUES, capacityKwh: 'not-a-number' }, { saltSeed: SEED }),
             /field 'capacityKwh' value is not numeric/
         );
     });
@@ -177,7 +184,7 @@ describe('parity with NIGHTGATE buildDocumentContentRoot', () => {
 
         const pc = await loadPureCircuits();
         const theirs = ng.buildDocumentContentRoot(values, specs, pc, fromHex32(SEED));
-        const ours = await buildContentRoot(values, { saltSeed: SEED });
+        const ours = await buildContentRoot(BATTERY_PROFILE, values, { saltSeed: SEED });
 
         assert.equal(ours.contentRoot, theirs.contentRoot);
         assert.equal(ours.schemaId, theirs.schemaId);

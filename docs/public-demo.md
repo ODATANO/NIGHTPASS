@@ -1,14 +1,15 @@
 # Public demo deployment
 
 How to put the NIGHTPASS passport viewer on a public host so that visitors of
-your homepage can open a battery passport from its QR code and verify it live
-against the Midnight ledger, without any account.
+your homepage can open a product passport (battery or component) from its QR
+code and verify it live against the Midnight ledger, without any account.
 
 ## What visitors get
 
 1. Your homepage links (or embeds the QR image of) `https://<demo-host>/p/<passportId>`.
-2. The resolver routes them into the SAPUI5 viewer at the consumer tier
-   (Annex XIII Point 1 fields only). Recycler/authority stay behind login.
+2. The resolver routes them into the SAPUI5 viewer at the public level: the
+   head fields of the passport's family only (for a battery the Annex XIII
+   Point 1 fields). Legitimate-interest and authority readers stay behind login.
 3. The detail panel has a **Verify on Midnight** button. It calls the anonymous
    `PassportService.verifyOnChain(passportId)` function, which asks the public
    Midnight indexer live (crawler-free, NIGHTGATE `verifyAttestationState`)
@@ -41,8 +42,8 @@ can still live-verify across networks in two ways:
    SERVER-SIDE over its public API (no CORS/CSP impact, the browser only ever
    talks to the instance it is on). The peer's FIRST state read builds its
    provider bundle and can take ~30-60s cold; warm verifies answer in seconds.
-2. **NIGHTGATE `network` override (single process, pending):** once the FR
-   `verify-state-network-override.md` ships, NIGHTPASS detects it automatically
+2. **NIGHTGATE `network` override (single process):** on a platform whose
+   state reads accept a network parameter, NIGHTPASS detects it automatically
    (`runtime-config.crossNetworkVerify: true`) and the peer delegation becomes
    unnecessary.
 
@@ -55,15 +56,15 @@ instead.
 The cleanest public setup separates surfaces, not repos: **every producer runs
 their own (internal) NIGHTPASS work instance**, and one **public explorer
 instance** aggregates and shows them all. QR codes printed on batteries point
-at the public explorer, whose detail page shows the Point-1 info and verifies
-the anchor live against the chain.
+at the public explorer, whose detail page shows the public head fields and
+verifies the anchor live against the chain.
 
 Public explorer instance (same image, three env vars):
 
 | Variable | Effect |
 |---|---|
 | `PASSPORT_PUBLIC_SURFACE=explorer` | serves ONLY `/explorer`, GET `/api/v1/passport/*`, `/qr`, `/p`, `/resolve`; everything else (cockpit, tiered viewer, webhook, all writes) answers 404. `/p/<id>` (the QR target) redirects to the explorer detail page. |
-| `PASSPORT_SOURCES=cellco=https://cellco.internal,acme=...` | federation: pulls each producer's anonymous `anchorExplorer()` (public Point-1 + anchor metadata) into the local DB every `PASSPORT_SYNC_INTERVAL_MS` (default 60s). The vault map is deliberately not enumerable on-chain, so this pull is what populates the cross-producer view; verification never trusts it and always re-reads the chain. |
+| `PASSPORT_SOURCES=cellco=https://cellco.internal,acme=...` | federation: pulls each producer's anonymous `anchorExplorer()` (public head fields, `profile`, public `attributes`, anchor metadata and proven claims) into the local DB every `PASSPORT_SYNC_INTERVAL_MS` (default 60s). The vault map is deliberately not enumerable on-chain, so this pull is what populates the cross-producer view; verification never trusts it and always re-reads the chain. |
 | `PASSPORT_VIEWER_BASE` | optional link target for "Open in Passport Viewer" (an internal work instance); unset on the explorer surface = link hidden. |
 
 The explorer instance needs NO wallet, no proof server, no producer secrets and
@@ -177,8 +178,12 @@ the printed URL as `PASSPORT_DEMO_HOST`.
   Cardanoscan / the Midnight explorer: search (passport ID, payload hash or
   attestation tx), stat tiles, the anchor table with per-row live verification
   and a "Verify all" sweep, and detail pages that verify automatically on open
-  and offer the QR, viewer link and credential download. Dark theme, no login,
-  no build step (`app/explorer/`, plain HTML/CSS/JS).
+  and offer the QR, viewer link and credential download. Every row carries its
+  product family (`profile`: `battery` | `component`), the family's public
+  attribute rows (`attributes`, for a component the safety class and the
+  component status) and the proven claims with their thresholds or allow-lists;
+  the values stay hidden. Dark theme, no login, no build step (`app/explorer/`,
+  plain HTML/CSS/JS).
   **One instance = one network:** the list shows only the instance's own
   network (drafts are omitted). Each network gets its own instance and its own
   URL (e.g. `https://preview.<demo-host>/explorer/` and
@@ -199,6 +204,49 @@ the printed URL as `PASSPORT_DEMO_HOST`.
   `/api/v1/passport/passportCredential(payloadHash='<hash>')`.
 - Prefer linking over iframing: the viewer is a full SAPUI5 app and NIGHTPASS's
   host CSP intentionally denies framing.
+
+## "Try it" demo: visitor flow and API
+
+The optional demo instance (`DEMO_ENABLED=true`, `PASSPORT_PUBLIC_SURFACE=demo,explorer`)
+lets an anonymous visitor anchor their own passport with a generated,
+zero-funded identity; every fee is sponsored. Rollout and operations:
+`deploy/README.md`, "Try-it demo instance". The surface is `DemoService`
+(`/api/v1/demo`, no entities, actions only).
+
+Visitor flow (`app/demo/`):
+
+1. **Start**: `startTester(nickname)` creates an anonymous tester with a
+   fresh identity; the opaque `testerId` authorizes everything that follows.
+2. **Family**: battery or component. `demoProfiles()` lists the families with
+   label, tagline, regulation, passport id prefix (`BAT-TRY`, `CMP-TRY`), the
+   primary claim field, whether a second-life act is offered, and the public
+   head fields as `headJson` (name, label, kind, target, options, bounds,
+   default). The form builds itself from this catalog.
+3. **Head fields** (public, shown on the explorer row). Battery: model,
+   manufacturer, weight, performance class. Component: designation,
+   manufacturer, mass, safety class (stored as a public attribute row, not a
+   column).
+4. **Claims**: `demoClaimFields(profile)` lists the confidential values of the
+   family. Numeric claims have a fixed direction per field (carbon footprint,
+   cobalt content, hardness: at most; capacity, cycle life, recycled content,
+   yield strength, wall thickness: at least). Membership claims pick the hidden
+   value from the published allow-list (cell chemistry; material grade,
+   supplier, test method). The family's primary claim is always proven
+   (battery: carbon footprint; component: cobalt content), the rest are
+   optional. Every claim must be true: a false claim fails at local proving
+   and is rejected up front. All claims of a run ride in ONE proof transaction.
+5. **Second life** (battery only): age and repurpose the battery, re-anchored
+   as version 2. `createDemoPassport` rejects it for other families.
+6. **Submit**: `createDemoPassport(testerId, profile, headJson, claimsJson,
+   secondLife)` queues the run; `demoRunStatus(runId)` drives the timeline
+   (create and derive keys, attest, content root, id binding, proof, optional
+   second life, publish), each step with its transaction hash and explorer
+   link. `demoInfo()` tells the landing page whether the demo is open and how
+   busy it is.
+7. **Done**: the passport's QR code and an explorer link that verifies live.
+
+Explorer rows (`anchorExplorer()`) carry `profile` and `attributes` next to
+the head fields and the proven `claims`; rows without a profile are batteries.
 
 ## Security checklist before going public
 

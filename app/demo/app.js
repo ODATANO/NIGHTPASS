@@ -1,6 +1,6 @@
 /* NIGHTPASS "Try it" demo client. Plain JS, no build step, same-origin only.
-   State machine over four views (landing / form / run / done); testerId and
-   runId live in localStorage so a reload resumes the run. */
+   State machine over four views (landing / form / run / done); testerId,
+   profile and runId live in localStorage so a reload resumes the run. */
 (() => {
   'use strict';
 
@@ -194,63 +194,183 @@
 
   // ---------- form ----------
 
-  // Pre-fill the form with a plausible random battery so visitors can go
-  // straight to anchoring. Only fills the empty text fields (a returning
-  // visitor's own edits stay untouched); numbers are re-rolled each time.
-  const RAND_MODEL_A = ['Volt', 'Ion', 'Nova', 'Flux', 'Amp', 'Watt', 'Zap', 'Core', 'Polar', 'Titan'];
-  const RAND_MODEL_B = ['Cell', 'Pack', 'Drive', 'Grid', 'Store'];
-  const RAND_MODEL_C = ['EV-60', 'EV-75', 'EV-90', 'X-120', 'S-45', 'Max-80', 'Ultra-100', 'Go-55'];
-  const RAND_WERK = ['DemoWorks', 'NordCell', 'VoltFab', 'PowerHaus', 'CellSmith', 'ElectroWerk', 'GigaZelle', 'BatterieWerk', 'RheinVolt', 'HansaCell'];
-  const pick = (a) => a[Math.floor(Math.random() * a.length)];
+  // The product families (demoProfiles) and their claim catalogues
+  // (demoClaimFields) come from the server, so fields, bounds and claim
+  // directions are defined in exactly one place.
+  var profiles = [];
+  var profile = null;      // the chosen family
+  var primarySpec = null;  // its always-proven claim
+  var claimSpecs = [];     // its optional claims (the cart)
 
-  function randomizeForm() {
-    if (!$('fModel').value) $('fModel').value = `${pick(RAND_MODEL_A)}${pick(RAND_MODEL_B)} ${pick(RAND_MODEL_C)}`;
-    if (!$('fManufacturer').value) $('fManufacturer').value = pick(RAND_WERK);
-    $('fWeight').value = String(250 + 10 * Math.floor(Math.random() * 40));
-    $('fPerf').value = pick(['A', 'B', 'B', 'C', 'C', 'D']);
-    const co2 = 2800 + 50 * Math.floor(Math.random() * 36);
-    $('fCo2').value = String(co2);
-    $('fThreshold').value = String(Math.ceil((co2 * 1.05) / 100) * 100);
-    syncClaimBounds(false);
-  }
-
-  function enterForm() {
-    $('idNight').textContent = store.get('night') || '';
-    randomizeForm();
-    show('viewForm');
-  }
-
-  // Keep the claim pair valid while typing: the public threshold can never be
-  // below the confidential CO2 value (the proof must be TRUE). The threshold
-  // field's min follows the CO2 input, and both ends clamp on change.
-  function syncClaimBounds(bump) {
-    const co2 = Number($('fCo2').value);
-    if (!Number.isFinite(co2) || co2 < 1) return;
-    $('fThreshold').min = String(co2);
-    if (bump && Number($('fThreshold').value) < co2) $('fThreshold').value = String(co2);
-  }
-  $('fCo2').addEventListener('input', () => syncClaimBounds(false));
-  $('fCo2').addEventListener('change', () => syncClaimBounds(true));
-  $('fThreshold').addEventListener('change', () => syncClaimBounds(true));
-  syncClaimBounds(false);
-
-  // ---- extra claims ------------------------------------------------------
-  // The catalogue comes from the server (demoClaimFields) so the fields, their
-  // bounds and their direction are defined in exactly one place. Each entry is
-  // opt-in: tick it, set a confidential value and the public bound.
-
-  var claimSpecs = [];
-
-  /**
-   * Escape for the one place this app builds markup from server data. The
-   * catalogue is our own static list, but a template that interpolates without
-   * escaping is a habit that outlives the data it was written for.
-   */
+  /** Escape for every place this app builds markup from server data. */
   function esc(s) {
     return String(s == null ? '' : s)
       .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
       .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
   }
+
+  async function loadProfiles() {
+    if (profiles.length) return profiles;
+    var res = await api('GET', '/demoProfiles()');
+    profiles = (res.value || res || []).map(function (p) {
+      var head = [];
+      try { head = JSON.parse(p.headJson || '[]'); } catch (e) { head = []; }
+      return {
+        id: p.id, label: p.label, tagline: p.tagline, regulation: p.regulation,
+        primaryField: p.primaryField, secondLife: !!p.secondLife, head: head
+      };
+    });
+    return profiles;
+  }
+
+  /** "battery" or "component": the family word for sentences, from its label. */
+  function familyNoun(label) {
+    return String(label || 'product').replace(/ passport$/i, '').toLowerCase();
+  }
+
+  function renderFamilyTiles() {
+    var box = $('familyTiles');
+    box.innerHTML = '';
+    profiles.forEach(function (p) {
+      var on = !!profile && profile.id === p.id;
+      var tile = document.createElement('button');
+      tile.type = 'button';
+      tile.className = 'family-tile' + (on ? ' selected' : '');
+      tile.setAttribute('role', 'radio');
+      tile.setAttribute('aria-checked', on ? 'true' : 'false');
+      tile.dataset.profile = p.id;
+      tile.innerHTML =
+        '<span class="ft-label">' + esc(p.label) + '</span>' +
+        '<span class="ft-tagline">' + esc(p.tagline) + '</span>' +
+        '<span class="ft-reg">' + esc(p.regulation) + '</span>';
+      tile.addEventListener('click', function () { void selectProfile(p.id); });
+      box.appendChild(tile);
+    });
+  }
+
+  async function selectProfile(id) {
+    profile = profiles.find(function (p) { return p.id === id; }) || profiles[0];
+    if (!profile) return;
+    store.set('profile', profile.id);
+    store.set('profileLabel', profile.label);
+    renderFamilyTiles();
+    $('formTitle').textContent = 'Your ' + profile.label.toLowerCase();
+    renderHeadFields(profile.head);
+    $('secondLifeBlock').hidden = !profile.secondLife;
+    $('fSecondLife').checked = false;
+    await loadClaimFields(profile.id);
+  }
+
+  function headInput(f) {
+    var el;
+    if (f.kind === 'select') {
+      el = document.createElement('select');
+      (f.options || []).forEach(function (o) {
+        var opt = document.createElement('option');
+        opt.value = o; opt.textContent = o;
+        opt.selected = String(o) === String(f.defaultValue);
+        el.appendChild(opt);
+      });
+    } else {
+      el = document.createElement('input');
+      if (f.kind === 'number') {
+        el.type = 'number'; el.step = 'any';
+        if (f.min != null) el.min = String(f.min);
+        if (f.max != null) el.max = String(f.max);
+      } else {
+        // Head text becomes public explorer content; the catalog carries the charset the server accepts.
+        if (f.maxLength != null) el.maxLength = f.maxLength;
+        if (f.pattern) el.pattern = f.pattern;
+      }
+      el.value = f.defaultValue == null ? '' : String(f.defaultValue);
+    }
+    el.id = 'fHead-' + f.name;
+    el.required = true;
+    return el;
+  }
+
+  function renderHeadFields(head) {
+    var box = $('headFields');
+    box.innerHTML = '';
+    head.forEach(function (f) {
+      var label = document.createElement('label');
+      label.appendChild(document.createTextNode(f.label));
+      label.appendChild(headInput(f));
+      if (f.hint) {
+        var hint = document.createElement('span');
+        hint.className = 'hint'; hint.textContent = f.hint;
+        label.appendChild(hint);
+      }
+      box.appendChild(label);
+    });
+  }
+
+  /** The head values as createDemoPassport expects them in headJson. */
+  function headValues() {
+    var out = {};
+    (profile ? profile.head : []).forEach(function (f) {
+      var el = $('fHead-' + f.name);
+      if (!el) return;
+      out[f.name] = f.kind === 'number' ? Number(el.value) : el.value.trim();
+    });
+    return out;
+  }
+
+  async function enterForm() {
+    $('idNight').textContent = store.get('night') || '';
+    $('familyError').textContent = '';
+    show('viewForm');
+    try {
+      await loadProfiles();
+    } catch (e) {
+      $('familyError').textContent = 'Could not load the product families: ' + e.message;
+      $('btnCreate').disabled = true;
+      return;
+    }
+    await selectProfile(profile ? profile.id : (store.get('profile') || (profiles[0] && profiles[0].id)));
+  }
+
+  // ---- primary claim (always proven) ------------------------------------
+
+  function relWord(spec) { return spec.predicate === 'lessOrEqual' ? 'at most' : 'at least'; }
+
+  function holds(spec, value, threshold) {
+    return spec.predicate === 'lessOrEqual' ? value <= threshold : value >= threshold;
+  }
+
+  function renderPrimary(spec) {
+    primarySpec = spec;
+    $('primaryValueLabel').textContent = spec.label + ' (' + spec.unit + ')';
+    $('primaryThresholdLabel').textContent =
+      'Prove publicly: ' + spec.label.toLowerCase() + ' is ' + relWord(spec) + ' (' + spec.unit + ')';
+    var v = $('fPrimaryValue'), t = $('fPrimaryThreshold');
+    v.min = String(spec.min); v.max = String(spec.max); v.value = String(spec.defaultValue);
+    t.min = String(spec.min); t.max = String(spec.max * 2); t.value = String(spec.defaultThreshold);
+    syncClaimBounds(false);
+  }
+
+  // Keep the primary pair valid while typing: the public bound can never sit
+  // on the wrong side of the confidential value (the proof must be TRUE).
+  function syncClaimBounds(bump) {
+    if (!primarySpec) return;
+    var v = Number($('fPrimaryValue').value), t = $('fPrimaryThreshold');
+    if (!Number.isFinite(v)) return;
+    if (primarySpec.predicate === 'lessOrEqual') {
+      t.min = String(Math.max(primarySpec.min, v));
+      t.max = String(primarySpec.max * 2);
+      if (bump && Number(t.value) < v) t.value = String(v);
+    } else {
+      t.min = String(primarySpec.min);
+      t.max = String(v);
+      if (bump && Number(t.value) > v) t.value = String(v);
+    }
+  }
+  $('fPrimaryValue').addEventListener('input', () => syncClaimBounds(false));
+  $('fPrimaryValue').addEventListener('change', () => syncClaimBounds(true));
+  $('fPrimaryThreshold').addEventListener('change', () => syncClaimBounds(true));
+
+  // ---- extra claims ------------------------------------------------------
+  // Each entry is opt-in: tick it, set a confidential value and the public bound.
 
   function claimRow(spec) {
     var wrap = document.createElement('label');
@@ -279,7 +399,7 @@
         '</span>' +
         // Membership is a different kind of claim than the bounds above, so
         // it gets a permanent explanation plus the public list it refers to.
-        '<span class="hint claim-explain">Proves your chemistry is on this public list. Which of the ' + options.length +
+        '<span class="hint claim-explain">Proves your ' + esc(spec.label).toLowerCase() + ' is on this public list. Which of the ' + options.length +
           ' it is stays hidden. ' +
           '<button type="button" class="link-btn" id="' + idBase + '_toggle">Show the list</button></span>' +
         '<span class="claim-set-list" id="' + idBase + '_list" hidden>' + options.map(esc).join(' \u00b7 ') + '</span>' +
@@ -351,13 +471,13 @@
 
   function claimTrue(c) {
     if (c.spec.kind === 'membership') { return !!c.member; } // options ARE the list
-    return c.spec.predicate === 'lessOrEqual' ? c.value <= c.threshold : c.value >= c.threshold;
+    return holds(c.spec, c.value, c.threshold);
   }
 
   /** Live count plus a per-row warning when a claim would not hold. */
   function updateClaimState() {
     var picked = selectedClaims();
-    var n = picked.length + 1; // the footprint claim is always proven
+    var n = picked.length + 1; // the primary claim is always proven
     $('claimCount').textContent = n === 1 ? '1 claim' : n + ' claims, one transaction';
     claimSpecs.forEach(function (spec) {
       var row = $('claim_' + spec.field + '_on');
@@ -379,28 +499,42 @@
     });
   }
 
-  async function loadClaimFields() {
+  // A later family pick wins over a slower earlier catalogue response.
+  var claimLoadSeq = 0;
+
+  async function loadClaimFields(profileId) {
+    var seq = ++claimLoadSeq;
+    var all = [];
     try {
-      var all = await api('GET', '/demoClaimFields()');
-      claimSpecs = (all.value || all || []).filter(function (c) { return !c.primary; });
+      var res = await api('GET', "/demoClaimFields(profile='" + encodeURIComponent(profileId) + "')");
+      all = res.value || res || [];
     } catch (e) {
-      claimSpecs = []; // older server: the demo still runs with the single claim
+      $('familyError').textContent = 'Could not load the claim catalogue: ' + e.message;
     }
+    if (seq !== claimLoadSeq) return;
+    var primary = all.find(function (c) { return c.primary; })
+      || all.find(function (c) { return profile && c.field === profile.primaryField; });
+    claimSpecs = all.filter(function (c) { return c !== primary; });
+    if (primary) renderPrimary(primary); else primarySpec = null;
+    $('btnCreate').disabled = !primary;
     var list = $('claimList');
-    if (!list) return;
     list.innerHTML = '';
-    if (!claimSpecs.length) { $('claimCart').hidden = true; return; }
+    $('claimCart').hidden = !claimSpecs.length;
     claimSpecs.forEach(function (spec) { list.appendChild(claimRow(spec)); });
     updateClaimState();
   }
-  loadClaimFields();
 
   $('passportForm').addEventListener('submit', async (ev) => {
     ev.preventDefault();
     $('formError').textContent = '';
-    const co2 = Number($('fCo2').value), thr = Number($('fThreshold').value);
-    if (co2 > thr) {
-      $('formError').textContent = 'The threshold must be at least the CO2 value: the demo proves a TRUE claim.';
+    if (!profile || !primarySpec) {
+      $('formError').textContent = 'Pick a product family first.';
+      return;
+    }
+    const pv = Number($('fPrimaryValue').value), pt = Number($('fPrimaryThreshold').value);
+    if (!holds(primarySpec, pv, pt)) {
+      $('formError').textContent = primarySpec.label + ': ' + pv + ' is not ' + relWord(primarySpec) + ' ' + pt
+        + '. The demo proves a TRUE claim; adjust the value or the bound.';
       return;
     }
     const extra = selectedClaims();
@@ -410,21 +544,19 @@
         + 'Adjust the value or the bound.';
       return;
     }
+    const claims = [{ field: primarySpec.field, value: pv, threshold: pt }].concat(extra.map(function (c) {
+      return c.spec.kind === 'membership'
+        ? { field: c.field, member: c.member }
+        : { field: c.field, value: c.value, threshold: c.threshold };
+    }));
     setLoading($('btnCreate'), 'Submitting your passport…');
     try {
       const r = await api('POST', '/createDemoPassport', {
         testerId: store.get('testerId'),
-        model: $('fModel').value.trim(),
-        manufacturer: $('fManufacturer').value.trim(),
-        weightKg: Number($('fWeight').value),
-        performanceClass: $('fPerf').value,
-        co2Kg: co2,
-        proveThreshold: thr,
-        claimsJson: JSON.stringify(extra.map(function (c) {
-          return c.spec.kind === 'membership'
-            ? { field: c.field, member: c.member }
-            : { field: c.field, value: c.value, threshold: c.threshold };
-        }))
+        profile: profile.id,
+        headJson: JSON.stringify(headValues()),
+        claimsJson: JSON.stringify(claims),
+        secondLife: !!(profile.secondLife && $('fSecondLife').checked)
       });
       store.set('runId', r.runId);
       store.set('passportId', r.passportId);
@@ -500,7 +632,7 @@
     title: 'ZK-prove your claims',
     badge: (n) => n + ' ZK proofs · 1 batched transaction',
     info: 'Every line below is a public statement about one of your confidential values, and that statement is all the proof reveals. ' +
-      'The real number, or which entry of the public list your chemistry is, never appears anywhere: on-chain sits only the evidence that the statement holds.',
+      'The real number, or which entry of a public list your value is, never appears anywhere: on-chain sits only the evidence that the statement holds.',
     txLabel: 'proof tx '
   };
 
@@ -702,7 +834,7 @@
     }
     const secondLife = steps.find((s) => s.kind === 'secondLife' && s.status === 'succeeded');
     if (secondLife) {
-      links.push('<span class="hint">Your battery lived a second life: it aged, was repurposed and re-anchored as version 2. The explorer page shows its full anchor history; version 1 stays verifiable forever.</span>');
+      links.push('<span class="hint">Your ' + esc(familyNoun(store.get('profileLabel'))) + ' lived a second life: it aged, was repurposed and re-anchored as version 2. The explorer page shows its full anchor history; version 1 stays verifiable forever.</span>');
     }
     $('doneLinks').innerHTML = links.join('') || '';
     // The proven statements, as they were shown in the timeline: the public
@@ -723,7 +855,8 @@
 
   function restart() {
     clearInterval(pollTimer);
-    for (const k of ['testerId', 'night', 'shielded', 'runId', 'passportId', 'parked']) store.del(k);
+    for (const k of ['testerId', 'night', 'shielded', 'runId', 'passportId', 'parked', 'profile', 'profileLabel']) store.del(k);
+    profile = null;
     $('btnStart').disabled = false;
     $('btnCreate').disabled = false;
     void initLanding();
@@ -742,6 +875,6 @@
   // ---------- boot: resume where the visitor left off ----------
 
   if (store.get('runId')) enterRun();
-  else if (store.get('testerId') && !store.get('parked')) enterForm();
+  else if (store.get('testerId') && !store.get('parked')) void enterForm();
   else void initLanding();
 })();

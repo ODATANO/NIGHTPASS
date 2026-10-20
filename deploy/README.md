@@ -45,6 +45,12 @@ secrets; it reads and verifies only.
 ## Notes
 
 - `deploy/.env` is gitignored; move it to the server via scp, never commit it.
+- The schema carries the product families: `Passports.profile` (battery |
+  component) and the component tables `MaterialCertificates`,
+  `QualificationTests`, `CustodyRecords`. On PostgreSQL the `npm run deploy`
+  step adds them by schema evolution on the next deploy (the main container
+  runs it at every start, the demo instance in its one-off deploy step);
+  existing rows keep working as batteries.
 - PostgreSQL data lives in `passport-pg-data`. Back up with `pg_dump` before
   upgrades and verify restores regularly; a Docker volume is persistence, not
   a backup.
@@ -62,16 +68,17 @@ secrets; it reads and verifies only.
 ## Try-it demo instance (optional, compose profile `demo`)
 
 A second container (`nightpass-demo` + an internal `proof-server`) lets
-visitors anchor their OWN passport on `demo.<your-domain>`. Since
-2026-08-28 the demo runs on the REMOTE transport: the container holds no
-wallet and no NIGHT. Each run derives a throwaway seed, builds and proves
-its transactions locally (`@odatano/nightgate-tx`, proving on the internal
-proof-server) and hands the fee-unpaid bytes to the hosted NIGHTGATE
-(`api.nightgate.dev`) under an agent grant; the hosted sponsor pool pays
-the dust. Per run: attest + anchorContentRoot + bindDocument (one batch), the
-claim cart (one batch), optionally the second-life re-anchor. Verification
-reads go through the same API with the token. Runs start immediately (no
-wallet sync). Rollout:
+visitors anchor their OWN passport (battery or component) on
+`demo.<your-domain>`. The demo runs on the REMOTE transport: the container
+holds no wallet and no NIGHT. Each run derives a throwaway seed, builds and
+proves its transactions locally (`@odatano/nightgate-tx`, proving on the
+internal proof-server) and hands the fee-unpaid bytes to the hosted NIGHTGATE
+(`api.nightgate.dev`, service paths `/odata/v4/midnight*`) under an agent
+grant; the hosted sponsor pool pays the dust. Per run: attest +
+anchorContentRoot + bindDocument (one batch), the claim cart (one batch),
+optionally the second-life re-anchor (battery only). Verification reads go
+through the same API with the token. Runs start immediately (no wallet
+sync). Rollout:
 
 1. **DNS**: A record for `demo.<your-domain>` (the wildcard already covers it
    on zkpassport.eu).
@@ -93,7 +100,9 @@ wallet sync). Rollout:
 4. **Caddy**: `cp Caddyfile.demo Caddyfile` on the server (adds the demo
    site), then `docker compose restart caddy`.
 5. **Schema, then start**: deploy the schema as a one-off so a slow
-   `cds.deploy` can never eat the healthcheck window, then start:
+   `cds.deploy` can never eat the healthcheck window (this is also the step
+   that adds `Passports.profile` and the component tables to an existing
+   database), then start:
    ```bash
    docker compose --profile demo build nightpass-demo
    docker compose --profile demo run --rm --no-deps nightpass-demo npm run deploy
@@ -103,11 +112,12 @@ wallet sync). Rollout:
    the `passport-demo-zk-cache` volume (`remote lane zk assets ready` in the
    log); later boots find them cached.
 6. **Smoke**: `https://demo.<your-domain>/api/v1/demo/demoInfo()` shows
-   `"enabled": true`; run one visitor flow from a phone. Expect two anchor
-   txs (attest, then root + bind), ONE proof tx for all picked claims, and on
-   the done view the QR plus an explorer link that auto-verifies green. On
-   the hosted side the grant's `jobsUsed` grows by 3 per run (4 with the
-   second-life act).
+   `"enabled": true`; `demoProfiles()` lists both families; run one visitor
+   flow per family from a phone. Expect two anchor txs (attest, then root +
+   bind), ONE proof tx for all picked claims, and on the done view the QR
+   plus an explorer link that auto-verifies green. On the hosted side the
+   grant's `jobsUsed` grows by 3 per run (4 with the battery second-life
+   act).
 
 Fallback: `DEMO_TRANSPORT=plugin` keeps the in-process lane (server wallets,
 sponsor pool, `mem_limit` 12g); the wallet/sponsor keys in the example file

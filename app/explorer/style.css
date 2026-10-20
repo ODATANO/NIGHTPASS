@@ -223,6 +223,16 @@ td .sub { color: var(--ink-3); font-size: 12px; }
 .net { font-family: var(--mono); font-size: 12px; color: var(--ink-2); border: 1px dashed var(--border); border-radius: 6px; padding: 1px 7px; }
 .net.preview { color: var(--accent); border-color: var(--accent-2); }
 
+/* Product family badge (Battery / Component) on list rows and the detail head */
+.fam-chip {
+  display: inline-block; margin-right: 6px; padding: 0 7px;
+  border: 1px solid var(--border); border-radius: 999px;
+  font-family: var(--sans); font-size: 11px; font-weight: 600; letter-spacing: 0.04em;
+  color: var(--ink-2); vertical-align: middle; white-space: nowrap;
+}
+.fam-chip.fam-component { color: var(--accent); border-color: var(--accent-2); }
+.detail-head .fam-chip { font-size: 12px; }
+
 /* ---------- Verify ---------- */
 
 .btn {

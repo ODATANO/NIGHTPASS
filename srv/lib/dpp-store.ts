@@ -1,5 +1,3 @@
-/**
- * In-memory versioned DPP store + merge-patch helpers. Extracted to
- * @odatano/dpp-sdk; this shim keeps the historical import path stable.
- */
-export * from '@odatano/dpp-sdk/battery/store';
+/** Versioned DPP document store and helpers; NIGHTPASS documents use the battery profile. */
+export * from '@odatano/dpp-sdk/store';
+export { BATTERY_DOCUMENT, GUIDE_ACCESS } from '@odatano/dpp-sdk/battery/document';

@@ -15,29 +15,31 @@ const { INSERT, SELECT, UPDATE } = cds.ql;
 // the chain (see db/passport-schema.cds). `after READ` handlers strip every
 // field a tier may not see, so the same backend data renders three lawful views.
 //
-//   consumer  (anonymous)        → Annex XIII Point 1 only (public metadata).
-//   recycler  (role 'recycler')  → + dismantling / cell chemistry / capacity /
-//                                    recycled-content %  (legitimate interest).
-//   authority (role 'authority') → everything: supplier identities, carbon
-//                                    footprint, due-diligence docs, on-chain
-//                                    lineage.
-// Tier model + redaction rules are extracted to @odatano/dpp-sdk (shared with
-// DAYPASS); only the CAP wiring (role resolution, on-chain grant lookup, CQN
-// probing guards) and the chain-specific authority field list live here.
-import {
-    maxTier, levelToTier, attributeVisible, strip,
-    redactBattery, redactRecycled,
-    BATTERY_AUTHORITY_FIELDS, RECYCLED_AUTHORITY_FIELDS,
-    redactPassport as redactPassportShared, type Tier
-} from '@odatano/dpp-sdk/tier';
+//   public             (anonymous)        -> the public head fields only.
+//   legitimateInterest (role 'recycler')  -> + the profile's children minus
+//                                            supplier identities.
+//   authority          (role 'authority') -> everything: supplier identities,
+//                                            evidence, on-chain lineage.
+// The access vocabulary and the redaction rules per product profile come from
+// @odatano/dpp-sdk; only the CAP wiring (role resolution, on-chain grant
+// lookup, CQN probing guards) and the chain-specific authority field list live here.
+import { maxLevel, levelFromRank, strip, ACCESS_RANK, type AccessLevel } from '@odatano/dpp-sdk/access';
+import { redactRow, redactChildRow, type ChildSpec } from '@odatano/dpp-sdk/profile';
+import { APP_PROFILES, PROFILE_IDS, appProfileOf } from './lib/product-profiles';
 
-/** Tier from the requester's configured CAP roles (the dev/mocked-auth path). */
-function localTierOf(req: cds.Request): Tier {
+/** Access level from the requester's configured CAP roles (the dev/mocked-auth path). */
+function localLevelOf(req: cds.Request): AccessLevel {
     const user = req.user;
     if (user?.is('authority')) return 'authority';
-    if (user?.is('recycler')) return 'recycler';
-    return 'consumer';
+    if (user?.is('recycler')) return 'legitimateInterest';
+    return 'public';
 }
+
+/** Service entity name -> the child spec that governs its redaction, over every profile. */
+const CHILD_SPECS: ReadonlyArray<{ entity: string; spec: ChildSpec }> = PROFILE_IDS.flatMap((id) =>
+    Object.entries(APP_PROFILES[id].profile.children).map(([key, spec]) => ({
+        entity: String(APP_PROFILES[id].childEntities[key]).split('.').pop() as string, spec,
+    })));
 
 // On-chain disclosure ACL ----------------------------------
 //
@@ -121,9 +123,9 @@ const PASSPORT_AUTHORITY_FIELDS = [
     'payloadHash', 'passportIdHash', 'contractAddress', 'attestationTxHash', 'attestation', 'attestation_ID', 'owner'
 ] as const;
 
-/** Redact one Passports row (and any expanded children) for the given tier. */
-function redactPassport(row: Record<string, unknown>, tier: Tier): void {
-    redactPassportShared(row, tier, PASSPORT_AUTHORITY_FIELDS);
+/** Redact one Passports row (and any expanded children) for the given level. */
+function redactPassport(row: Record<string, unknown>, level: AccessLevel): void {
+    redactRow(appProfileOf(row.profile).profile, row, level, PASSPORT_AUTHORITY_FIELDS);
 }
 
 /**
@@ -180,21 +182,23 @@ export default class PassportService extends cds.ApplicationService {
         // projections (unqualified names, relative to PassportService), not the
         // db-level `passport.*` entities the cds-typer classes resolve to, which
         // a service READ never matches.
-        // The disclosure gate matches grants by payloadHash, so it must be in the
-        // row even when the client didn't $select it. Inject it up front; it is
-        // then stripped again by redactPassport for non-authority tiers.
+        // The disclosure gate matches grants by payloadHash and redacts by
+        // profile, so both must be in the row even when the client didn't
+        // $select them. Inject them up front; payloadHash is then stripped
+        // again by redactPassport for non-authority levels.
         this.before('READ', 'Passports', (req) => {
             const cols = (req.query as any)?.SELECT?.columns as any[] | undefined;
-            if (Array.isArray(cols) && !cols.some((c) => c === '*' || (c?.ref && c.ref[0] === 'payloadHash'))) {
-                cols.push({ ref: ['payloadHash'] });
+            if (!Array.isArray(cols) || cols.some((c) => c === '*')) return;
+            for (const name of ['payloadHash', 'profile']) {
+                if (!cols.some((c) => c?.ref && c.ref[0] === name)) cols.push({ ref: [name] });
             }
         });
 
         this.after('READ', 'Passports', async (data, req) => {
-            const local = localTierOf(req);
+            const local = localLevelOf(req);
             const grantees = await granteesOf(req);
             // A registered dataspace partner (DID login, role 'partner') has no
-            // local tier; the GRANT LEVEL per passport drives disclosure, and
+            // local level; the GRANT LEVEL per passport drives disclosure, and
             // they see ONLY passports granted to them. Built-in demo users and
             // the producer keep role-based behavior (no list scoping).
             const isPartner = !!req.user?.is?.('partner');
@@ -204,8 +208,8 @@ export default class PassportService extends cds.ApplicationService {
                 const ph = typeof row.payloadHash === 'string' ? row.payloadHash : '';
                 const grantLvl = effective && ph ? (effective.get(ph) ?? -1) : -1;
                 if (isPartner && grantLvl < 0) continue; // partner: granted passports only
-                const grantTier: Tier = grantLvl >= 0 ? levelToTier(grantLvl) : 'consumer';
-                redactPassport(row, maxTier(local, grantTier));
+                const grantLevel: AccessLevel = grantLvl >= 0 ? levelFromRank(grantLvl) : 'public';
+                redactPassport(row, maxLevel(local, grantLevel));
                 kept.push(row);
             }
             if (isPartner && Array.isArray(data)) data.splice(0, data.length, ...kept);
@@ -213,46 +217,32 @@ export default class PassportService extends cds.ApplicationService {
         // Direct child reads carry no passport scope, so on-chain (per-attestation)
         // grants can't be resolved here; gate on the local role only.
         //
-        // The boundary is enforced BEFORE the database: a consumer gets no row
-        // at all (an empty row still leaks through $count), and a recycler may
-        // not filter, sort or aggregate on the authority-only columns. The
-        // after-READ redaction below stays as defense in depth.
-        this.before('READ', 'Batteries', (req) => {
-            const tier = localTierOf(req);
-            if (tier === 'consumer') return restrictToNothing(req);
-            if (tier !== 'authority') rejectRestrictedProbing(req, BATTERY_AUTHORITY_FIELDS);
-        });
-        this.after('READ', 'Batteries', (data, req) => {
-            const tier = localTierOf(req);
-            asRows(data).forEach((row) => redactBattery(row, tier));
-        });
-        this.before('READ', 'RecycledMaterials', (req) => {
-            const tier = localTierOf(req);
-            if (tier === 'consumer') return restrictToNothing(req);
-            if (tier !== 'authority') rejectRestrictedProbing(req, RECYCLED_AUTHORITY_FIELDS);
-        });
-        this.after('READ', 'RecycledMaterials', (data, req) => {
-            const tier = localTierOf(req);
-            asRows(data).forEach((row) => redactRecycled(row, tier));
-        });
-        // Direct and nav-property reads on the guide-attribute rows: restrict
-        // BEFORE the database via a tier where-clause. Row-level after-READ
+        // The boundary is enforced BEFORE the database: below the child's
+        // minimum level a caller gets no row at all (an empty row still leaks
+        // through $count), and below authority nobody may filter, sort or
+        // aggregate on the authority-only columns. The after-READ redaction
+        // stays as defense in depth.
+        for (const { entity, spec } of CHILD_SPECS) {
+            const minLevel = spec.minLevel ?? 'legitimateInterest';
+            this.before('READ', entity, (req) => {
+                const level = localLevelOf(req);
+                if (ACCESS_RANK[level] < ACCESS_RANK[minLevel]) return restrictToNothing(req);
+                if (level !== 'authority') rejectRestrictedProbing(req, spec.authorityColumns ?? []);
+            });
+            this.after('READ', entity, (data, req) => {
+                const level = localLevelOf(req);
+                asRows(data).forEach((row) => redactChildRow(spec, row, level));
+            });
+        }
+        // Direct and nav-property reads on the attribute rows: restrict BEFORE
+        // the database via a level where-clause. Row-level after-READ
         // filtering is not enough here: clients control $select, and a row
         // fetched without its accessClass column cannot be classified anymore.
         this.before('READ', 'PassportAttributes', (req) => {
-            const tier = localTierOf(req);
-            if (tier === 'authority') return;
-            const allowed = tier === 'recycler' ? ['public', 'legitimateInterest'] : ['public'];
+            const level = localLevelOf(req);
+            if (level === 'authority') return;
+            const allowed = level === 'legitimateInterest' ? ['public', 'legitimateInterest'] : ['public'];
             (req.query as any).where({ accessClass: { in: allowed } });
-        });
-        // DiligenceDoc is authority-only in full; below-tier requests get nothing
-        // (not even a row count, hence the before-READ restriction).
-        this.before('READ', 'DiligenceDoc', (req) => {
-            if (localTierOf(req) !== 'authority') restrictToNothing(req);
-        });
-        this.after('READ', 'DiligenceDoc', (data, req) => {
-            if (localTierOf(req) === 'authority') return;
-            asRows(data).forEach((row) => strip(row, Object.keys(row)));
         });
 
         return super.init();
@@ -779,10 +769,24 @@ export default class PassportService extends cds.ApplicationService {
 
     private anchorExplorer = async () => {
         const rows = await SELECT.from(Passports)
-            .columns('ID', 'passportId', 'model', 'manufacturerId', 'batteryCategory', 'status',
+            .columns('ID', 'passportId', 'profile', 'model', 'manufacturerId', 'batteryCategory', 'status',
                 'manufactureDate', 'weightKg', 'performanceClass', 'qrCodeUrl',
                 'payloadHash', 'contractAddress', 'anchorNetwork', 'attestationTxHash', 'createdAt', 'attesterId')
             .orderBy('createdAt desc');
+        // Public attribute rows the profiles show on the explorer (e.g. a
+        // component's safety class). Public by their own access class.
+        const shown = [...new Set(PROFILE_IDS.flatMap((id) => [...APP_PROFILES[id].explorerAttributes]))];
+        const attrRows = shown.length
+            ? await SELECT.from('passport.PassportAttributes')
+                .columns('passport_ID', 'attribute', 'valueJson')
+                .where({ attribute: { in: shown }, accessClass: 'public' }) as Record<string, unknown>[]
+            : [];
+        const attrsByPassport = new Map<string, { attribute: string; valueJson: string }[]>();
+        for (const a of attrRows) {
+            const list = attrsByPassport.get(String(a.passport_ID)) ?? [];
+            list.push({ attribute: String(a.attribute), valueJson: String(a.valueJson ?? '') });
+            attrsByPassport.set(String(a.passport_ID), list);
+        }
         // Successfully proven ZK claims per passport. Public by design: claim,
         // threshold (scaled back to raw units) and proof tx; never the value.
         const proofs: any[] = await SELECT.from(PredicateProofLog)
@@ -824,6 +828,7 @@ export default class PassportService extends cds.ApplicationService {
             .sort((a, b) => (rank[String(a.status)] ?? 9) - (rank[String(b.status)] ?? 9))
             .map((r) => ({
                 passportId: r.passportId,
+                profile: appProfileOf(r.profile).id,
                 model: r.model,
                 manufacturerId: r.manufacturerId,
                 batteryCategory: r.batteryCategory,
@@ -839,6 +844,8 @@ export default class PassportService extends cds.ApplicationService {
                 attesterId: r.attesterId ? norm(r.attesterId) : null,
                 explorerUrl: explorerTxUrl(r.attestationTxHash as string | null, r.anchorNetwork as string | null),
                 createdAt: r.createdAt ?? null,
+                attributes: (attrsByPassport.get(String(r.ID)) ?? []).filter((a) =>
+                    appProfileOf(r.profile).explorerAttributes.includes(a.attribute)),
                 claims: (claimsByPassport.get(String(r.ID)) ?? []).map((c: any) => ({
                     ...c, explorerUrl: explorerTxUrl(c.txHash, r.anchorNetwork as string | null),
                 })),

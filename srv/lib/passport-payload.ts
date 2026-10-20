@@ -1,39 +1,36 @@
 /**
- * Canonical payload projection v2. The pure projection (payloadFromDb) is
- * extracted to @odatano/dpp-sdk (shared with DAYPASS, byte-identical hashing);
- * only the thin CAP reader lives here. See the SDK module for the determinism
- * rules and the v1/v2 drift story.
+ * Canonical payload of a passport: the profile's children plus the attribute
+ * rows, read from the database and projected by the dpp-sdk engine. The
+ * projection is the frozen hash contract; only the CAP reader lives here.
  */
-
 import cds from '@sap/cds';
-import type { GuideAttributeRow } from '@odatano/dpp-sdk/battery/guide-defaults';
+import { projectPayload, type ProfileRows } from '@odatano/dpp-sdk/profile';
+import type { AttributeRow } from '@odatano/dpp-sdk/attributes';
+import type { AppProfile } from './product-profiles';
 
-export { PAYLOAD_VERSION, payloadFromDb, type PayloadInputs } from '@odatano/dpp-sdk/payload';
-import type { PayloadInputs } from '@odatano/dpp-sdk/payload';
+export { projectPayload, type ProfileRows };
 
 const { SELECT } = cds.ql;
 
-/** Read the payload inputs of a passport from the DB (current state). */
-export async function readPayloadInputs(passportRowId: string): Promise<PayloadInputs> {
-    const [batteries, recycledMaterials, diligenceDocs, attributes] = await Promise.all([
-        cds.run(SELECT.from('passport.Batteries')
-            .columns('serialNumber', 'cellChemistry', 'capacityKwh', 'carbonFootprintKgCO2', 'supplierName',
-                'recycledContentPct', 'cycleLife', 'roundTripEfficiencyPct', 'leadContentPpm')
-            .where({ passport_ID: passportRowId })),
-        cds.run(SELECT.from('passport.RecycledMaterials')
-            .columns('material', 'recycledPercentage', 'sourceSupplierName')
-            .where({ passport_ID: passportRowId })),
-        cds.run(SELECT.from('passport.DiligenceDoc')
-            .columns('docType', 'fileName', 'sha256')
-            .where({ passport_ID: passportRowId })),
-        cds.run(SELECT.from('passport.PassportAttributes')
-            .columns('section', 'attribute', 'valueJson', 'accessClass')
-            .where({ passport_ID: passportRowId })),
-    ]) as [Record<string, unknown>[], Record<string, unknown>[], Record<string, unknown>[], GuideAttributeRow[]];
-    return {
-        batteries: batteries ?? [],
-        recycledMaterials: recycledMaterials ?? [],
-        diligenceDocs: diligenceDocs ?? [],
-        attributes: attributes ?? [],
-    };
+/** Child rows of every profile child plus the attribute rows (current state). */
+export async function readProfileRows(app: AppProfile, passportRowId: string): Promise<ProfileRows> {
+    const rows: ProfileRows = {};
+    await Promise.all(Object.entries(app.profile.children).map(async ([key, spec]) => {
+        const entity = app.childEntities[key];
+        if (!entity) throw new Error(`profile '${app.id}' has no table for child '${key}'`);
+        const list = await cds.run(SELECT.from(entity)
+            .columns(...Object.keys(spec.columns))
+            .where({ passport_ID: passportRowId })) as Record<string, unknown>[] | undefined;
+        rows[key] = list ?? [];
+    }));
+    const attributes = await cds.run(SELECT.from('passport.PassportAttributes')
+        .columns('section', 'attribute', 'valueJson', 'accessClass')
+        .where({ passport_ID: passportRowId })) as AttributeRow[] | undefined;
+    rows.attributes = attributes ?? [];
+    return rows;
+}
+
+/** The canonical payload of a passport as stored right now. */
+export async function readPayload(app: AppProfile, passportRowId: string): Promise<Record<string, unknown>> {
+    return projectPayload(app.profile, await readProfileRows(app, passportRowId));
 }

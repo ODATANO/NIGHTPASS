@@ -4,13 +4,13 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Try it - anchor your own ZK battery passport | NIGHTPASS</title>
+  <title>Try it - anchor your own ZK product passport | NIGHTPASS</title>
   <meta name="description"
-    content="Anchor your own zero-knowledge battery passport on Midnight in five minutes. No wallet, no tokens, no signup." />
+    content="Anchor your own zero-knowledge product passport on Midnight in five minutes. No wallet, no tokens, no signup." />
   <!-- Link previews (Open Graph + Twitter). og:image must be an absolute URL. -->
   <meta property="og:type" content="website" />
   <meta property="og:site_name" content="zkpassport.eu" />
-  <meta property="og:title" content="Anchor your own battery passport on Midnight" />
+  <meta property="og:title" content="Anchor your own product passport on Midnight" />
   <meta property="og:description"
     content="No wallet, no tokens, no signup. Five minutes, zero-knowledge proof included. Live on a Midnight testnet." />
   <meta property="og:url" content="https://demo.zkpassport.eu/demo/" />
@@ -18,7 +18,7 @@
   <meta property="og:image:width" content="2400" />
   <meta property="og:image:height" content="1260" />
   <meta name="twitter:card" content="summary_large_image" />
-  <meta name="twitter:title" content="Anchor your own battery passport on Midnight" />
+  <meta name="twitter:title" content="Anchor your own product passport on Midnight" />
   <meta name="twitter:description"
     content="No wallet, no tokens, no signup. Five minutes, zero-knowledge proof included. Live on a Midnight testnet." />
   <meta name="twitter:image" content="https://demo.zkpassport.eu/demo/og-image.png" />
@@ -39,12 +39,12 @@
 
     <!-- ============ view: landing ============ -->
     <section id="viewLanding" class="view">
-      <h1 class="hero-title">Create your own <em>battery passport</em><br />and anchor it on Midnight.</h1>
+      <h1 class="hero-title">Create your own <em>product passport</em><br />and anchor it on Midnight.</h1>
       <p class="hero-sub">
-        From February 2027 the EU Battery Regulation requires a digital
-        passport for every EV, industrial and light-transport battery sold in
-        Europe: public, verifiable data without exposing competitive secrets.
-        Exactly what you get to try here, live on a real Midnight testnet:
+        A digital product passport publishes verifiable data about a product
+        without exposing competitive secrets. Pick a product family, an EV
+        battery or a safety-related plant component, and try exactly that,
+        live on a real Midnight testnet:
       </p>
       <div class="feature-row">
         <span class="feature-pill"><span class="fdot"></span>dust-sponsored fees</span>
@@ -54,8 +54,8 @@
         <span class="feature-pill"><svg class="lock" aria-hidden="true" viewBox="0 0 14 16" xmlns="http://www.w3.org/2000/svg"><path d="M4 7 V5 a3 3 0 0 1 6 0 V7" fill="none"/><rect x="1.8" y="7" width="10.4" height="7.2" rx="2" fill="none"/></svg>list membership, entry hidden</span>
       </div>
       <p class="hero-sub">
-        In about five minutes you will create a small battery passport, anchor
-        it on the Midnight blockchain and prove up to five confidential claims
+        In about five minutes you will create a small product passport, anchor
+        it on the Midnight blockchain and prove several confidential claims
         about it, without revealing a single number.
       </p>
       <div class="cta-row">
@@ -72,16 +72,16 @@
       </div>
       <div class="fact-row">
         <div class="fact">
-          <div class="fact-k">9</div>
-          <div class="fact-v">fields per passport, 4 of them optional confidential values you can make claims about</div>
+          <div class="fact-k">2</div>
+          <div class="fact-v">product families: an EV battery under the EU Battery Regulation, and a safety-related plant component with a material certificate, qualification tests and chain of custody</div>
         </div>
         <div class="fact">
           <div class="fact-k">3</div>
           <div class="fact-v">on-chain transactions per passport: the fingerprint, one batch for id binding + field root, one batch for every proof</div>
         </div>
         <div class="fact">
-          <div class="fact-k">5</div>
-          <div class="fact-v"><svg class="lock" aria-hidden="true" viewBox="0 0 14 16" xmlns="http://www.w3.org/2000/svg"><path d="M4 7 V5 a3 3 0 0 1 6 0 V7" fill="none"/><rect x="1.8" y="7" width="10.4" height="7.2" rx="2" fill="none"/></svg>kinds of confidential claims: CO2, capacity, cycle life and recycled content each stay within a public bound, and the cell chemistry is shown to be on a public list without saying which one. All proven together in one transaction</div>
+          <div class="fact-k">5+</div>
+          <div class="fact-v"><svg class="lock" aria-hidden="true" viewBox="0 0 14 16" xmlns="http://www.w3.org/2000/svg"><path d="M4 7 V5 a3 3 0 0 1 6 0 V7" fill="none"/><rect x="1.8" y="7" width="10.4" height="7.2" rx="2" fill="none"/></svg>confidential claims per family: each number stays within a public bound, each list value is shown to be on a public list without saying which entry. All proven together in one transaction</div>
         </div>
       </div>
       <ul class="how-list">
@@ -100,38 +100,24 @@
         <p class="muted small">Your passport is issued and anchored under this identity.</p>
       </div>
 
-      <h2>Your battery passport</h2>
+      <h2>Choose a product family</h2>
+      <div id="familyTiles" class="family-tiles" role="radiogroup" aria-label="Product family"></div>
+      <p id="familyError" class="err small"></p>
+
+      <h2 id="formTitle">Your product passport</h2>
       <form id="passportForm" class="panel form-panel">
         <div class="grid2">
-          <label>Model name
-            <input id="fModel" required maxlength="40" pattern="[A-Za-z0-9 ._\-]{2,40}"
-              placeholder="e.g. MyCell EV-60" />
-          </label>
-          <label>Manufacturer
-            <input id="fManufacturer" required maxlength="40" pattern="[A-Za-z0-9 ._\-]{2,40}"
-              placeholder="e.g. DemoWorks" />
-          </label>
-          <label>Weight (kg)
-            <input id="fWeight" required type="number" min="1" max="5000" step="1" value="300" />
-          </label>
-          <label>Performance class
-            <select id="fPerf" required>
-              <option value="A">A</option>
-              <option value="B" selected>B</option>
-              <option value="C">C</option>
-              <option value="D">D</option>
-              <option value="E">E</option>
-            </select>
-            <span class="hint">Public, shown on the explorer next to model and weight.</span>
-          </label>
+          <!-- Public head fields of the chosen family (demoProfiles().headJson). -->
+          <div id="headFields" class="head-fields"></div>
+          <!-- The family's primary claim: always proven. -->
           <label class="confidential">
-            <svg class="lock" aria-hidden="true" viewBox="0 0 14 16" xmlns="http://www.w3.org/2000/svg"><path d="M4 7 V5 a3 3 0 0 1 6 0 V7" fill="none"/><rect x="1.8" y="7" width="10.4" height="7.2" rx="2" fill="none"/></svg>Carbon footprint (kg CO2e) <span
+            <svg class="lock" aria-hidden="true" viewBox="0 0 14 16" xmlns="http://www.w3.org/2000/svg"><path d="M4 7 V5 a3 3 0 0 1 6 0 V7" fill="none"/><rect x="1.8" y="7" width="10.4" height="7.2" rx="2" fill="none"/></svg><span id="primaryValueLabel">Confidential value</span> <span
               class="chip-conf">confidential</span>
-            <input id="fCo2" required type="number" min="1" max="100000" step="1" value="3900" />
+            <input id="fPrimaryValue" required type="number" min="1" step="any" />
             <span class="hint">Never published, never on-chain in clear. Only a proof about it.</span>
           </label>
-          <label>Prove publicly: CO2 is at most (kg CO2e)
-            <input id="fThreshold" required type="number" min="1" max="200000" step="1" value="4000" />
+          <label><span id="primaryThresholdLabel">Prove publicly</span>
+            <input id="fPrimaryThreshold" required type="number" min="1" step="any" />
             <span class="hint">The claim everyone can verify, without learning the real value.</span>
           </label>
           <div class="claim-cart" id="claimCart">
@@ -142,6 +128,13 @@
             <p class="hint claim-cart-intro">Each extra claim adds another confidential value to your passport and one more public statement about it. They are proven together in ONE transaction, so any number of claims costs one wait and one fee.</p>
             <div id="claimList"></div>
           </div>
+          <label class="second-life" id="secondLifeBlock" hidden>
+            <span class="claim-line">
+              <input type="checkbox" id="fSecondLife" />
+              <span class="claim-label">Second life: age it and re-anchor it as version 2</span>
+            </span>
+            <span class="hint">After the first anchor the passport is aged, repurposed and anchored again. The explorer then shows both versions; version 1 stays verifiable.</span>
+          </label>
         </div>
         <div class="cta-row">
           <button type="submit" class="btn-primary" id="btnCreate">Anchor it on Midnight</button>
@@ -178,7 +171,7 @@
         <p><code id="donePassportId" class="hash big"></code></p>
         <div id="doneQr" class="done-qr" hidden>
           <img id="doneQrImg" alt="QR code linking to this passport" width="210" height="210" />
-          <span class="hint">Scan it: this QR is the passport's public link, like the one printed on a real battery.</span>
+          <span class="hint">Scan it: this QR is the passport's public link, like the one printed on or attached to a real product.</span>
         </div>
         <div id="doneLinks" class="done-links"></div>
         <div id="doneClaims" class="done-claims" hidden>
