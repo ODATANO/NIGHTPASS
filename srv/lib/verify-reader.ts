@@ -1,9 +1,9 @@
 /**
  * One seam for the crawler-free state reads (`verifyAttestationState`,
  * `verifyPredicateState`). Plugin: the in-process NightgateService under a
- * technical user. Hosted: the nightgate-tx client against NIGHTGATE_API_URL
- * with the agent token (the hosted API has no anonymous reads). Same
- * parameters, same answer shape on both.
+ * technical user. Hosted: the nightgate-tx client against the public verify
+ * service under NIGHTGATE_API_URL, without a token. Same parameters, same
+ * answer shape on both.
  *
  *   NIGHTGATE_VERIFY_VIA=hosted | plugin
  *   unset: hosted when the demo runs on the remote transport and the hosted

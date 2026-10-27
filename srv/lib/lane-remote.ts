@@ -409,7 +409,7 @@ export class RemoteLane implements ChainLane {
     }
 
     async verifyClaimLanded(input: ClaimVerifyInput): Promise<{ verified: boolean; txHash: string }> {
-        const ng = await this.client();
+        const ng = await hostedVerifyClient(this.cfg);
         const membership = input.predicate === 'setMembership';
         if (membership && !input.setRoot) return { verified: false, txHash: '' };
         const attesterId = input.attesterId ?? await this.attesterId();
@@ -422,9 +422,9 @@ export class RemoteLane implements ChainLane {
         return { verified: res?.verified === true, txHash: '' };
     }
 
-    /** Anchor effect check through the hosted API (token-authenticated); the record defaults to this lane's own. */
+    /** Anchor effect check through the public verify service; the record defaults to this lane's own. */
     async verifyAnchor(p: { contractAddress: string; payloadHash: string; attesterId?: string; contentRoot?: string; schemaId?: string }): Promise<boolean> {
-        const ng = await this.client();
+        const ng = await hostedVerifyClient(this.cfg);
         const attesterId = p.attesterId ?? await this.attesterId();
         const res = await ng.verifyAttestation({
             contractAddress: p.contractAddress, attesterId, payloadHash: p.payloadHash,
@@ -443,13 +443,13 @@ export class RemoteLane implements ChainLane {
 
 let hostedClientPromise: Promise<NightgateClient> | null = null;
 let hostedClientKey = '';
-/** A token-authenticated client for the read surface, shared per process. */
+/** A client for the public verify service, shared per process. It sends no token, so the reads cost nothing. */
 export function hostedVerifyClient(cfg: RemoteLaneConfig): Promise<NightgateClient> {
-    const key = `${cfg.apiUrl}|${cfg.agentToken}`;
+    const key = cfg.apiUrl;
     if (!hostedClientPromise || hostedClientKey !== key) {
         hostedClientKey = key;
         hostedClientPromise = sdk().then(({ client }) => client.connect({
-            baseUrl: cfg.apiUrl, agentToken: cfg.agentToken, timeoutMs: 120_000
+            baseUrl: cfg.apiUrl, servicePath: '/odata/v4/midnight-verify', timeoutMs: 120_000
         }));
     }
     return hostedClientPromise;
