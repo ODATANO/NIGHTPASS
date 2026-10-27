@@ -4,7 +4,7 @@
 # the anonymous live on-chain verification (PassportService.verifyOnChain) on
 # port 4004. Runs via cds-tsx: the TypeScript service implementations need the
 # tsx loader, plain cds-serve would silently skip them.
-FROM node:22-slim
+FROM node:22.23.4-slim
 
 # Fonts + fontconfig for sharp's SVG rasterizer (per-passport OG images);
 # node:22-slim ships none, and librsvg renders <text> through fontconfig.
