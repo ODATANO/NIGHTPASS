@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Nightly PostgreSQL backup for both NIGHTPASS databases, run from host cron.
+# Nightly PostgreSQL backup of the NIGHTPASS database, run from host cron.
 #
 #   bash backup-db.sh [target-dir]      # default /root/nightpass-backups
 #
-# Writes one custom-format dump per database (pg_dump -Fc, restorable with
+# Writes one custom-format dump (pg_dump -Fc, restorable with
 # pg_restore, compressed) and prunes dumps older than RETAIN_DAYS.
 #
 # IMPORTANT, and deliberately not automated here: these dumps live on the SAME
@@ -26,7 +26,7 @@ mkdir -p "$TARGET" || exit 1
 dump_one() {
   local service="$1" db="$2" user="$3"
   local out="$TARGET/${db}-${STAMP}.dump"
-  if ! docker compose --profile demo exec -T "$service" pg_dump -Fc -U "$user" -d "$db" > "$out" 2>/tmp/pgdump.err; then
+  if ! docker compose exec -T "$service" pg_dump -Fc -U "$user" -d "$db" > "$out" 2>/tmp/pgdump.err; then
     echo "=== $(date -Is) backup FAILED for $db: $(tail -1 /tmp/pgdump.err) ==="
     rm -f "$out"
     return 1
@@ -42,7 +42,6 @@ dump_one() {
 }
 
 rc=0
-dump_one postgres nightpass nightpass || rc=1
 dump_one postgres-demo nightpass_demo nightpass_demo || rc=1
 
 # Retention: keep the last RETAIN_DAYS days of dumps.

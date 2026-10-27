@@ -2,7 +2,7 @@
 # Periodic restart of the Try-it demo container to pre-empt stale sponsor
 # sessions (indexer websockets drop over long uptime -> "Sponsor session not
 # found, inactive" on every anchor). Boot re-prewarms the 3 sponsors to chain
-# tip and mints fresh sessions. Main site (nightpass, caddy) is untouched.
+# tip and mints fresh sessions. Caddy is untouched.
 set -uo pipefail
 cd /root/nightpass/deploy || exit 1
 
@@ -36,7 +36,7 @@ exec 9>/var/lock/nightpass-nightpass-demo.lock
 flock 9
 
 echo "=== $(date -Is) demo restart (cron) ==="
-/usr/bin/docker compose --profile demo restart nightpass-demo \
+/usr/bin/docker compose restart nightpass-demo \
   || echo "=== $(date -Is) restart command failed ==="
 
 # A wedged container can make `docker restart` fail ("did not receive an exit
@@ -46,7 +46,7 @@ if ! docker ps --format '{{.Names}}' | grep -q '^deploy-nightpass-demo-1$'; then
   echo "=== $(date -Is) container not running after restart, forcing kill + up -d ==="
   docker kill deploy-nightpass-demo-1 2>/dev/null
   docker rm -f deploy-nightpass-demo-1 2>/dev/null
-  /usr/bin/docker compose --profile demo up -d nightpass-demo
+  /usr/bin/docker compose up -d nightpass-demo
 fi
 
 # Wait for sponsor prewarm to catch up, then log the result.

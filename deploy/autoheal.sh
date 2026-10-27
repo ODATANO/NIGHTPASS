@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # Auto-heal for a NIGHTPASS container, run from host cron every 5 minutes.
 #
-#   bash autoheal.sh nightpass          # main site (zkpassport.eu)
-#   bash autoheal.sh nightpass-demo     # Try-it demo (demo.zkpassport.eu)
+#   bash autoheal.sh nightpass-demo     # explorer + demo (zkpassport.eu)
 #
 # Why this exists: Docker's restart policy does not act on failed healthchecks,
 # and a wedged container can even survive `docker restart` (2026-08-02 outage:
@@ -20,9 +19,6 @@ cd /root/nightpass/deploy || exit 1
 
 SERVICE="${1:-nightpass-demo}"
 NAME="deploy-${SERVICE}-1"
-# The demo container only exists under the compose profile of the same name.
-PROFILE_ARGS=()
-[ "$SERVICE" = "nightpass-demo" ] && PROFILE_ARGS=(--profile demo)
 
 [ -e ".${SERVICE}-off" ] && exit 0
 # Back-compat with the demo-only kill switch documented before this rewrite.
@@ -44,7 +40,7 @@ fi
 
 echo "=== $(date -Is) autoheal[$SERVICE]: state=$state health=$health, forcing recreate ==="
 docker rm -f "$NAME" 2>/dev/null
-if /usr/bin/docker compose "${PROFILE_ARGS[@]}" up -d "$SERVICE"; then
+if /usr/bin/docker compose up -d "$SERVICE"; then
   echo "=== $(date -Is) autoheal[$SERVICE]: up -d ok ==="
 else
   echo "=== $(date -Is) autoheal[$SERVICE]: up -d FAILED (exit $?) ==="
