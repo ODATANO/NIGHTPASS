@@ -1,5 +1,4 @@
 using { cuid, managed } from '@sap/cds/common';
-using { midnight } from '@odatano/nightgate/db/schema';
 
 namespace passport;
 
@@ -12,11 +11,9 @@ namespace passport;
  *   - Points 2/3     → LEGITIMATE INTEREST  (recycler tier)
  *   - Points 2/3 + supplier identities → AUTHORITY (notified-body tier)
  *
- * On-chain ≠ API: only the public metadata + payload hash go to Midnight (via
- * the plugin's `Attestations`); everything else stays encrypted off-chain and
- * the disclosure tier is enforced in the API layer, not the chain. The
- * `attestation` / `documentRef` associations point at plugin-owned entities
- * (`@odatano/nightgate/db/schema`) and are never redefined here.
+ * On-chain ≠ API: only the public metadata + payload hash go to Midnight;
+ * everything else stays encrypted off-chain and the disclosure tier is
+ * enforced in the API layer, not the chain.
  */
 
 /** Battery category per Regulation 2023/1542 Art. 2. */
@@ -124,10 +121,6 @@ entity Passports : cuid, managed {
     anchorNetwork     : String(20);          // Midnight network of the anchor (preview/preprod/mainnet)
     attestationTxHash : String(120);         // tx that anchored attest/bindDocument
     status            : PassportStatus default #draft;  // producer lifecycle (draft → anchored)
-
-    // On-chain anchor. Public metadata and payload hash are committed to Midnight.
-    // Plugin-owned entity; the disclosure tier is decided in the API, not here.
-    attestation      : Association to midnight.Attestations;
 
     // Compositions hold child detail. Mixed tiers are gated per field in the service.
     // A passport fills the children of its profile; the others stay empty.
@@ -280,14 +273,13 @@ entity RecycledMaterials : cuid {
 }
 
 /**
- * Due-diligence document reference. The bytes live off-chain at the plugin
- * `Documents.storageRef`; only the sha256 + public metadata are anchored. AUTHORITY
+ * Due-diligence document. The bytes live off-chain in this row; only the
+ * sha256 is anchored. AUTHORITY
  * tier (Points 2/3), supply-chain due-diligence evidence.
  */
 entity DiligenceDoc : cuid {
     passport     : Association to Passports;
     docType      : String(100);              // e.g. "supply-chain-due-diligence-report"
-    documentRef  : Association to midnight.Documents;  // plugin-owned anchor
 
     // Uploaded evidence file. The bytes stay off-chain in this row; only the
     // sha256 is anchored on-chain (own attest tx via anchorDocument), so the
@@ -352,8 +344,7 @@ entity PassportTransactions : cuid, managed {
 
 /**
  * Producer-side audit log of disclosure grants/revokes. Distinct from the
- * plugin's chain-indexed `midnight.DisclosureGrants` (read-side tier gate);
- * this records what the producer issued and its tx result.
+ * vault's own `disclosures` map; this records what the producer issued and its tx result.
  */
 entity DisclosureGrantLog : cuid, managed {
     passport : Association to Passports;
@@ -367,7 +358,7 @@ entity DisclosureGrantLog : cuid, managed {
 /**
  * Producer-side log of ZK predicate proofs (PAC). The hidden value is NEVER
  * stored; only the claim (field, predicate, threshold, unit) and the proof
- * reference (predicateAttestationId, txHash, result).
+ * reference (txHash, result).
  */
 entity PredicateProofLog : cuid, managed {
     passport               : Association to Passports;
@@ -375,7 +366,6 @@ entity PredicateProofLog : cuid, managed {
     predicate              : PredicateOp;
     threshold              : Integer64;
     unit                   : String(60);
-    predicateAttestationId : String(64);
     txHash                 : String(120);
     status                 : TxStatus default #offline;
     result                 : Boolean;        // proven true (tx SUCCESS); value stays hidden

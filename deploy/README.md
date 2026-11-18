@@ -33,16 +33,25 @@ wallet sync).
    sponsorSessionId: <pool sentinel>, allowedContracts: [<vault>],
    allowedCircuits: [attest, bindDocument, anchorContentRoot,
    proveFieldPredicate, proveFieldMembership], maxJobsPerDay: <DEMO_MAX_PER_DAY x 4>,
-   agentLabel: 'nightpass-demo')`. The token is shown once. The vault must be
-   the lineage the hosted API and the installed `@odatano/nightgate-tx` build
-   calls for (lineage 4); a grant from an earlier lineage lists `bindPassport`
-   and refuses the new circuit name.
+   agentLabel: 'nightpass-demo')`. The token is shown once. With
+   `DEMO_REGISTER_OWNERSHIP=true` the grant also needs `registerDocument`; a
+   work instance with the producer cockpit needs the full list in
+   `docs/architecture.md`, section 6. The vault must be
+   deployed on ledger 9 from the contract package the installed
+   `@odatano/nightgate-tx` ships (`@odatano/contract-attestation-vault`):
+   `node --env-file=.env --import tsx scripts/deploy-vault.mjs` deploys one
+   under a grant with `allowDeploy`. A
+   vault from before the fork takes one circuit call per transaction, so the
+   anchor batch and the proof cart are refused on it.
 
 3. **Config** (both files are gitignored; scp them to the server, mode 600):
    - `cp deploy/.env.example deploy/.env`: domains and `POSTGRES_PASSWORD`.
    - `cp deploy/.env.demo.example deploy/.env.demo`:
-     `DEMO_NIGHTGATE_AGENT_TOKEN`, `PASSPORT_CONTRACT_ADDRESS` (the vault from
-     step 2), a fresh `ENCRYPTION_KEY` (payload cipher + tester seeds at rest).
+     `NIGHTGATE_AGENT_TOKEN`, `PASSPORT_CONTRACT_ADDRESS` (the vault from
+     step 2; several vaults go into `PASSPORT_CONTRACT_ADDRESSES`), a fresh
+     `ENCRYPTION_KEY` (payload cipher + tester seeds at rest). Without the
+     token, the API URL or a vault the demo reports `enabled: false` and the
+     boot log names what is missing.
 
 4. **Server prep**: install Docker (`curl -fsSL https://get.docker.com | sh`),
    then lay the repo down on the server (`git archive HEAD | ssh <host> tar -x
@@ -57,18 +66,18 @@ wallet sync).
    docker compose up -d
    ```
    The first boot fetches the prover keys from the hosted `/zk-config` into
-   the `passport-demo-zk-cache` volume (`remote lane zk assets ready` in the
-   log); later boots find them cached.
+   the `passport-demo-zk-cache` volume (`prover keys ready` in the log); later
+   boots find them cached.
 
 6. **Smoke**:
    - `https://<main-domain>/` redirects to `/explorer/`, "Verify all" turns green
    - `https://<main-domain>/api/v1/demo/demoInfo()` shows `"enabled": true`;
      `demoProfiles()` lists both families
-   - run one visitor flow per family from a phone. Expect two anchor txs
-     (attest, then root + bind), ONE proof tx for all picked claims, and on
-     the done view the QR that resolves to the passport in the explorer. On
-     the hosted side the grant's `jobsUsed` grows by 3 per run (4 with the
-     battery second-life act).
+   - run one visitor flow per family from a phone. Expect ONE anchor tx
+     (attest, content root and binding), ONE proof tx for all picked claims,
+     and on the done view the QR that resolves to the passport in the
+     explorer. On the hosted side the grant's `jobsUsed` grows by 2 per run
+     (3 with the battery second-life act).
 
 ## Updates
 
@@ -80,6 +89,19 @@ ssh <host> 'cd /root/nightpass/deploy && docker compose up -d --build nightpass-
 A schema change needs the one-off `npm run deploy` from step 5 before `up`.
 The demo DB is disposable (visitor data only).
 
+A database that was deployed with the NIGHTGATE plugin needs one more step
+first, because `npm run deploy` refuses to drop what the plugin left in the
+stored model. Back up, then:
+
+```bash
+docker compose run --rm --no-deps nightpass-demo node scripts/migrate-drop-plugin-model.mjs          # reports
+docker compose run --rm --no-deps nightpass-demo node scripts/migrate-drop-plugin-model.mjs --apply  # writes
+docker compose run --rm --no-deps nightpass-demo npm run deploy
+```
+
+The script prints `DROP` statements for the plugin's views, tables and columns
+that stay behind. Keep them and run them with `psql` after the deploy.
+
 ## Notes
 
 - The DPP conformance API stays OFF on public hosts (`DPP_API_ENABLED` unset);
@@ -89,9 +111,6 @@ The demo DB is disposable (visitor data only).
   grant (`revokeAgentGrant` the old one) and a container restart.
 - `DEMO_MAINTENANCE=true` in `.env.demo` parks the demo behind a static page
   without a redeploy; the explorer keeps serving.
-- Fallback: `DEMO_TRANSPORT=plugin` keeps the in-process lane (server wallets,
-  sponsor pool, `mem_limit` 12g); the wallet and sponsor keys in the example
-  file document that profile.
 
 ### Periodic restart (stale sponsor sessions)
 

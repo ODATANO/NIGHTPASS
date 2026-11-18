@@ -10,8 +10,8 @@
 //   Server (scratch DB):
 //     cds_requires_db_credentials_database=<scratch> \
 //     PRODUCER_WALLETS=T,U \
-//     PRODUCER_T_SHIELDED_ADDRESS=addr-owner-T PRODUCER_T_WALLET_MNEMONIC=x PRODUCER_T_VIEWING_KEY=x \
-//     PRODUCER_U_SHIELDED_ADDRESS=addr-owner-U PRODUCER_U_WALLET_MNEMONIC=x PRODUCER_U_VIEWING_KEY=x \
+//     PRODUCER_T_SHIELDED_ADDRESS=addr-owner-T PRODUCER_T_WALLET_MNEMONIC=x \
+//     PRODUCER_U_SHIELDED_ADDRESS=addr-owner-U PRODUCER_U_WALLET_MNEMONIC=x \
 //     npm start
 //   Then: node test/integration/handover-e2e.mjs
 

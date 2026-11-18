@@ -11,8 +11,7 @@
 ![Architecture](./architecture.png)
 
 Six sections: the layering, the data flow, the security model, the field-bound
-predicate, the product profiles, and how a consumer pulls the platform in as a
-CAP plugin.
+predicate, the product profiles, and how the app connects to the platform.
 
 ## 1. Three layers
 
@@ -22,19 +21,16 @@ not just batteries.
 
 | Layer | Package | Owns |
 |---|---|---|
-| Platform | `@odatano/nightgate` | The Midnight read/write bridge: OData services, indexer, wallet/proof submission, job tracking. Shipped as a CAP plugin. |
-| SDK surface | `@odatano/nightgate` (sub-path exports) | The reusable on-chain primitive, the `attestation-vault` Compact contract, the CDS schema (`midnight.*`), the submission actions, and the browser building blocks (`@odatano/nightgate/browser`). |
-| App | `@odatano/passport` | The product-family schema (battery, component) on top of `@odatano/dpp-sdk` profiles, the producer cockpit and consumer viewer, the disclosure gating, the QR resolver, the off-chain content-root Merkle builder. This repo. |
+| Platform | NIGHTGATE API | The Midnight read/write bridge: chain reads, state verification, fee sponsoring, submission, job tracking. A hosted service or an own NIGHTGATE server. |
+| SDK | `@odatano/nightgate-tx` | The transaction builder and the API client, the `attestation-vault` contract with its call helpers, and the browser building blocks. |
+| App | `@odatano/passport` | The product-family schema (battery, component) on top of `@odatano/dpp-sdk` profiles, the producer cockpit and consumer viewer, the disclosure gating, the QR resolver, the off-chain content-root Merkle builder. |
 
-The app never reaches into the plugin's internals. It configures the plugin via
-`cds.requires.nightgate` and calls it over the documented OData surface
-(`/api/v1/nightgate`) and the browser building blocks. A capability the app needs
-but the platform lacks becomes a feature request against NIGHTGATE, never a local
-patch. That is what keeps the platform reusable.
-
-The `attestation-vault` contract is shipped by the plugin and consumed as-is.
-There is no contract in this repo (the earlier separate `passport-attestation`
-contract was folded into `attestation-vault`).
+The app runs no chain software of its own. It builds, proves and signs every
+transaction locally with the SDK, so no key leaves the server, and hands the
+transaction to the API, which pays the fee and submits it. Verification reads
+the vault's state through the API's public verify service. A capability the app
+needs but the platform lacks is raised with NIGHTGATE, never
+a local patch. That is what keeps the platform reusable.
 
 ## 2. Data flow
 
@@ -59,13 +55,14 @@ are further circuit calls; the attester can `retract` its record.
 
 **Two ways to submit,** same contract, differ only in who holds the key:
 
-1. Server path: `ProducerService` runs the calls through NIGHTGATE's worker wallet
-   as async jobs (no UI, no wallet popups), polling `getJobStatus`.
+1. Server path: `ProducerService` builds, proves and signs the calls with a server
+   wallet's key (no UI, no wallet popups) and hands the transaction to the NIGHTGATE
+   API, which pays the fee and submits it.
 2. Wallet path: the cockpit runs the same calls in-app from the user's Lace wallet
-   over the DApp-Connector, using `@odatano/nightgate/browser`.
+   over the DApp-Connector, with the browser building blocks of `@odatano/nightgate-tx`.
 
-Offline-first: without a signing session or contract, actions write local tracking
-rows so the cockpit and read gate work without the chain.
+Offline-first: without a signer, an API grant or a contract, actions write local
+tracking rows so the cockpit and read gate work without the chain.
 
 **Read (consumer):** `PassportService` reads the same data back for the viewer at
 three tiers. An `after READ Passports` handler redacts restricted fields per tier.
@@ -150,7 +147,7 @@ re-timestamp of unchanged numbers. That is why the measured fields
 (`CapacityFade`, `RemainingCapacity`,
 `NumberOfFullChargingAndDischargingCycles`) sit in the provable panel at all.
 
-Anyone re-checks both crawler-free and without a wallet:
+Anyone re-checks both without a wallet or a token:
 `PassportService.verifyVersionIntegrityOnChain(passportId, payloadHashA,
 payloadHashB, allowedMask)` and
 `verifyVersionChangeOnChain(passportId, payloadHashA, payloadHashB,
@@ -220,11 +217,13 @@ only; it is never the boundary.
 
 **On-chain tier entitlement.** The `attestation-vault` `disclosures` ACL
 (`grantDisclosure` / `revokeDisclosure`, levels 0/1/2) is a tamper-evident,
-revocable registry. NIGHTGATE indexes it into `midnight.DisclosureGrants` and binds
-principals to grantee ids via `midnight.GranteeIdentities`. `effectiveGrantsFor`
-in the read gate consults it (union with the offline `DisclosureGrantLog`): an
-active grant elevates a requester's tier above their login role, scoped per
-passport (by `payloadHash`), and degrades to the login role on any lookup failure.
+revocable registry. A partner's login resolves to its grantee id
+(`passport.Partners`). The producer's grant log (`DisclosureGrantLog`) records
+every grant and revoke; an on-chain entry counts once the vault's state confirmed
+it (`verifyDisclosureState` on the API's verify service). `effectiveGrantsFor` in
+the read gate takes the latest settled entry per passport and grantee: an active
+grant elevates a requester's tier above their login role, scoped per passport (by
+`payloadHash`), and degrades to the login role on any lookup failure.
 
 **Integrity and authorization: ZK proofs, not signatures.** On-chain writes go
 through Midnight circuits authorized by zero-knowledge proofs. Owner-gated
@@ -347,44 +346,33 @@ tables and membership catalog (`srv/lib/product-profiles.ts`, `APP_PROFILES`).
 The producer cockpit, the BMS simulator, the DPP Life Cycle API and the
 Catena-X export serve the battery family.
 
-## 6. Build and deploy: the platform as a CAP plugin
+## 6. Build and deploy: the app against the NIGHTGATE API
 
-A consumer app needs no glue code. CAP discovers the plugin and merges its CDS.
-
-**1. Depend on the plugin.**
+**1. Depend on the SDK.**
 
 ```bash
-npm install @odatano/nightgate @cap-js/sqlite
+npm install @odatano/nightgate-tx
 ```
 
-**2. Configure it** in `package.json` under `cds.requires.nightgate`. The contract
-points at the artifact shipped inside the installed plugin:
+**2. Configure the API access** in the environment:
 
-```jsonc
-{
-  "cds": { "requires": {
-    "db": { "kind": "sqlite" },
-    "nightgate": {
-      "network": "preprod",
-      "granteeBinding": "did",
-      "crawler": { "enabled": false },
-      "contracts": {
-        "attestation-vault": {
-          "artifactPath": "node_modules/@odatano/nightgate/contracts/attestation-vault/src/managed/attestation-vault/contract/index.js",
-          "privateStateId": "attestationVaultPrivateState",
-          "zkConfigPath": "node_modules/@odatano/nightgate/contracts/attestation-vault/src/managed/attestation-vault"
-        }
-      }
-    },
-    "auth": { "kind": "custom", "impl": "srv/auth.js" }
-  } }
-}
-```
+| Variable | Meaning |
+|---|---|
+| `NIGHTGATE_API_URL` | Base URL of the NIGHTGATE API |
+| `NIGHTGATE_AGENT_TOKEN` | Agent grant token or gateway key. Without it the app works offline and still verifies on chain |
+| `NIGHTGATE_NETWORK` | Midnight network, default `preprod` |
+| `PASSPORT_CONTRACT_ADDRESS` | The deployed attestation vault. It must be in the sponsor policy of the API and in the grant |
+| `NIGHTGATE_PROOF_SERVER_URL` | Own proof server. Empty = in-process wasm proving |
+
+The grant lists the circuits the app proves: `attest`, `bindDocument`,
+`anchorContentRoot`, `proveFieldPredicate`, `proveFieldMembership`,
+`proveFieldEquality`, `grantDisclosure`, `revokeDisclosure`,
+`registerDocument`, `proveDocumentComparison`.
 
 **3. Deploy and run.**
 
 ```bash
-npm run deploy   # creates the midnight_* tables + the passport schema
+npm run deploy   # creates the passport schema
 npm start        # cds-tsx serve: REQUIRED for the TypeScript service impls
 ```
 
@@ -393,19 +381,16 @@ npm start        # cds-tsx serve: REQUIRED for the TypeScript service impls
 > producer actions. The boot log is the tell: `impl: 'srv/passport-service.ts'`
 > (good) vs a generic `...-service.js` (impl not loaded).
 
-On boot the services mount side by side and the boot log confirms
-`Registered contracts: counter, attestation-vault`.
-
-Live on-chain writes additionally need a funded wallet and a proof server. The
-server path needs a signing session and `PASSPORT_CONTRACT_ADDRESS`; the wallet path
-needs Lace and a local proof server at `http://localhost:6300`. Without them the
-offline path (hash, encrypt, persist, QR, local log rows) still runs.
+Live on-chain writes additionally need a signer: a server wallet
+(`PRODUCER_WALLET_MNEMONIC`) or, in the cockpit, Lace with a local proof server
+at `http://localhost:6300`. Without a signer the offline path (hash, encrypt,
+persist, QR, local log rows) still runs.
 
 ### At a glance
 
-- Services: `ProducerService` (`/api/v1/producer`), `PassportService` (`/api/v1/passport`), `NightgateService` (`/api/v1/nightgate`), `DemoService` (`/api/v1/demo`, only with `DEMO_ENABLED=true`).
+- Services: `ProducerService` (`/api/v1/producer`), `PassportService` (`/api/v1/passport`), `DemoService` (`/api/v1/demo`, only with `DEMO_ENABLED=true`).
 - Families: `battery` and `component`, one `Passports.profile` per row, profiles from `@odatano/dpp-sdk`.
-- Contract: one `attestation-vault` (plugin-shipped): tiered disclosure, passport binding, numeric predicate, and field-bound predicate.
+- Contract: one `attestation-vault` (from `@odatano/contract-attestation-vault`): tiered disclosure, passport binding, numeric predicate, and field-bound predicate.
 - Crypto: blake2b-256 integrity hash, AES-256-GCM + HKDF-SHA256 payload encryption, salted Merkle content root (the contract's transient hash), ZK-proof authorization.
 - UI: producer cockpit (battery, with in-app Lace wallet flow), consumer viewer (three disclosure levels), public explorer, "Try it" demo, QR resolver at `/p/:passportId`.
 - Chain: Midnight (preprod): public metadata, hash, binding, content root, disclosure and predicate results only.

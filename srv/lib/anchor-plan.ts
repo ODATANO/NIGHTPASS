@@ -2,16 +2,14 @@
  * Shared on-chain anchor call plan: the AttestationVault circuit calls that
  * anchor one passport version, grouped into the transactions they ride in.
  * Single source of truth for every submit path:
- *   - plugin lane: srv/lib/lane-plugin.ts (NIGHTGATE submitContractCallBatch)
- *   - remote lane: srv/lib/lane-remote.ts (nightgate-tx buildSponsorable)
+ *   - server: srv/lib/lane-remote.ts (nightgate-tx buildSponsorable)
  *   - browser: app/connector/connector.mjs anchorBatch (wallet-signed)
  *
  * Dependency-free on purpose: no @sap/cds, no Node-only APIs, so the vite
  * connector build can bundle this file for the browser.
  *
- * Vault lineage 4 (NIGHTGATE 0.24): records are keyed by attester and payload
- * and `attest` no longer touches a cell shared with other callers, so the
- * whole anchor is ONE transaction again. Apply order follows the ledger's
+ * Records are keyed by attester and payload, so the whole anchor is ONE
+ * transaction. Apply order follows the ledger's
  * causality rule: `attest` and `anchorContentRoot` stay in the guaranteed
  * stage as the vault grows, `bindDocument` turns fallible and must come last.
  */

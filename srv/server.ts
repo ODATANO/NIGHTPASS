@@ -1,9 +1,11 @@
 import cds from '@sap/cds';
 import QRCode from 'qrcode';
 import crypto from 'node:crypto';
+import { Readable } from 'node:stream';
 import express from 'express';
-import { verifyPeers, explorerLinks, passportSources, assertEncryptionKey } from './lib/passport-anchor';
+import { verifyPeers, explorerLinks, passportSources, assertEncryptionKey, effectiveNetwork } from './lib/passport-anchor';
 import { passportHttpSecurity } from './http-security';
+import { apiUrlFromEnv } from './lib/lane-remote';
 
 const { SELECT, INSERT, UPDATE, DELETE } = cds.ql;
 
@@ -32,8 +34,7 @@ function rememberTelemetrySignature(sig: string): void {
  * so the view preselects the battery.
  */
 cds.on('bootstrap', (app: any) => {
-    // NIGHTPASS owns host-wide HTTP policy. Plugins (including NIGHTGATE) must
-    // not alter unrelated routes in the shared CAP process.
+    // NIGHTPASS owns the host-wide HTTP policy.
     app.use(passportHttpSecurity);
 
     // Fail closed on a missing app secret: without a valid ENCRYPTION_KEY every
@@ -210,34 +211,59 @@ cds.on('bootstrap', (app: any) => {
         }
     });
 
+    // --- Vault manifest and proving files for the browser connector ------------
+    // Public files of the NIGHTGATE API, passed through so the browser reads them from this origin.
+    app.get(['/contract-manifest', '/zk-config/*'], async (req: any, res: any) => {
+        const path = String(req.path || '');
+        // Only the manifest and the files of a contract folder reach the API.
+        if (path.includes('..') || !/^\/(contract-manifest|zk-config(\/[\w.-]+){1,3})\/?$/.test(path)) {
+            return res.status(404).end();
+        }
+        const abort = new AbortController();
+        // The timer bounds the wait for the answer, not the download of a prover key.
+        const timer = setTimeout(() => abort.abort(), 30_000);
+        res.on('close', () => abort.abort());
+        try {
+            const etag = req.headers['if-none-match'];
+            const upstream = await fetch(apiUrlFromEnv() + path, {
+                headers: etag ? { 'if-none-match': String(etag) } : {},
+                signal: abort.signal
+            });
+            clearTimeout(timer);
+            res.status(upstream.status);
+            for (const name of ['content-type', 'etag', 'cache-control']) {
+                const value = upstream.headers.get(name);
+                if (value) res.setHeader(name, value);
+            }
+            if (!upstream.body) return res.end();
+            const body = Readable.fromWeb(upstream.body as Parameters<typeof Readable.fromWeb>[0]);
+            // A download that breaks off ends the response instead of crashing the process.
+            body.on('error', () => res.destroy());
+            body.pipe(res);
+        } catch (e) {
+            clearTimeout(timer);
+            if (!res.headersSent) res.status(502).json({ error: `NIGHTGATE API unreachable: ${String((e as Error)?.message ?? e)}` });
+        }
+    });
+
     // --- Runtime config for the browser connector -----------------------------
-    // Issue #2 (JAlbertCode): the wallet connector must anchor to the SAME
-    // network as the server worker. This exposes the server's effective
-    // NIGHTGATE network (same precedence as the plugin: env override first,
-    // then cds.requires.nightgate.network) so the client derives instead of
-    // hardcoding. Indexer URLs follow the same precedence with the public
-    // per-network hosts as default.
+    // The wallet connector must anchor on the SAME network as the server.
+    // This exposes the server's network and indexer so the client derives
+    // them instead of hardcoding.
     app.get('/api/v1/passport/runtime-config', (_req: any, res: any) => {
-        const cfg: any = (cds.env as any).requires?.nightgate ?? {};
-        const network = process.env.NIGHTGATE_NETWORK?.trim() || cfg.network || 'preprod';
-        const httpOverride = process.env.NIGHTGATE_INDEXER_HTTP_URL?.trim() || cfg.indexerHttpUrl;
+        const network = effectiveNetwork();
+        const httpOverride = process.env.NIGHTGATE_INDEXER_HTTP_URL?.trim();
         const indexerHttpUrl = httpOverride
             || `https://indexer.${network}.midnight.network/api/v4/graphql`;
-        // NIGHTGATE derives the ws endpoint from an HTTP-only override (same
-        // host/path, ws scheme, /ws suffix). Mirror that here so the browser
-        // connector stays on the exact indexer the server worker uses.
-        const indexerWsUrl = process.env.NIGHTGATE_INDEXER_WS_URL?.trim() || cfg.indexerWsUrl
+        // The ws endpoint follows an HTTP-only override: same host and path, ws scheme, /ws suffix.
+        const indexerWsUrl = process.env.NIGHTGATE_INDEXER_WS_URL?.trim()
             || (httpOverride
                 ? httpOverride.replace(/^http/, 'ws').replace(/\/+$/, '') + '/ws'
                 : `wss://indexer.${network}.midnight.network/api/v4/graphql/ws`);
-        // Capability flags for the explorer UIs: can verifyOnChain live-check
-        // rows anchored on ANOTHER network? `crossNetworkVerify` covers ANY
-        // network when the installed NIGHTGATE exposes the `network` override
-        // (detected on the loaded model);
-        // `peerNetworks` lists networks covered by delegating peer instances
-        // (PASSPORT_VERIFY_PEERS) until then.
-        const crossNetworkVerify =
-            !!((cds.model as any)?.definitions?.['NightgateService.verifyAttestationState']?.params?.network);
+        // Capability flags for the explorer UIs. The verify reads take a
+        // `network`, so rows anchored on another network are checked live;
+        // `peerNetworks` lists networks covered by delegating peer instances.
+        const crossNetworkVerify = true;
         const peerNetworks = Object.keys(verifyPeers());
         // Where "Open in Passport Viewer" should point: an explicit base URL
         // (internal work instance), same-origin ('') when the viewer is

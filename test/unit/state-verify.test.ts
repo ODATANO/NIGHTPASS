@@ -1,16 +1,14 @@
 import { describe, it, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import cds from '@sap/cds';
 import { verifyAttestState, verifyGrantState, verifyPredicateState, recordSelectorArgs, resolveAnchorAttester } from '../../srv/lib/state-verify';
 
 /**
- * Crawler-free state verification. The module talks to the
- * plugin via `cds.connect.to('nightgate').send(...)` and reads back
- * `midnight.DisclosureGrants` via `cds.db.read`. Both are stubbed here so the
- * verdict mapping is asserted in isolation, without a live chain or CAP context.
+ * State verification. The module reads the NIGHTGATE API's verify service;
+ * the HTTP call is stubbed here so the verdict mapping is asserted in
+ * isolation, without a live chain.
  *
  * The invariant under test: an on-chain effect that is present maps to
- * `confirmed`; everything else (absent, or the plugin unreachable) maps to
+ * `confirmed`; everything else (absent, or the API unreachable) maps to
  * `unknown` and never `failed`. A not-yet-settled action keeps waiting.
  */
 
@@ -20,29 +18,32 @@ const GRANTEE = 'ff'.repeat(32);
 const ATT = '11'.repeat(32);
 const DOC = '22'.repeat(32);
 
-const origConnectTo = cds.connect.to;
-const origDb = Object.getOwnPropertyDescriptor(cds, 'db');
+process.env.NIGHTGATE_API_URL = 'https://ng.test';
+const down = async (): Promise<any> => { throw new Error('no stub'); };
+let answer: (event: string, data: any) => Promise<any> = down;
 
-/**
- * Stub `cds.connect.to('nightgate')` with a `send` that runs `sendImpl`,
- * reachable directly and through the technical-user `tx` the verify reader uses.
- */
+// The verify client keeps the fetch it was created with, so one fake stays installed and the tests swap its answer.
+globalThis.fetch = (async (url: unknown) => {
+    const m = /\/([A-Za-z]+)\((.*)\)$/.exec(decodeURIComponent(String(url)));
+    const data: Record<string, unknown> = {};
+    for (const part of (m?.[2] ?? '').match(/[A-Za-z]+=(?:'(?:[^']|'')*'|[^,]+)/g) ?? []) {
+        const i = part.indexOf('=');
+        const raw = part.slice(i + 1);
+        data[part.slice(0, i)] = raw.startsWith("'") ? raw.slice(1, -1) : raw === 'true' ? true : raw === 'false' ? false : Number(raw);
+    }
+    try {
+        return new Response(JSON.stringify(await answer(m?.[1] ?? '', data)), { status: 200, headers: { 'content-type': 'application/json' } });
+    } catch (e) {
+        return new Response(JSON.stringify({ error: { code: 'INTERNAL', message: String((e as Error).message) } }), { status: 500, headers: { 'content-type': 'application/json' } });
+    }
+}) as typeof fetch;
+
+/** Answers the next state reads with `sendImpl(function name, parameters)`. */
 function stubNightgate(sendImpl: (event: string, data: any) => Promise<any>): void {
-    const svc = { send: sendImpl };
-    (cds.connect as any).to = async () => ({ ...svc, tx: async (_ctx: unknown, cb: (tx: typeof svc) => Promise<any>) => cb(svc) });
-}
-/** Stub `cds.db.read(...).columns(...).where(...)` to resolve `rows`. */
-function stubDbRead(rows: any[]): void {
-    Object.defineProperty(cds, 'db', {
-        configurable: true,
-        value: { read: () => ({ columns: () => ({ where: async () => rows }) }) }
-    });
+    answer = sendImpl;
 }
 
-afterEach(() => {
-    (cds.connect as any).to = origConnectTo;
-    if (origDb) Object.defineProperty(cds, 'db', origDb);
-});
+afterEach(() => { answer = down; });
 
 describe('recordSelectorArgs', () => {
     it('names the record by attester + payload, else by the bound document id, else not at all', () => {
@@ -110,34 +111,44 @@ describe('verifyAttestState', () => {
 });
 
 describe('verifyGrantState', () => {
-    it('confirms a grant once its row is active on-chain', async () => {
-        stubNightgate(async () => ({ active: 1 }));
-        stubDbRead([{ active: true }]);
-        assert.equal(await verifyGrantState({ contractAddress: ADDR, payloadHash: PH, grantee: GRANTEE, op: 'grant' }), 'confirmed');
+    const GRANT = { contractAddress: ADDR, payloadHash: PH, attesterId: ATT, grantee: GRANTEE };
+
+    it('confirms a grant once the vault holds it, and names the record and the grantee', async () => {
+        let seen: any = null;
+        stubNightgate(async (event, data) => { seen = { event, data }; return { verified: true, granted: true, level: 1 }; });
+        assert.equal(await verifyGrantState({ ...GRANT, op: 'grant' }), 'confirmed');
+        assert.deepEqual(seen, { event: 'verifyDisclosureState', data: { ...GRANT, compiledArtifactRef: 'attestation-vault' } });
     });
 
-    it('keeps a grant pending while no active row exists yet', async () => {
-        stubNightgate(async () => ({ active: 0 }));
-        stubDbRead([]);
-        assert.equal(await verifyGrantState({ contractAddress: ADDR, payloadHash: PH, grantee: GRANTEE, op: 'grant' }), 'unknown');
+    it('keeps a grant pending while the vault holds none yet', async () => {
+        stubNightgate(async () => ({ verified: false, granted: false, level: null }));
+        assert.equal(await verifyGrantState({ ...GRANT, op: 'grant' }), 'unknown');
     });
 
-    it('confirms a revoke once no active grant remains', async () => {
-        stubNightgate(async () => ({ active: 0 }));
-        stubDbRead([]);
-        assert.equal(await verifyGrantState({ contractAddress: ADDR, payloadHash: PH, grantee: GRANTEE, op: 'revoke' }), 'confirmed');
+    it('confirms a revoke once the grant is gone from a record that is still there', async () => {
+        stubNightgate(async (event) => (event === 'verifyDisclosureState'
+            ? { verified: false, granted: false, level: null }
+            : { verified: true, attested: true }));
+        assert.equal(await verifyGrantState({ ...GRANT, op: 'revoke' }), 'confirmed');
     });
 
-    it('keeps a revoke pending while the grant is still active', async () => {
-        stubNightgate(async () => ({ active: 1 }));
-        stubDbRead([{ active: true }]);
-        assert.equal(await verifyGrantState({ contractAddress: ADDR, payloadHash: PH, grantee: GRANTEE, op: 'revoke' }), 'unknown');
+    it('keeps a revoke pending when the read finds no record at all', async () => {
+        stubNightgate(async (event) => (event === 'verifyDisclosureState'
+            ? { verified: false, granted: false, level: null }
+            : { verified: false, attested: false }));
+        assert.equal(await verifyGrantState({ ...GRANT, op: 'revoke' }), 'unknown');
     });
 
-    it('stays unknown when the reindex call fails', async () => {
+    it('keeps a revoke pending while the grant is still there', async () => {
+        stubNightgate(async () => ({ verified: true, granted: true, level: 2 }));
+        assert.equal(await verifyGrantState({ ...GRANT, op: 'revoke' }), 'unknown');
+    });
+
+    it('stays unknown when the read fails or the record has no attester', async () => {
         stubNightgate(async () => { throw new Error('no live provider'); });
-        stubDbRead([{ active: true }]);
-        assert.equal(await verifyGrantState({ contractAddress: ADDR, payloadHash: PH, grantee: GRANTEE, op: 'grant' }), 'unknown');
+        assert.equal(await verifyGrantState({ ...GRANT, op: 'grant' }), 'unknown');
+        stubNightgate(async () => ({ granted: true }));
+        assert.equal(await verifyGrantState({ ...GRANT, attesterId: null, op: 'grant' }), 'unknown');
     });
 });
 

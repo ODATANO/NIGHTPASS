@@ -2,48 +2,35 @@
  * Registry of the SERVER-side producer wallets the cockpit can sign with.
  *
  * The cockpit offers two login modes: an in-browser Lace wallet (the user signs
- * every tx themselves) or one of these server wallets (NIGHTGATE holds the key
- * and signs on the server). Each entry is one independent Midnight account, so
- * a demo can show N producers, each anchoring under its own identity.
+ * every tx themselves) or one of these server wallets (this server holds the
+ * key, builds and signs; the NIGHTGATE API pays the fee and submits). Each
+ * entry is one independent identity, so a demo can show N producers.
  *
  * Configuration is env-only; secrets never leave the server:
  *
  *   PRODUCER_WALLETS=A,B,C                 ids of the configured wallets
  *   PRODUCER_A_WALLET_MNEMONIC=...         signing secret (never served)
- *   PRODUCER_A_VIEWING_KEY=...             session key (never served)
  *   PRODUCER_A_SHIELDED_ADDRESS=...        the wallet's identity = passport `owner`
  *   PRODUCER_A_LABEL=CellCo GmbH           optional display name
  *
- * The legacy single-wallet config (`PRODUCER_WALLET_MNEMONIC` /
- * `PRODUCER_VIEWING_KEY`, optionally `PRODUCER_SHIELDED_ADDRESS`) stays
- * supported and surfaces as the wallet id `default`.
- *
- * Addresses come from the env rather than deriving them at runtime on purpose:
- * NIGHTGATE rate-limits the secret-carrying surface (deriveWalletInfo /
- * connectWalletForSigning share a 5-per-hour limiter), so a boot-time derivation
- * of every wallet would eat the budget the signing sessions need.
- * `scripts/make-wallets` writes all four values per wallet.
+ * The single-wallet config (`PRODUCER_WALLET_MNEMONIC`, optionally
+ * `PRODUCER_SHIELDED_ADDRESS`) surfaces as the wallet id `default`.
  */
+import { mnemonicToSeedSync, validateMnemonic } from 'bip39';
 
 export interface ProducerWallet {
     id: string;
     label: string;
     /** Shielded address; the passport `owner` this wallet's rows are scoped to. */
     owner: string;
-    /** True when both signing secrets are present (i.e. this wallet can anchor). */
+    /** True when the signing secret is present (i.e. this wallet can anchor). */
     signingReady: boolean;
-    /**
-     * Optional cached attester id (64-hex, deriveWalletInfo.attesterId): the
-     * on-chain identity registerPassport assigns ownership to. Env-cached
-     * (PRODUCER_<ID>_ATTESTER_ID) because deriving it shares the rate-limited
-     * secret path with session opening; unset = derived lazily on first use.
-     */
+    /** Optional attester id (64-hex) from `PRODUCER_<ID>_ATTESTER_ID`; unset = derived from the seed. */
     attesterId?: string;
 }
 
 interface ProducerWalletSecrets extends ProducerWallet {
     mnemonic?: string;
-    viewingKey?: string;
 }
 
 const LEGACY_ID = 'default';
@@ -57,30 +44,26 @@ function registry(): ProducerWalletSecrets[] {
     for (const id of ids) {
         const key = id.toUpperCase().replace(/[^A-Z0-9_]/g, '_');
         const mnemonic = process.env[`PRODUCER_${key}_WALLET_MNEMONIC`]?.trim();
-        const viewingKey = process.env[`PRODUCER_${key}_VIEWING_KEY`]?.trim();
         out.push({
             id,
             label: process.env[`PRODUCER_${key}_LABEL`]?.trim() || `Producer ${id}`,
             owner: process.env[`PRODUCER_${key}_SHIELDED_ADDRESS`]?.trim() || '',
-            signingReady: !!(mnemonic && viewingKey),
+            signingReady: !!mnemonic,
             attesterId: process.env[`PRODUCER_${key}_ATTESTER_ID`]?.trim() || undefined,
-            mnemonic,
-            viewingKey
+            mnemonic
         });
     }
 
-    // Legacy single-wallet env, still the one the ERP ingest path uses.
+    // Single-wallet env, the one the ERP ingest path uses.
     const legacyMnemonic = process.env.PRODUCER_WALLET_MNEMONIC?.trim();
-    const legacyViewingKey = process.env.PRODUCER_VIEWING_KEY?.trim();
-    if (legacyMnemonic && legacyViewingKey && !out.some((w) => w.id === LEGACY_ID)) {
+    if (legacyMnemonic && !out.some((w) => w.id === LEGACY_ID)) {
         out.push({
             id: LEGACY_ID,
             label: process.env.PRODUCER_LABEL?.trim() || 'Server wallet',
             owner: process.env.PRODUCER_SHIELDED_ADDRESS?.trim() || '',
             signingReady: true,
             attesterId: process.env.PRODUCER_ATTESTER_ID?.trim() || undefined,
-            mnemonic: legacyMnemonic,
-            viewingKey: legacyViewingKey
+            mnemonic: legacyMnemonic
         });
     }
     return out;
@@ -91,35 +74,21 @@ export function listProducerWallets(): ProducerWallet[] {
     return registry().map(({ id, label, owner, signingReady }) => ({ id, label, owner, signingReady }));
 }
 
-/**
- * The server wallet POOL that pays the dust fees for OTHER wallets' on-chain
- * legs (NIGHTGATE 0.8.x per-tx sponsoring), from `PASSPORT_FEE_SPONSOR_WALLET`
- * as a comma-separated list of registry wallet ids (a single id remains
- * valid). Unset = no sponsoring; every wallet pays its own fees.
- *
- * Why a pool: parallel runs over ONE sponsor race each other for the same
- * dust notes (1014 rejections); with one sponsor leased per concurrent run
- * the collisions cannot happen at all.
- */
-export function feeSponsorWalletIds(): string[] {
-    return String(process.env.PASSPORT_FEE_SPONSOR_WALLET ?? '')
-        .split(',').map((s) => s.trim()).filter(Boolean);
-}
-
-/** First pool member; the default sponsor for callers without a preference. */
-export function feeSponsorWalletId(): string | null {
-    return feeSponsorWalletIds()[0] ?? null;
-}
-
 /** Secrets for one wallet id, or undefined. Never leaves the server. */
 export function producerWalletSecrets(walletId?: string | null):
-    { id: string; mnemonic: string; viewingKey: string; owner: string; attesterId?: string } | undefined {
+    { id: string; mnemonic: string; owner: string; attesterId?: string } | undefined {
     const all = registry();
     const wanted = String(walletId ?? '').trim();
     // No id given: the legacy/default wallet, else the only configured one.
     const w = wanted
         ? all.find((x) => x.id === wanted)
         : (all.find((x) => x.id === LEGACY_ID) ?? (all.length === 1 ? all[0] : undefined));
-    if (!w?.mnemonic || !w.viewingKey) return undefined;
-    return { id: w.id, mnemonic: w.mnemonic, viewingKey: w.viewingKey, owner: w.owner, attesterId: w.attesterId };
+    if (!w?.mnemonic) return undefined;
+    return { id: w.id, mnemonic: w.mnemonic, owner: w.owner, attesterId: w.attesterId };
+}
+
+/** The 64-byte BIP39 seed of a mnemonic as hex: what the transaction builder signs with. */
+export function producerSeedHex(mnemonic: string): string {
+    if (!validateMnemonic(mnemonic)) throw new Error('server wallet mnemonic is not a valid BIP39 phrase');
+    return mnemonicToSeedSync(mnemonic).toString('hex');
 }

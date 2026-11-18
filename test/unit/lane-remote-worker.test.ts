@@ -15,15 +15,14 @@ const CFG: RemoteLaneConfig = { apiUrl: 'https://api.example', agentToken: 'ngat
 const SEED = 'ab'.repeat(64);
 
 describe('lane error serialization', () => {
-    it('keeps a ProofCartError partial, its job id and claim ids', () => {
+    it('keeps a ProofCartError partial and its job id', () => {
         const e = new ProofCartError('proof cart: PARTIAL_SUCCESS', {
-            partial: true, jobId: 'job-1', claimIds: new Map([['k1', 'pa-1']]), cause: { job: { errorCode: 'OnChainStatus' } }
+            partial: true, jobId: 'job-1', cause: { job: { errorCode: 'OnChainStatus' } }
         });
         const back = deserializeLaneError(serializeLaneError(e));
         assert.ok(back instanceof ProofCartError);
         assert.equal(back.partial, true);
         assert.equal(back.jobId, 'job-1');
-        assert.deepEqual([...back.claimIds.entries()], [['k1', 'pa-1']]);
         assert.equal(back.message, 'proof cart: PARTIAL_SUCCESS');
         assert.equal((back as any).code, 'OnChainStatus');
     });
@@ -49,7 +48,7 @@ describe('createRemoteLane', () => {
     });
 
     it('forwards exactly the lane surface', () => {
-        for (const m of ['identity', 'submitAnchorTx', 'submitProofCart', 'verifyClaimLanded', 'verifyAnchor', 'dispose']) {
+        for (const m of ['identity', 'attesterId', 'submitVaultTx', 'submitProofCart', 'submitComparison', 'verifyClaimLanded', 'verifyAnchor', 'dispose']) {
             assert.ok(REMOTE_LANE_WORKER_METHODS.has(m), m);
             assert.equal(typeof (RemoteLane.prototype as any)[m], 'function', m);
             assert.equal(typeof (RemoteLaneWorker.prototype as any)[m], 'function', m);

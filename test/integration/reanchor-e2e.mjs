@@ -13,8 +13,7 @@
 //   WALLET_ID        server wallet that signs (default 'default' = Main)
 //   SKIP_PROOF       '1' skips the ZK-claim leg (saves ~5 min wasm proving)
 //
-// Spends a handful of testnet transactions (fee-sponsored when
-// PASSPORT_FEE_SPONSOR_WALLET is set on the server).
+// Spends a handful of testnet transactions; the NIGHTGATE API sponsors the fees.
 
 const BASE = process.env.NIGHTPASS_BASE || 'http://localhost:4004';
 const WALLET_ID = process.env.WALLET_ID || 'default';

@@ -1,31 +1,14 @@
 /**
- * Canonical membership-set tree for `proveFieldMembership`, delegated to
- * NIGHTGATE's own implementation.
- *
- * History: this file used to carry a hand-written twin of NIGHTGATE's
- * set-root rule because the module was not exported from the package. Since
- * 0.16.0 it is (`@odatano/nightgate/set-root`), so the twin is gone and the
- * canonical rule has exactly one implementation again. What stays local is
- * the thin shape this codebase consumes (`digestOf` / `proofFor`) and the
- * capacity check against our own catalogue constants.
- *
- * Why not NIGHTGATE's `prepareMembershipSet` ACTION: the read side (public
- * claim verification, explorer) has no wallet session and often no
- * authenticated user at all, while the published payload carries the allowed
- * values so any verifier recomputes the root from the list alone. The write
- * path still hands NIGHTGATE the raw allowedValues and lets it resolve the
- * root itself.
- *
- * The set tree is NOT salted (unlike the content tree since 0.16.0): its
- * leaves are digests of PUBLIC allow-list values, and the padding repeats a
- * real member on purpose so every leaf is a member digest.
+ * Membership-set tree for `proveFieldMembership`, built with the SDK's set-root rule.
+ * Unlike the content tree it is not salted: its leaves are digests of public
+ * allow-list values, and the padding repeats a real member.
  */
 
 import {
     buildMembershipSet as ngBuildMembershipSet,
     membershipPathFor as ngMembershipPathFor,
     canonicalSetDigests,
-} from '@odatano/nightgate/set-root';
+} from '@odatano/nightgate-tx/set-root';
 import { blake2b256Hex, loadPureCircuits } from './passport-anchor';
 import { MAX_SET_VALUES, SET_MERKLE_DEPTH } from './claim-sets';
 

@@ -1,6 +1,6 @@
 import { test, describe, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { listProducerWallets, producerWalletSecrets, feeSponsorWalletId, feeSponsorWalletIds } from '../../srv/lib/producer-wallets';
+import { listProducerWallets, producerWalletSecrets, producerSeedHex } from '../../srv/lib/producer-wallets';
 
 /**
  * The server-wallet registry backing the cockpit's "server wallet" login mode.
@@ -9,10 +9,9 @@ import { listProducerWallets, producerWalletSecrets, feeSponsorWalletId, feeSpon
 
 const KEYS = [
     'PRODUCER_WALLETS', 'PRODUCER_LABEL', 'PRODUCER_SHIELDED_ADDRESS',
-    'PRODUCER_WALLET_MNEMONIC', 'PRODUCER_VIEWING_KEY',
-    'PRODUCER_A_WALLET_MNEMONIC', 'PRODUCER_A_VIEWING_KEY', 'PRODUCER_A_SHIELDED_ADDRESS', 'PRODUCER_A_LABEL',
-    'PRODUCER_B_WALLET_MNEMONIC', 'PRODUCER_B_VIEWING_KEY', 'PRODUCER_B_SHIELDED_ADDRESS',
-    'PASSPORT_FEE_SPONSOR_WALLET'
+    'PRODUCER_WALLET_MNEMONIC',
+    'PRODUCER_A_WALLET_MNEMONIC', 'PRODUCER_A_SHIELDED_ADDRESS', 'PRODUCER_A_LABEL',
+    'PRODUCER_B_WALLET_MNEMONIC', 'PRODUCER_B_SHIELDED_ADDRESS'
 ];
 let saved: Record<string, string | undefined> = {};
 
@@ -31,11 +30,9 @@ describe('producer wallet registry', () => {
     test('lists the configured wallets without exposing secrets', () => {
         process.env.PRODUCER_WALLETS = 'A,B';
         process.env.PRODUCER_A_WALLET_MNEMONIC = 'phrase a';
-        process.env.PRODUCER_A_VIEWING_KEY = 'vk-a';
         process.env.PRODUCER_A_SHIELDED_ADDRESS = 'mn_shield-addr_preview1aaa';
         process.env.PRODUCER_A_LABEL = 'CellCo';
         process.env.PRODUCER_B_WALLET_MNEMONIC = 'phrase b';
-        process.env.PRODUCER_B_VIEWING_KEY = 'vk-b';
         process.env.PRODUCER_B_SHIELDED_ADDRESS = 'mn_shield-addr_preview1bbb';
 
         const wallets = listProducerWallets();
@@ -48,10 +45,9 @@ describe('producer wallet registry', () => {
         // No secret ever leaves the registry's public view.
         const serialized = JSON.stringify(wallets);
         assert.ok(!serialized.includes('phrase'));
-        assert.ok(!serialized.includes('vk-'));
     });
 
-    test('marks a wallet without signing keys as not ready', () => {
+    test('marks a wallet without a mnemonic as not ready', () => {
         process.env.PRODUCER_WALLETS = 'A';
         process.env.PRODUCER_A_SHIELDED_ADDRESS = 'mn_shield-addr_preview1aaa';
 
@@ -62,18 +58,15 @@ describe('producer wallet registry', () => {
     test('resolves the secrets of the requested wallet id', () => {
         process.env.PRODUCER_WALLETS = 'A,B';
         process.env.PRODUCER_A_WALLET_MNEMONIC = 'phrase a';
-        process.env.PRODUCER_A_VIEWING_KEY = 'vk-a';
         process.env.PRODUCER_B_WALLET_MNEMONIC = 'phrase b';
-        process.env.PRODUCER_B_VIEWING_KEY = 'vk-b';
 
         assert.equal(producerWalletSecrets('B')?.mnemonic, 'phrase b');
-        assert.equal(producerWalletSecrets('A')?.viewingKey, 'vk-a');
+        assert.equal(producerWalletSecrets('A')?.mnemonic, 'phrase a');
         assert.equal(producerWalletSecrets('nope'), undefined);
     });
 
-    test('exposes the legacy single-wallet env as the `default` wallet', () => {
+    test('exposes the single-wallet env as the `default` wallet', () => {
         process.env.PRODUCER_WALLET_MNEMONIC = 'legacy phrase';
-        process.env.PRODUCER_VIEWING_KEY = 'legacy vk';
         process.env.PRODUCER_SHIELDED_ADDRESS = 'mn_shield-addr_preview1legacy';
 
         const wallets = listProducerWallets();
@@ -89,7 +82,6 @@ describe('producer wallet registry', () => {
     test('with only named wallets and no id, a single wallet is still resolvable', () => {
         process.env.PRODUCER_WALLETS = 'A';
         process.env.PRODUCER_A_WALLET_MNEMONIC = 'phrase a';
-        process.env.PRODUCER_A_VIEWING_KEY = 'vk-a';
 
         assert.equal(producerWalletSecrets()?.id, 'A');
     });
@@ -100,25 +92,16 @@ describe('producer wallet registry', () => {
     });
 });
 
-describe('fee sponsor wallet (PASSPORT_FEE_SPONSOR_WALLET)', () => {
-    test('unset or blank means no sponsoring', () => {
-        assert.equal(feeSponsorWalletId(), null);
-        process.env.PASSPORT_FEE_SPONSOR_WALLET = '   ';
-        assert.equal(feeSponsorWalletId(), null);
+describe('producerSeedHex', () => {
+    const PHRASE = 'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
+
+    test('derives the 64-byte BIP39 seed of the phrase', () => {
+        // BIP39 test vector for this phrase with an empty passphrase.
+        assert.equal(producerSeedHex(PHRASE),
+            '5eb00bbddcf069084889a8ab9155568165f5c453ccb85e70811aaed6f6da5fc19a5ac40b389cd370d086206dec8aa6c43daea6690f20ad3d8d48b2d2ce9e38e4');
     });
 
-    test('returns the configured wallet id, trimmed', () => {
-        process.env.PASSPORT_FEE_SPONSOR_WALLET = ' default ';
-        assert.equal(feeSponsorWalletId(), 'default');
-    });
-
-    test('parses a comma-separated pool; single id stays a one-element pool', () => {
-        process.env.PASSPORT_FEE_SPONSOR_WALLET = ' S1 , S2,S3 ';
-        assert.deepEqual(feeSponsorWalletIds(), ['S1', 'S2', 'S3']);
-        assert.equal(feeSponsorWalletId(), 'S1'); // first member = default sponsor
-        process.env.PASSPORT_FEE_SPONSOR_WALLET = 'default';
-        assert.deepEqual(feeSponsorWalletIds(), ['default']);
-        delete process.env.PASSPORT_FEE_SPONSOR_WALLET;
-        assert.deepEqual(feeSponsorWalletIds(), []);
+    test('refuses a phrase that is not valid BIP39', () => {
+        assert.throws(() => producerSeedHex('phrase a'), /not a valid BIP39 phrase/);
     });
 });

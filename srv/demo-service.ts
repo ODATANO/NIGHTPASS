@@ -7,35 +7,24 @@ import {
     DEMO_PROFILES, demoProfile, demoClaimList, demoChildRows, membershipSetFor, type ResolvedClaim,
 } from './lib/demo-claims';
 import type { AttributeRow } from '@odatano/dpp-sdk/attributes';
-import { feeSponsorWalletIds, producerWalletSecrets } from './lib/producer-wallets';
 import { encryptSecret, decryptSecret } from './lib/demo-crypto';
-import { sendDetached, waitForJobResult, detachedFromRequest, explorerTxUrl, blake2b256Hex } from './lib/passport-anchor';
-import { remoteIdentity, remoteLaneConfigFromEnv, registerRemoteSigner, releaseRemoteSigner, ensureRemoteZkAssets, hostedVerifyClient } from './lib/lane-remote';
+import { detachedFromRequest, explorerTxUrl, blake2b256Hex } from './lib/passport-anchor';
+import {
+    chainLaneConfigured, remoteIdentity, remoteLaneConfigFromEnv, remoteLaneFor, registerRemoteSigner, releaseRemoteSigner,
+    ensureRemoteZkAssets, hostedVerifyClient, type RemoteChainLane
+} from './lib/lane-remote';
 
 const { INSERT, SELECT, UPDATE } = cds.ql;
 
 /**
- * DemoService: the anonymous "Try it" surface (see docs/try-it-demo-plan.md).
- *
- * Every NIGHTGATE / ProducerService call runs under ONE fixed technical user
- * ('producer', same principal as the cockpit + ERP ingest): NIGHTGATE binds
- * wallet sessions to the userId and the 0.8.0 fee-sponsor guard is same-user
- * scoped, so the tester's acting session and the sponsor session must share a
- * principal. App-level tester identity lives in demo.Testers instead.
- *
- * Runs are serialized through one in-memory FIFO (concurrency 1): the VPS
- * proof server and the wallet worker stay healthy, and visitors get an honest
- * queue position. In-flight state is lost on restart; boot marks stale rows
- * failed (a demo run is cheap to redo).
+ * DemoService: the anonymous "Try it" surface. Every ProducerService call runs
+ * under one technical user; the tester's identity lives in demo.Testers. Runs
+ * queue in memory, so a restart loses the ones in flight and boot fails them.
  */
 export default class DemoService extends cds.ApplicationService {
     private queue: string[] = [];
     /** runIds currently executing (semaphore up to concurrency()). */
     private running = new Set<string>();
-    /** Sponsor pool lease: walletId -> runId currently pinned to it. One run
-     *  per sponsor at a time, so parallel runs never race each other for the
-     *  same wallet's dust notes (1014). */
-    private sponsorLeases = new Map<string, string>();
 
     override async init(): Promise<void> {
         this.on('startTester', this.startTester);
@@ -48,34 +37,34 @@ export default class DemoService extends cds.ApplicationService {
         // Stale queued/running rows from a previous process are unrecoverable
         // (the queue is in-memory); fail them honestly on boot.
         cds.on('served', () => {
-            if (process.env.DEMO_ENABLED === 'true' && !this.encryptionKeyOk()) {
-                cds.log('demo').error(
-                    'DEMO_ENABLED is set but ENCRYPTION_KEY is missing or not 64 hex chars; ' +
-                    'the demo stays DISABLED (tester wallet secrets must never use the dev fallback key)');
+            if (process.env.DEMO_ENABLED === 'true') {
+                const log = cds.log('demo');
+                if (!this.encryptionKeyOk()) {
+                    log.error(
+                        'DEMO_ENABLED is set but ENCRYPTION_KEY is missing or not 64 hex chars; ' +
+                        'the demo stays DISABLED (tester wallet secrets must never use the dev fallback key)');
+                }
+                if (!chainLaneConfigured()) {
+                    log.error('DEMO_ENABLED is set but NIGHTGATE_API_URL or NIGHTGATE_AGENT_TOKEN is missing; the demo stays DISABLED');
+                }
+                if (!this.vaultPool().length) {
+                    log.error('DEMO_ENABLED is set but PASSPORT_CONTRACT_ADDRESSES and PASSPORT_CONTRACT_ADDRESS name no vault (64 hex); the demo stays DISABLED');
+                }
             }
             void this.failStaleRuns().catch(() => { /* best-effort */ });
-            // Under parallel runs, write bursts (facade saves, deep inserts)
-            // exceed the default 5s busy timeout; let writers queue longer
-            // instead of failing with 'database is locked'. Same best-effort
-            // pragma mechanism the plugin's sqlite tuning uses.
+            // Under parallel runs, write bursts exceed the default 5s busy timeout.
+            // Let writers queue longer instead of failing with 'database is locked'.
             void (async () => {
                 try {
                     const db: any = await cds.connect.to('db');
                     if (typeof db.pragma === 'function') await db.pragma('busy_timeout = 15000');
                 } catch { /* non-sqlite or pragma unsupported */ }
             })();
-            // Warm the sponsor at boot: the sponsor facade must catch up to
-            // the chain tip before its first dust balance (117 guard), and
-            // without this the FIRST visitor after a restart pays that wait
-            // inside their attest step.
-            void this.prewarmSponsor().catch((e: unknown) =>
-                cds.log('demo').warn('sponsor boot prewarm failed:', (e as Error)?.message));
-            this.startSponsorWatchdog();
             this.startHostedSponsorProbe();
-            if (this.enabled() && this.remoteTransport()) {
+            if (this.enabled()) {
                 void ensureRemoteZkAssets()
-                    .then((r) => cds.log('demo').info(`remote lane zk assets ready (${r.fetched} fetched, ${r.cached} cached)`))
-                    .catch((e: unknown) => cds.log('demo').warn('remote lane zk asset warm-up failed:', (e as Error)?.message));
+                    .then((r) => cds.log('demo').info(`prover keys ready (${r.fetched} fetched, ${r.cached} cached)`))
+                    .catch((e: unknown) => cds.log('demo').warn('prover key warm-up failed:', (e as Error)?.message));
             }
         });
         return super.init();
@@ -93,47 +82,19 @@ export default class DemoService extends cds.ApplicationService {
         return /^[0-9a-fA-F]{64}$/.test(process.env.ENCRYPTION_KEY ?? '');
     }
 
+    /** Without the API and its grant no run can reach the chain, so the demo counts as off. */
     private enabled(): boolean {
-        return process.env.DEMO_ENABLED === 'true' && this.encryptionKeyOk();
+        return process.env.DEMO_ENABLED === 'true' && this.encryptionKeyOk() && chainLaneConfigured();
     }
-    /**
-     * DEMO_TRANSPORT=remote: every run builds and proves its transactions in
-     * this process with a throwaway seed and hands them to the hosted
-     * NIGHTGATE under an agent grant; no wallet session, no sponsor pool, no
-     * worker here. Default 'plugin' keeps the in-process lane.
-     */
-    private remoteTransport(): boolean { return process.env.DEMO_TRANSPORT === 'remote'; }
     private maxPerDay(): number { return Number(process.env.DEMO_MAX_PER_DAY || 50); }
     private maxPerIpPerDay(): number { return Number(process.env.DEMO_MAX_PER_IP_PER_DAY || 5); }
     private maxPerTester(): number { return Number(process.env.DEMO_MAX_PER_TESTER || 1); }
     private maxQueue(): number { return Number(process.env.DEMO_MAX_QUEUE || 5); }
     private queueDepth(): number { return this.queue.length + this.running.size; }
 
-    /**
-     * How many runs may execute in parallel, capped by the sponsor pool size
-     * (each run leases its own sponsor, see sponsorLeases).
-     *
-     * DEFAULT IS 1; DEMO_CONCURRENCY > 1 requires @odatano/nightgate >= 0.8.2
-     * (hardened persist sink). Before that hardening, parallel runs made the
-     * facade saves lose the SQLite write lock on every tick; load-tested
-     * green at concurrency 3 with 0.8.2 plus the start stagger below.
-     */
+    /** How many runs may execute in parallel. The API's pool sponsors in parallel, so proving capacity is the bound. */
     private concurrency(): number {
-        const wanted = Number(process.env.DEMO_CONCURRENCY || 1);
-        // Remote lane: the hosted pool sponsors in parallel; proving capacity
-        // is the bound, not a local sponsor count.
-        if (this.remoteTransport()) return Math.max(1, wanted);
-        const pool = feeSponsorWalletIds().length;
-        return Math.max(1, Math.min(pool || 1, wanted));
-    }
-
-    /** Lease a free pool sponsor for a run; null when none configured. */
-    private acquireSponsor(runId: string): string | null {
-        if (this.remoteTransport()) return null;
-        const free = feeSponsorWalletIds().find((w) => !this.sponsorLeases.has(w));
-        if (!free) return null;
-        this.sponsorLeases.set(free, runId);
-        return free;
+        return Math.max(1, Number(process.env.DEMO_CONCURRENCY) || 1);
     }
 
     /**
@@ -146,23 +107,17 @@ export default class DemoService extends cds.ApplicationService {
      * still overlap, which is where the parallel throughput actually lives.
      */
     private startStaggerMs(): number {
-        // Remote transport with a vault pool: no local write-lock storm and no
-        // shared attest cell, so runs may start almost back to back.
-        const dflt = this.remoteTransport() && this.vaultPool().length > 1 ? 5_000 : 45_000;
+        // With a vault pool the runs write distinct contracts, so they may start almost back to back.
+        const dflt = this.vaultPool().length > 1 ? 5_000 : 45_000;
         return Number(process.env.DEMO_START_STAGGER_MS || dflt);
     }
     private lastStartAt = 0;
     private staggerTimer: NodeJS.Timeout | null = null;
     /** Default vault (the first of the pool). */
     private contractAddress(): string | null { return this.vaultPool()[0] ?? null; }
-    /**
-     * Vaults visitor runs are spread over. `attest` updates one sequence cell
-     * PER VAULT, so two runs attesting in the same block on one vault
-     * collide; on distinct vaults they do not. PASSPORT_CONTRACT_ADDRESSES
-     * (comma list) or the single PASSPORT_CONTRACT_ADDRESS.
-     */
+    /** Vaults visitor runs are spread over: PASSPORT_CONTRACT_ADDRESSES (comma list), else the single PASSPORT_CONTRACT_ADDRESS. */
     private vaultPool(): string[] {
-        const list = String(process.env.PASSPORT_CONTRACT_ADDRESSES ?? process.env.PASSPORT_CONTRACT_ADDRESS ?? '')
+        const list = String(process.env.PASSPORT_CONTRACT_ADDRESSES?.trim() || process.env.PASSPORT_CONTRACT_ADDRESS || '')
             .split(',').map((v) => v.trim().toLowerCase()).filter((v) => /^[0-9a-f]{64}$/.test(v));
         return [...new Set(list)];
     }
@@ -232,21 +187,13 @@ export default class DemoService extends cds.ApplicationService {
     // --- actions --------------------------------------------------------------
 
     /**
-     * The tester's on-chain identity for a fresh seed. Plugin lane: the
-     * plugin's pure derivation (viewing key for the session, addresses).
-     * Remote lane: attester id and night address derived from the seed
-     * (no builder, no network); there is no viewing key because there is no
-     * session, and the attester id doubles as the owner scope of the passport.
+     * The tester's on-chain identity for a fresh seed: attester id and night
+     * address, derived without a builder or the network. The attester id
+     * doubles as the owner scope of the passport.
      */
-    private async testerIdentity(seedHex: string): Promise<{ viewingKey?: string; shieldedAddress: string; nightAddress: string }> {
-        if (this.remoteTransport()) {
-            const id = await remoteIdentity(remoteLaneConfigFromEnv(), seedHex);
-            return { shieldedAddress: id.attesterId, nightAddress: id.nightAddress };
-        }
-        const nightgate: any = await cds.connect.to('NightgateService');
-        const info: any = await nightgate.tx({ user: this.techUser() }, (tx: any) =>
-            tx.send('deriveWalletInfo', { seedHex }));
-        return { viewingKey: String(info.viewingKey), shieldedAddress: String(info.shieldedAddress), nightAddress: String(info.nightAddress) };
+    private async testerIdentity(seedHex: string): Promise<{ shieldedAddress: string; nightAddress: string }> {
+        const id = await remoteIdentity(remoteLaneConfigFromEnv(), seedHex);
+        return { shieldedAddress: id.attesterId, nightAddress: id.nightAddress };
     }
 
     private startTester = async (req: cds.Request) => {
@@ -261,18 +208,12 @@ export default class DemoService extends cds.ApplicationService {
             return req.reject(429, 'daily demo budget for this address is used up, try again tomorrow');
         }
 
-        // Fresh wallet: a random 64-byte BIP39 seed (no mnemonic round-trip
-        // needed; NIGHTGATE accepts seedHex everywhere). Identity via the
-        // plugin's pure derivation action.
+        // Fresh identity: a random 64-byte seed, which the transaction builder takes as it is.
         const seedHex = randomBytes(64).toString('hex');
         const info = await this.testerIdentity(seedHex);
 
         const testerId = cds.utils.uuid();
-        // Cap re-check + INSERT under the in-process lock (parallel-burst
-        // safe), and as a detached short root tx: the request's own snapshot
-        // is stale by now (the deriveWalletInfo service call above let the
-        // wallet worker's periodic facade-save commit in between), and writing
-        // in a stale snapshot is the documented SQLITE_BUSY_SNAPSHOT trap.
+        // Cap re-check and INSERT under the in-process lock, in a short root tx of their own.
         await this.withCapLock(async () => {
             if (!ipExempt && await this.countToday(Testers, { clientKey }) >= this.maxPerIpPerDay()) {
                 return req.reject(429, 'daily demo budget for this address is used up, try again tomorrow');
@@ -281,7 +222,6 @@ export default class DemoService extends cds.ApplicationService {
                 testerId,
                 nickname: validNickname((req.data as any).nickname),
                 encSeedHex: encryptSecret(seedHex, testerId),
-                encViewingKey: encryptSecret(String(info.viewingKey ?? ''), testerId),
                 shieldedAddress: String(info.shieldedAddress),
                 nightAddress: String(info.nightAddress),
                 clientKey,
@@ -352,11 +292,7 @@ export default class DemoService extends cds.ApplicationService {
                     .set({ passportCount: { '+=': 1 } } as any)
                     .where({ ID: tester.ID, passportCount: { '<': this.maxPerTester() } } as any));
             if (!won) return req.reject(429, 'this tester already created a passport');
-            // (passportCount was incremented by the atomic gate just above.)
-            // Detached write for the same snapshot-staleness reason as
-            // startTester: the wallet worker's periodic saves commit on other
-            // connections at any time, so demo writes always take their own
-            // short root tx.
+            // The run row takes a short root tx of its own, like the tester row.
             await this.detachedWrite(async () => {
                 await INSERT.into(Runs).entries({
                     ID: runId,
@@ -464,31 +400,13 @@ export default class DemoService extends cds.ApplicationService {
             }));
     };
 
-    /**
-     * Ops dust monitor: delegate to ProducerService (it owns the sponsor
-     * sessions) under the same technical principal that opened them, and
-     * surface the pool's NIGHT/dust snapshot on the anonymous demo surface so
-     * an operator can curl it without SSH. Never throws; degrades to [].
-     */
+    /** The API's sponsor pool as one gauge row, from the cached background probe. Empty when the demo is off. */
     private demoSponsorStatus = async () => {
         if (!this.enabled()) return [];
-        // Remote lane: the gauge shows the hosted sponsor as ONE member, from
-        // the cached background probe (never a live read in the request path).
-        if (this.remoteTransport()) return [this.hostedSponsorRow()];
-        try {
-            // DETACHED, never inside a managed tx: the pool reads talk to the
-            // wallet worker and can take seconds; an open DB transaction held
-            // across that leaked one postgres connection per poll until the
-            // pool starved (found live 2026-07-24 with the battery gauge).
-            const producer: any = await cds.connect.to('ProducerService');
-            return await sendDetached(producer, 'sponsorPoolStatus', {}, this.techUser());
-        } catch (e) {
-            cds.log('demo').warn('demoSponsorStatus failed:', (e as Error)?.message);
-            return [];
-        }
+        return [this.hostedSponsorRow()];
     };
 
-    // --- hosted sponsor probe (remote transport) ------------------------------
+    // --- sponsor probe ---------------------------------------------------------
 
     private hostedProbe: { state: 'cold' | 'ready' | 'error'; error: string; at: number } = { state: 'cold', error: '', at: 0 };
     private hostedProbeTimer?: ReturnType<typeof setInterval>;
@@ -501,8 +419,8 @@ export default class DemoService extends cds.ApplicationService {
      * the background every DEMO_SPONSOR_WATCHDOG_MS (default 60 s here).
      */
     private startHostedSponsorProbe(): void {
-        if (!this.enabled() || !this.remoteTransport()) return;
-        const interval = Number(process.env.DEMO_SPONSOR_WATCHDOG_MS ?? 60_000);
+        if (!this.enabled()) return;
+        const interval = Number(process.env.DEMO_SPONSOR_WATCHDOG_MS?.trim() || 60_000);
         const tick = async () => {
             const contractAddress = this.contractAddress();
             try {
@@ -543,13 +461,7 @@ export default class DemoService extends cds.ApplicationService {
         input: NonNullable<ReturnType<typeof validateDemoInput>['value']>;
     }>();
 
-    /**
-     * Whether runs pre-register passport ownership on-chain (0.10.x vault
-     * feature). Explicit opt-in per deployment: the DEPLOYED vault must carry
-     * the `registerPassport` circuit (0.10.0 contract) and the registrar
-     * wallet (the vault DEPLOYER) must be configured on this instance; neither
-     * is detectable from the model alone.
-     */
+    /** Whether runs pre-register the passport id on-chain. Opt-in: it needs the registrar wallet on this instance. */
     private registerOwnershipEnabled(): boolean {
         return /^(true|1|yes|on)$/i.test(String(process.env.DEMO_REGISTER_OWNERSHIP ?? ''));
     }
@@ -566,8 +478,8 @@ export default class DemoService extends cds.ApplicationService {
             ? claims.map((c) => ({ kind: `prove:${c.field}`, label: statement(c), status: 'pending' }))
             : [{ kind: 'provePredicate', label: claims[0] ? `ZK-prove ${statement(claims[0])}` : 'ZK-prove the primary claim', status: 'pending' }];
         return [
-            { kind: 'sync', label: this.remoteTransport() ? 'Create passport & derive keys' : 'Create passport & sync wallet', status: 'pending' },
-            ...(this.registerOwnershipEnabled() && !this.remoteTransport()
+            { kind: 'sync', label: 'Create passport & derive keys', status: 'pending' },
+            ...(this.registerOwnershipEnabled()
                 ? [{ kind: 'registerPassport', label: 'Register passport ownership', status: 'pending' }]
                 : []),
             { kind: 'attest', label: 'Anchor the fingerprint (attest)', status: 'pending' },
@@ -581,11 +493,7 @@ export default class DemoService extends cds.ApplicationService {
         ];
     }
 
-    /**
-     * Launcher: starts queued runs while free slots (and pool sponsors) are
-     * available. Synchronous pop-and-launch; every completed run re-invokes
-     * it, so the queue drains under parallelism without a coordinator loop.
-     */
+    /** Starts queued runs while slots are free. Every finished run calls it again, so the queue drains without a loop. */
     private processQueue(): void {
         while (this.queue.length && this.running.size < this.concurrency()) {
             // Stagger starts (see startStaggerMs): the first run of an idle
@@ -607,10 +515,9 @@ export default class DemoService extends cds.ApplicationService {
             const ctx = this.pending.get(runId);
             this.pending.delete(runId);
             if (!ctx) continue;
-            const sponsor = this.acquireSponsor(runId);
             const vault = this.acquireVault(runId);
             this.running.add(runId);
-            void detachedFromRequest(() => this.executeRun(ctx, sponsor ?? undefined, vault ?? undefined))
+            void detachedFromRequest(() => this.executeRun(ctx, vault ?? undefined))
                 .catch(async (e: unknown) => {
                     const msg = String((e as Error)?.message ?? e).slice(0, 480);
                     cds.log('demo').warn(`run ${runId} failed:`, e);
@@ -619,7 +526,6 @@ export default class DemoService extends cds.ApplicationService {
                 .finally(() => {
                     this.running.delete(runId);
                     this.vaultLeases.delete(runId);
-                    if (sponsor) this.sponsorLeases.delete(sponsor);
                     this.processQueue();
                 });
         }
@@ -627,20 +533,16 @@ export default class DemoService extends cds.ApplicationService {
 
     private async executeRun(
         ctx: NonNullable<ReturnType<DemoService['pending']['get']>>,
-        sponsorWalletId?: string,
         vault?: string
     ): Promise<void> {
         const log = cds.log('demo');
         const { runId, passportId, input } = ctx;
         const user = this.techUser();
-        const nightgate: any = await cds.connect.to('NightgateService');
         const producer: any = await cds.connect.to('ProducerService');
         const claims = demoClaimList(input.profile, input.claims);
         const steps = this.initialSteps(input.secondLife, claims);
-        // BEST-EFFORT: the timeline is cosmetic. A stepsJson UPDATE that hits
-        // write-lock contention (facade saves) must never fail a run whose
-        // on-chain work succeeded; the next setStep re-writes the full array
-        // anyway, so a dropped intermediate write self-heals.
+        // Best effort: a failed timeline write must never fail a run whose
+        // on-chain work succeeded. The next setStep writes the full array again.
         const setSteps = async (patches: Array<[string, Record<string, unknown>]>) => {
             for (const [kind, patch] of patches) {
                 const s: any = steps.find(x => x.kind === kind);
@@ -654,105 +556,53 @@ export default class DemoService extends cds.ApplicationService {
         };
         const setStep = (kind: string, patch: Record<string, unknown>) => setSteps([[kind, patch]]);
 
-        // 0. Make sure the LEASED sponsor's session exists BEFORE the anchor:
-        //    without this, a failed boot prewarm would let ProducerService
-        //    open the sponsor session lazily INSIDE the write-holding
-        //    createPassport tx (the documented write-lock-vs-detached-commit
-        //    deadlock), and the run would silently degrade to unsponsored and
-        //    die on zero dust. Failing here instead gives an honest, early
-        //    error. (sponsorWalletId is this run's exclusive pool lease.)
-        if (sponsorWalletId) {
-            const warm: any = await producer.tx({ user }, (tx: any) =>
-                tx.send('prewarmServerWallet', { walletId: sponsorWalletId }));
-            if (warm?.state === 'error') {
-                throw new Error(`fee sponsor '${sponsorWalletId}' unavailable: ${warm?.error || 'no signing session'}`);
-            }
-        }
-
-        // 1. Wallet: open the tester's signing session + wait for sync.
+        // 1. Signer: the seed stays in this process for the run. The run id
+        //    doubles as the signer handle (the actions type it as UUID) and
+        //    routes every producer action of this run to the tester's seed.
         await this.patchRun(runId, { state: 'wallet' });
         await setStep('sync', { status: 'running' });
         const tester: any = await SELECT.one.from(Testers).where({ ID: ctx.testerRowId });
         const seedHex = decryptSecret(tester.encSeedHex, tester.testerId);
-        const remote = this.remoteTransport();
-        let sessionId: string;
-        if (remote) {
-            // The seed stays in this process for the run; the run id doubles
-            // as the session handle (the actions type it as UUID) and routes
-            // every producer action of this run through the remote lane.
-            sessionId = runId;
-            registerRemoteSigner(sessionId, seedHex, { contractAddress: vault ?? this.contractAddress() ?? undefined });
-            if (vault) log.info(`run ${runId}: vault ${vault.slice(0, 8)}... (${this.vaultPool().length} in the pool)`);
-        } else {
-            const viewingKey = decryptSecret(tester.encViewingKey, tester.testerId);
-            const conn: any = await sendDetached(nightgate, 'connectWallet', { viewingKey }, user);
-            sessionId = String(conn.sessionId);
-        }
+        const sessionId = runId;
+        const contractAddress = vault ?? this.contractAddress() ?? undefined;
+        registerRemoteSigner(sessionId, seedHex, { contractAddress });
+        if (vault) log.info(`run ${runId}: vault ${vault.slice(0, 8)}... (${this.vaultPool().length} in the pool)`);
         try {
-            if (!remote) {
-                // With NIGHTGATE_SPONSORED_CALLER_SYNC=skip (0.8.1) a fresh
-                // caller wallet needs no chain sync at all: connect with
-                // prewarm:false so NO background sync job races the submission's
-                // on-demand facade init, the caller balance wait is skipped, and
-                // the sponsor carries the fees. Without the skip opt-in, keep the
-                // classic prewarm + wait.
-                const skipCallerSync = process.env.NIGHTGATE_SPONSORED_CALLER_SYNC === 'skip';
-                const signing: any = await sendDetached(nightgate, 'connectWalletForSigning',
-                    { sessionId, seedHex, ...(skipCallerSync ? { prewarm: false } : {}) }, user);
-                if (signing?.prewarmJobId && !skipCallerSync) {
-                    log.info(`run ${runId}: waiting for tester wallet sync...`);
-                    await waitForJobResult(nightgate, String(signing.prewarmJobId), sessionId, user);
-                }
-            }
             await setStep('sync', { status: 'succeeded' });
 
-            // 1b. Pre-register passport ownership (0.10.x vault): the
-            //     registrar (the vault deployer's wallet on this instance)
-            //     assigns the passportId to the TESTER's attester identity
-            //     (deriveWalletInfo.attesterId, 0.10.1) BEFORE the first bind,
-            //     so the id is squat-proof from the very first on-chain
-            //     second. NEVER fatal: an unregistered id still binds
-            //     first-come, and a SUCCESSFUL registration points at exactly
-            //     the identity the tester binds with.
-            if (this.registerOwnershipEnabled() && !remote) {
+            // 1b. Pre-register passport ownership: the registrar assigns the
+            //     passport id to the TESTER's attester identity BEFORE the
+            //     first bind, so the id cannot be taken by someone else.
+            //     NEVER fatal: an unregistered id still binds first-come.
+            if (this.registerOwnershipEnabled()) {
                 await setStep('registerPassport', { status: 'running' });
+                let registrar: RemoteChainLane | null = null;
                 try {
-                    const info: any = await sendDetached(nightgate, 'deriveWalletInfo', { seedHex }, user);
-                    if (!info?.attesterId) throw new Error('plugin lacks deriveWalletInfo.attesterId (NIGHTGATE >= 0.10.1 required)');
-                    const reg = producerWalletSecrets(process.env.PASSPORT_REGISTRAR_WALLET);
-                    if (!reg) throw new Error('no registrar wallet configured (PASSPORT_REGISTRAR_WALLET / default)');
-                    const contractAddress = process.env.PASSPORT_CONTRACT_ADDRESS;
-                    if (!contractAddress) throw new Error('PASSPORT_CONTRACT_ADDRESS not set');
-                    // REUSE the producer-cached session of the registrar
-                    // wallet. Never connectWallet here: that would open a
-                    // SECOND facade for an account the boot prewarm already
-                    // holds, and two facades on one accountId wedge the
-                    // wallet worker (this exact run hung on it live).
+                    if (!contractAddress) throw new Error('no vault configured');
                     const sess: any = await producer.tx({ user }, (tx: any) =>
-                        tx.send('serverWalletSession', { walletId: reg.id }));
-                    const regSession = String(sess.sessionId);
-                    const job: any = await sendDetached(nightgate, 'registerPassport', {
-                        passportId: blake2b256Hex(passportId),
-                        ownerId: info.attesterId,
-                        sessionId: regSession,
-                        contractAddress
-                    }, user);
-                    const res: any = await waitForJobResult(nightgate, String(job.jobId), regSession, user, { requireChainSuccess: true });
+                        tx.send('serverWalletSession', { walletId: process.env.PASSPORT_REGISTRAR_WALLET || 'default' }));
+                    const { attesterId } = await remoteIdentity(remoteLaneConfigFromEnv(), seedHex);
+                    registrar = remoteLaneFor(String(sess.sessionId));
+                    const res = await registrar.submitVaultTx({
+                        contractAddress,
+                        tx: { label: 'registerDocument', calls: [{ circuit: 'registerDocument', args: ['0', blake2b256Hex(passportId), attesterId] }] }
+                    });
                     await setStep('registerPassport', {
                         status: 'succeeded', txHash: res.txHash, explorerUrl: explorerTxUrl(res.txHash)
                     });
                 } catch (e) {
                     log.warn(`run ${runId}: ownership registration failed (continuing unregistered):`, (e as Error)?.message);
                     await setStep('registerPassport', { status: 'failed' });
+                } finally {
+                    await registrar?.dispose().catch(() => { /* nothing left to release */ });
                 }
             }
 
             // 2. Create + anchor through the standard cockpit action. MANAGED
             //    tx (callback form) so its 'succeeded' event fires and the
             //    detached anchor runner actually starts (ERP-ingest lesson).
-            //    The explicit sessionId makes ProducerService use the tester's
-            //    session, and PASSPORT_FEE_SPONSOR_WALLET on this instance
-            //    makes the sponsor pay all three anchor fees.
+            //    The explicit sessionId makes ProducerService sign with the
+            //    tester's seed; the API's pool pays the fees.
             await this.patchRun(runId, { state: 'anchoring' });
             await setStep('attest', { status: 'running' });
             // Public head: the visitor's column values plus the family's fixed
@@ -782,8 +632,7 @@ export default class DemoService extends cds.ApplicationService {
                 ...demoChildRows(input.profile, input.claims, { nonce: randomBytes(4).toString('hex'), today }),
             });
             const created: any = await producer.tx({ user }, (tx: any) => tx.send('createPassport', {
-                passportJson, submit: true, owner: tester.shieldedAddress, sessionId,
-                ...(sponsorWalletId ? { sponsorWalletId } : {})
+                passportJson, submit: true, owner: tester.shieldedAddress, sessionId
             }));
             if (created?.mode !== 'anchoring') {
                 throw new Error(`createPassport returned mode '${created?.mode}' (expected 'anchoring')`);
@@ -807,8 +656,7 @@ export default class DemoService extends cds.ApplicationService {
                 claimsJson: JSON.stringify(claims.map((c) => (c.predicate === 'setMembership'
                     ? { sourceField: c.field, predicate: 'setMembership', setId: c.setId }
                     : { sourceField: c.field, predicate: c.predicate, threshold: c.threshold, unit: c.unit }))),
-                sessionId,
-                ...(sponsorWalletId ? { sponsorWalletId } : {})
+                sessionId
             }));
             if (prove?.mode !== 'proving') throw new Error(`provePassportValuesBatch returned mode '${prove?.mode}'`);
             const proofIds: string[] = JSON.parse(String(prove.proofLogIds ?? '[]'));
@@ -853,8 +701,7 @@ export default class DemoService extends cds.ApplicationService {
                     const mocksap: any = await cds.connect.to('BmsSimulatorService');
                     await mocksap.tx({ user }, (tx: any) => tx.send('triggerBmsTelemetry', { passportId, ticks: 2 }));
                     const st: any = await producer.tx({ user }, (tx: any) => tx.send('changeBatteryStatus', {
-                        passportId, newStatus: 'repurposed', sessionId,
-                        ...(sponsorWalletId ? { sponsorWalletId } : {})
+                        passportId, newStatus: 'repurposed', sessionId
                     }));
                     if (st?.mode !== 'anchoring') throw new Error(`changeBatteryStatus returned mode '${st?.mode}'`);
                     const aged = await this.pollReanchor(passportId);
@@ -892,30 +739,7 @@ export default class DemoService extends cds.ApplicationService {
             await this.patchRun(runId, { state: 'done' });
             log.info(`run ${runId}: ${passportId} done`);
         } finally {
-            if (remote) releaseRemoteSigner(sessionId);
-            // Memory hygiene: every visitor otherwise leaves a wallet facade
-            // behind in the worker forever. Disconnecting evicts the facade
-            // (with a final state save) and deactivates the session; a later
-            // run for the same tester simply reconnects from the stored
-            // secrets. Retried on write contention (the evict's own final
-            // multi-MB facade save can hold the write lock past the busy
-            // timeout). FIRE-AND-FORGET: the retry sleeps must not delay the
-            // next queued visitor's run; nothing downstream depends on this
-            // per-run session, so the queue can advance immediately.
-            if (!remote) void (async () => {
-                for (let attempt = 0; attempt < 3; attempt++) {
-                    if (attempt > 0) await new Promise(r => setTimeout(r, 5000));
-                    try {
-                        await sendDetached(nightgate, 'disconnectWallet', { sessionId }, user);
-                        log.info(`run ${runId}: tester session ${sessionId.slice(0, 8)}... disconnected (facade evicted)`);
-                        return;
-                    } catch (e) {
-                        const msg = String((e as Error)?.message ?? e);
-                        log.warn(`run ${runId}: tester session cleanup attempt ${attempt + 1} failed:`, msg);
-                        if (!/database is locked|SQLITE_BUSY/i.test(msg)) return;
-                    }
-                }
-            })();
+            releaseRemoteSigner(sessionId);
         }
     }
 
@@ -984,13 +808,7 @@ export default class DemoService extends cds.ApplicationService {
         }
     }
 
-    /**
-     * Short detached root tx for writes (see the snapshot notes above), with
-     * a bounded retry on sqlite write contention: the wallet worker's
-     * periodic multi-MB facade saves can hold the write lock past the busy
-     * timeout, and a visitor request colliding with one must not surface a
-     * raw 500 (seen live: a double-submit got SQLITE_BUSY instead of 429).
-     */
+    /** Short root tx for a write, retried on sqlite write contention so a visitor request does not surface a raw 500. */
     private async detachedWrite<T>(fn: () => Promise<T>): Promise<T> {
         let lastErr: unknown;
         for (let attempt = 0; attempt < 3; attempt++) {
@@ -1010,68 +828,10 @@ export default class DemoService extends cds.ApplicationService {
             UPDATE.entity(Runs).set(patch).where({ ID: runId }) as any);
     }
 
-    private sponsorWatchdogTimer?: ReturnType<typeof setInterval>;
-
-    /**
-     * Periodic sponsor health check. Sponsor sessions can die while the
-     * container keeps running: the session row hits its TTL and NIGHTGATE's
-     * cleanup removes it ("Session not found or inactive", seen live
-     * 2026-08-01 after 28h uptime), or the facade gets evicted. The boot
-     * prewarm only runs once, so without this every visitor run fails at
-     * sponsoring until someone restarts the container.
-     *
-     * Each tick calls sponsorPoolStatus, which already self-heals a DEAD
-     * cached session (drops it and reconnects). Members with no session at
-     * all ('cold', e.g. a failed boot prewarm) or a failed open ('error')
-     * additionally get a fresh prewarm kick here. The balance reads behind
-     * the tick are bounded (10s wallet-read timeout) and run detached.
-     *
-     * DEMO_SPONSOR_WATCHDOG_MS overrides the 5-min default; 0 disables.
-     */
-    private startSponsorWatchdog(): void {
-        if (!this.enabled() || this.remoteTransport() || !feeSponsorWalletIds().length) return;
-        const interval = Number(process.env.DEMO_SPONSOR_WATCHDOG_MS ?? 300_000);
-        if (!interval || interval < 0) return;
-        const tick = async () => {
-            try {
-                const producer: any = await cds.connect.to('ProducerService');
-                const pool: any[] = await sendDetached(producer, 'sponsorPoolStatus', {}, this.techUser());
-                for (const s of pool ?? []) {
-                    if (!s || s.healthy || s.state === 'warming' || s.state === 'ready') continue;
-                    cds.log('demo').warn(
-                        `sponsor watchdog: '${s.walletId}' is ${s.state}${s.error ? ` (${String(s.error).slice(0, 120)})` : ''}; kicking prewarm`);
-                    await producer.tx({ user: this.techUser() }, (tx: any) =>
-                        tx.send('prewarmServerWallet', { walletId: s.walletId }));
-                }
-            } catch (e) {
-                cds.log('demo').warn('sponsor watchdog tick failed:', (e as Error)?.message);
-            }
-        };
-        this.sponsorWatchdogTimer = setInterval(() => void tick(), interval);
-        this.sponsorWatchdogTimer.unref?.();
-    }
-
-    /** Kick every pool sponsor's session + sync at boot (non-blocking). The
-     *  registrar wallet joins the round: it signs registerPassport for every
-     *  run, so a cold registrar stalls the first visitor for minutes. */
-    private async prewarmSponsor(): Promise<void> {
-        if (!this.enabled() || this.remoteTransport()) return;
-        const wallets = new Set(feeSponsorWalletIds());
-        if (this.registerOwnershipEnabled())
-            wallets.add(process.env.PASSPORT_REGISTRAR_WALLET || 'default');
-        if (!wallets.size) return;
-        const producer: any = await cds.connect.to('ProducerService');
-        for (const walletId of wallets) {
-            await producer.tx({ user: this.techUser() }, (tx: any) =>
-                tx.send('prewarmServerWallet', { walletId }));
-            cds.log('demo').info(`server wallet '${walletId}' prewarm kicked at boot`);
-        }
-    }
-
     private async failStaleRuns(): Promise<void> {
         await (cds as any).tx({}, () =>
             UPDATE.entity(Runs)
                 .set({ state: 'failed', error: 'server restarted while the run was in flight' })
-                .where({ state: { in: ['queued', 'wallet', 'anchoring', 'proving', 'publishing'] } }));
+                .where({ state: { in: ['queued', 'wallet', 'anchoring', 'proving', 'aging', 'publishing'] } }));
     }
 }

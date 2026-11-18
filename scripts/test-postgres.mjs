@@ -10,7 +10,7 @@ await cds.deploy(model).to('db');
 
 const db = await cds.connect.to('db');
 const { SELECT } = cds.ql;
-const entities = ['passport.Passports', 'midnight.SyncState', 'midnight.BackgroundJobs'];
+const entities = ['passport.Passports', 'passport.PassportTransactions', 'demo.Runs'];
 for (const entity of entities) {
   const [{ count }] = await db.run(SELECT.from(entity).columns('count(*) as count'));
   if (!Number.isFinite(Number(count))) throw new Error(`Invalid row count returned for ${entity}`);

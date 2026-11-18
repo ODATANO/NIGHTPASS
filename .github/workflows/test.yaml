@@ -62,10 +62,9 @@ jobs:
           fail_ci_if_error: false
 
   # =========================================================================
-  # CDS: the full model (domain schema + mock SAP feed + the three services,
-  # merged with the NIGHTGATE plugin) must still compile and expose the
-  # load-bearing definitions. A silent CDS break would ship a service that
-  # 404s at runtime, so this gate is worth its seconds.
+  # CDS: the full model (domain schema, mock SAP feed and the services) must
+  # still compile and expose the load-bearing definitions. A silent CDS break
+  # would ship a service that 404s at runtime.
   # =========================================================================
   cds-compile:
     runs-on: ubuntu-latest

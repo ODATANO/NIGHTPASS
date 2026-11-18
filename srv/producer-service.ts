@@ -5,18 +5,19 @@ import {
     PassportAttributes, PassportAttributeHistory, PassportAnchorVersions
 } from '#cds-models/passport';
 import {
-    hashPayload, blake2b256Hex, encryptPayload, anchorPassport, waitForJob, waitForJobResult,
-    detachedFromRequest, sendDetached,
-    buildContentRoot, newSaltSeed, decryptPayload, fieldKeyHex, runChainStep,
+    hashPayload, blake2b256Hex, encryptPayload, anchorPassport, detachedFromRequest,
+    buildContentRoot, newSaltSeed, decryptPayload, fieldKeyHex,
     effectiveNetwork, explorerTxUrl, recordKeyFor
 } from './lib/passport-anchor';
 import { appProfileOf, type AppProfile } from './lib/product-profiles';
 import type { AttributeRow } from '@odatano/dpp-sdk/attributes';
-import { PluginLane } from './lib/lane-plugin';
-import { remoteLaneFor, hasRemoteSigner, remoteVaultFor } from './lib/lane-remote';
+import {
+    remoteLaneFor, hasRemoteSigner, remoteVaultFor, registerRemoteSigner,
+    remoteIdentity, remoteLaneConfigFromEnv, ensureRemoteZkAssets, chainLaneConfigured
+} from './lib/lane-remote';
 import {
     ProofCartError,
-    type ChainLane, type CartClaimArgs, type ProofCartInput
+    type ChainLane, type CartClaimArgs, type ComparisonInput, type ProofCartInput, type VaultTx
 } from './lib/chain-lane';
 import { CLAIM_SETS, claimSetById } from './lib/claim-sets';
 import {
@@ -31,11 +32,13 @@ import { projectPayload, readProfileRows, readPayload } from './lib/passport-pay
 import { validateTransition, parseBatteryStatus, encodeBatteryStatus, type BatteryStatus } from './lib/battery-lifecycle';
 import { validateDiligenceUpload, decodeUpload, sha256Hex } from './lib/diligence-upload';
 import { proofCartPlan, claimKey, responseClaimKey, claimValidUntil, type ProofClaim } from './lib/proof-plan';
-import { listProducerWallets, producerWalletSecrets, feeSponsorWalletId, feeSponsorWalletIds } from './lib/producer-wallets';
+import { listProducerWallets, producerWalletSecrets, producerSeedHex } from './lib/producer-wallets';
 import { s4ConfigFromEnv, fetchMaterialDocuments, enrichMaster, loadProductMaster } from './lib/s4-client';
 import { buildReceiptRows, BATTERY_MAPPING } from './lib/s4-material-document';
-import { verifyContractTx, type ChainVerdict } from './lib/chain-verify';
-import { verifyAttestState, attestRootState, verifyGrantState, verifyPredicateState, verifyCrossRootState, resolveAnchorAttester } from './lib/state-verify';
+import {
+    verifyAttestState, attestRootState, verifyGrantState, verifyPredicateState, verifyCrossRootState, resolveAnchorAttester,
+    type ChainVerdict
+} from './lib/state-verify';
 import { sweepAction, verdictToStatus } from './lib/stuck-rows';
 
 /**
@@ -48,7 +51,6 @@ function claimLifetimeS(): number | undefined {
     return Number.isFinite(v) && v > 0 ? v : undefined;
 }
 
-const CONTRACT_REF = 'attestation-vault';
 
 /** One cart claim's log row plus its on-chain coordinates (for per-claim settlement). */
 type ProofClaimMeta = {
@@ -108,17 +110,10 @@ interface PassportInput {
  * The anchor sequence is shared with PassportService via srv/lib/passport-anchor.
  */
 export default class ProducerService extends cds.ApplicationService {
-    /** walletId -> NIGHTGATE signing session (one per configured server wallet). */
-    private serverSessions = new Map<string, string>();
-    /** sessionId -> pending facade prewarm job; awaited once by the first
-     *  detached anchor run on that session (submitting before the facade
-     *  exists fails with "No facade for sessionId"). */
-    private serverPrewarmJobs = new Map<string, string>();
-    /** walletId -> in-flight session creation; dedupes the login prewarm racing
-     *  a quick first attest (connectWalletForSigning is rate-limited). */
-    private serverSessionInflight = new Map<string, Promise<string | null>>();
-    /** walletId -> prewarm bookkeeping for the cockpit status surface. */
-    private walletWarmth = new Map<string, { state: 'warming' | 'ready' | 'error'; startedAt: number; error?: string }>();
+    /** walletId -> signer handle of its seed (one per configured server wallet). */
+    private serverSigners = new Map<string, string>();
+    /** The prover-key fetch of this process; every wallet shares it. */
+    private keyWarmth: { state: 'warming' | 'ready' | 'error'; startedAt: number; error: string } | null = null;
 
     override async init(): Promise<void> {
         this.on('createPassport', this.createPassport);
@@ -128,7 +123,6 @@ export default class ProducerService extends cds.ApplicationService {
         this.on('prewarmServerWallet', this.prewarmServerWallet);
         this.on('serverWalletStatus', this.serverWalletStatus);
         this.on('serverWalletSession', this.serverWalletSession);
-        this.on('sponsorPoolStatus', this.sponsorPoolStatus);
         this.on('recordWalletAttest', this.recordWalletAttest);
         this.on('recordWalletDisclosure', this.recordWalletDisclosure);
         this.on('recordWalletPredicate', this.recordWalletPredicate);
@@ -253,121 +247,41 @@ export default class ProducerService extends cds.ApplicationService {
         return this.contractAddress() ?? row?.contractAddress ?? null;
     }
 
-    /**
-     * Lazy server signing session from env (PRODUCER_VIEWING_KEY + mnemonic/seed).
-     *
-     * BARE `srv.send()` on purpose: it joins the caller's AMBIENT request tx,
-     * so NIGHTGATE's session writes ride on the same sqlite transaction (no
-     * cross-tx write-lock conflict) and inherit the request's user, which
-     * NIGHTGATE binds the session to. Callers must therefore run inside a
-     * proper request context with an authenticated user: HTTP requests have
-     * one anyway; programmatic callers (ERP ingest) must use the MANAGED
-     * `srv.tx({user}, fn)` form. Both a wrapper `nightgate.tx({user},...)` and
-     * `sendDetached` were tried here and deadlock (SQLITE_BUSY) against the
-     * caller's open request tx.
-     */
-    private serverSigningSession(walletId?: string): Promise<string | null> {
+    /** The signer handle of a server wallet, registered on first use. Null without a signing secret or without API access. */
+    private serverSigner(walletId?: string): string | null {
         const secrets = producerWalletSecrets(walletId);
-        if (!secrets) return Promise.resolve(null);
-        const cached = this.serverSessions.get(secrets.id);
-        if (cached) return Promise.resolve(cached);
-        const inflight = this.serverSessionInflight.get(secrets.id);
-        if (inflight) return inflight;
-        const opening = this.openServerSession(secrets)
-            .finally(() => this.serverSessionInflight.delete(secrets.id));
-        this.serverSessionInflight.set(secrets.id, opening);
-        return opening;
-    }
-
-    private async openServerSession(
-        secrets: NonNullable<ReturnType<typeof producerWalletSecrets>>
-    ): Promise<string | null> {
-        const { mnemonic, viewingKey } = secrets;
-        try {
-            const nightgate = await cds.connect.to('NightgateService');
-            // DETACHED sends: since NIGHTGATE 0.10.2 connectWalletForSigning
-            // reads the session row on its own autocommit connection. If
-            // connectWallet's INSERT still sits in this request's open tx,
-            // that read cannot see it (404 Session not found). Detaching
-            // commits the session row before the signing call looks it up.
-            // The user must ride along explicitly (sessions are userId-bound
-            // and the detached scope drops the ambient context). Callers
-            // reached via srv.send() have no ALS context at all, so an absent
-            // ambient user falls back to the technical 'producer' principal:
-            // every server-wallet session is owned by that principal anyway
-            // (cockpit basic auth and the demo executor both resolve to it).
-            const ambient = (cds.context as any)?.user;
-            const user = ambient?.id ? ambient : new (cds.User as any)({ id: 'producer', roles: ['producer'] });
-            const conn: any = await sendDetached(nightgate, 'connectWallet', { viewingKey }, user);
-            const sessionId = String(conn.sessionId);
-            const signing: any = await sendDetached(nightgate, 'connectWalletForSigning', {
-                sessionId, mnemonic
-            }, user);
-            // Remember the prewarm job: the detached anchor runner must await it
-            // before its first submission (the facade does not exist until then).
-            if (signing?.prewarmJobId) this.serverPrewarmJobs.set(sessionId, String(signing.prewarmJobId));
-            this.walletWarmth.set(secrets.id, {
-                state: signing?.prewarmJobId && signing?.prewarmStatus !== 'succeeded' ? 'warming' : 'ready',
-                startedAt: Date.now()
-            });
-            this.serverSessions.set(secrets.id, sessionId);
-            return sessionId;
-        } catch (e: any) {
-            // Log the FULL error shape: CAP OData rejections often carry the
-            // detail in e.code/e.reason/e.cause rather than e.message.
-            cds.log('producer').warn(`server signing session unavailable (wallet '${secrets.id}'):`,
-                e?.message || '(no message)',
-                '| code:', e?.code ?? '-',
-                '| cause:', e?.cause?.message ?? e?.reason ?? '-',
-                '| raw:', (() => { try { return JSON.stringify(e).slice(0, 300); } catch { return String(e); } })());
-            this.walletWarmth.set(secrets.id, {
-                state: 'error', startedAt: Date.now(), error: String(e?.message ?? e ?? 'session unavailable')
-            });
-            return null;
+        if (!secrets || !chainLaneConfigured()) return null;
+        let handle = this.serverSigners.get(secrets.id);
+        if (!handle) {
+            handle = cds.utils.uuid();
+            registerRemoteSigner(handle, producerSeedHex(secrets.mnemonic));
+            this.serverSigners.set(secrets.id, handle);
         }
+        return handle;
     }
 
     /**
-     * Explicit arg session (the in-browser Lace flow supplies one) wins;
-     * otherwise open/reuse the session of the selected SERVER wallet. `walletId`
-     * selects which configured server wallet signs; omitted = the default one.
+     * The signer of a chain call: a handle the caller registered (a demo
+     * run), else the selected server wallet. `walletId` omitted = the default one.
      */
-    private async effectiveSession(argSessionId?: string, walletId?: string): Promise<string | null> {
-        return argSessionId || this.serverSigningSession(walletId);
+    private effectiveSession(argSessionId?: string, walletId?: string): string | null {
+        if (!argSessionId) return this.serverSigner(walletId);
+        if (hasRemoteSigner(argSessionId)) return argSessionId;
+        throw Object.assign(new Error(`unknown signer '${argSessionId}'`), { status: 400 });
     }
 
-    /**
-     * NIGHTGATE session of the configured fee-sponsor wallet
-     * (PASSPORT_FEE_SPONSOR_WALLET), for per-tx dust sponsoring of the
-     * on-chain legs. Returns undefined when no sponsor is configured, when the
-     * sponsor IS the acting session (self-sponsoring is a no-op), or when the
-     * sponsor session cannot be opened. The latter degrades to unsponsored
-     * with a warning: a funded acting wallet still succeeds on its own dust,
-     * an unfunded one surfaces a clear insufficient-dust failure downstream.
-     *
-     * Must run inside the original request context (session opening inherits
-     * the request's user, and NIGHTGATE's sponsor guard requires the sponsor
-     * session to belong to the same user as the acting one).
-     */
-    private async sponsorSessionIdFor(actingSessionId: string, preferredWalletId?: string): Promise<string | undefined> {
-        // The remote lane's sponsor is the hosted pool behind the agent grant.
-        if (hasRemoteSigner(actingSessionId)) return undefined;
-        const pool = feeSponsorWalletIds();
-        if (!pool.length) return undefined;
-        // A caller-supplied preference must be a member of the CONFIGURED
-        // pool: the param selects among operator-approved sponsors, it can
-        // never turn an arbitrary registry wallet into one.
-        const sponsorWallet = preferredWalletId && pool.includes(preferredWalletId)
-            ? preferredWalletId
-            : pool[0];
-        const sponsorSession = await this.serverSigningSession(sponsorWallet);
-        if (!sponsorSession) {
-            cds.log('producer').warn(
-                `fee sponsor wallet '${sponsorWallet}' has no signing session; proceeding UNSPONSORED`);
-            return undefined;
-        }
-        if (sponsorSession === actingSessionId) return undefined;
-        return sponsorSession;
+    /** Starts the prover-key fetch once; a failed fetch starts again on the next call. */
+    private warmKeys(): void {
+        if (this.keyWarmth && this.keyWarmth.state !== 'error') return;
+        const warmth: NonNullable<ProducerService['keyWarmth']> = { state: 'warming', startedAt: Date.now(), error: '' };
+        this.keyWarmth = warmth;
+        Promise.resolve().then(() => ensureRemoteZkAssets()).then(
+            () => { warmth.state = 'ready'; },
+            (e: unknown) => {
+                warmth.state = 'error';
+                warmth.error = String((e as Error)?.message ?? e);
+                cds.log('producer').warn('prover key fetch failed:', warmth.error);
+            });
     }
 
     /** The configured server wallets the cockpit can sign with (no secrets). */
@@ -408,200 +322,32 @@ export default class ProducerService extends cds.ApplicationService {
         }
     };
 
-    /**
-     * Kick off the signing-facade prewarm for a server wallet (cockpit login).
-     * Opening the session already starts the prewarm inside NIGHTGATE; the call
-     * returns as soon as the session exists, NOT when the wallet is synced.
-     */
+    /** Registers the wallet's signer and starts the prover-key fetch (cockpit login). Returns at once. */
     private prewarmServerWallet = async (req: cds.Request) => {
         const { walletId } = req.data as { walletId?: string };
         const secrets = producerWalletSecrets(walletId);
         if (!secrets) return req.reject(404, `unknown server wallet '${walletId ?? ''}'`);
-        const sessionId = await this.serverSigningSession(secrets.id);
-        if (!sessionId) {
-            const w = this.walletWarmth.get(secrets.id);
-            return { walletId: secrets.id, state: 'error', error: w?.error || 'signing session unavailable (see server log)' };
-        }
-        const w = this.walletWarmth.get(secrets.id);
-        return { walletId: secrets.id, state: w?.state ?? 'ready', error: w?.error ?? '' };
+        this.serverSigner(secrets.id);
+        this.warmKeys();
+        return { walletId: secrets.id, state: this.keyWarmth?.state ?? 'ready', error: this.keyWarmth?.error ?? '' };
     };
 
-    /**
-     * Warmth of a server wallet's facade for the cockpit header status. While
-     * 'warming', each call polls the prewarm job once; 'ready' means the wallet
-     * is synced to the chain tip. Never rejects on job-read hiccups; it just
-     * reports the last known state.
-     */
-    /**
-     * The (cached, or newly opened) NIGHTGATE session of a server wallet.
-     * Exists so in-process consumers (demo executor's registrar step) reuse
-     * the ONE session per wallet instead of connecting a second facade for
-     * the same accountId, which wedges the wallet worker.
-     */
+    /** The signer handle of a server wallet, for in-process consumers. */
     private serverWalletSession = async (req: cds.Request) => {
         const { walletId } = req.data as { walletId?: string };
-        const secrets = producerWalletSecrets(walletId);
-        if (!secrets) return req.reject(404, `unknown server wallet '${walletId ?? ''}'`);
-        const sessionId = await this.serverSigningSession(secrets.id);
-        if (!sessionId) return req.reject(503, `server wallet '${secrets.id}' has no signing session`);
+        const sessionId = this.serverSigner(walletId);
+        if (!sessionId) return req.reject(404, `unknown server wallet '${walletId ?? ''}'`);
         return { sessionId };
     };
 
+    /** A signer needs no chain sync, so a wallet is ready once the prover keys are there. */
     private serverWalletStatus = async (req: cds.Request) => {
         const { walletId } = req.data as { walletId?: string };
         const secrets = producerWalletSecrets(walletId);
         if (!secrets) return req.reject(404, `unknown server wallet '${walletId ?? ''}'`);
-        const sessionId = this.serverSessions.get(secrets.id);
-        const warmth = this.walletWarmth.get(secrets.id);
-        if (!sessionId) {
-            // No session yet: either never prewarmed ('cold') or opening failed.
-            const state = warmth?.state === 'error' ? 'error' : 'cold';
-            return { walletId: secrets.id, state, sinceSeconds: 0, error: warmth?.error ?? '' };
-        }
-        let state: string = warmth?.state ?? 'ready';
-        let error = warmth?.error ?? '';
-        if (state === 'warming') {
-            const jobId = this.serverPrewarmJobs.get(sessionId);
-            if (!jobId) {
-                state = 'ready';
-            } else {
-                try {
-                    const nightgate = await cds.connect.to('NightgateService');
-                    const job: any = await sendDetached(nightgate, 'getJobStatus', { jobId, sessionId }, req.user);
-                    if (job?.status === 'succeeded') state = 'ready';
-                    else if (job?.status === 'failed') {
-                        const failMsg = `${job.errorCode ?? ''} ${job.errorMessage ?? ''}`.trim() || 'prewarm failed';
-                        if (/SUPERSEDED/i.test(failMsg)) {
-                            // 0.10.2: a fresh prewarm superseded this one; the
-                            // successor carries the sync, so keep 'warming'.
-                            state = 'warming';
-                            this.serverPrewarmJobs.delete(sessionId);
-                        } else {
-                            state = 'error';
-                            error = failMsg;
-                        }
-                    } else if (job?.status === 'reconciliation_required') {
-                        state = 'error';
-                        error = `${job.errorCode ?? ''} ${job.errorMessage ?? ''}`.trim() || 'prewarm requires reconciliation';
-                    }
-                } catch { /* job read hiccup: keep reporting 'warming' */ }
-            }
-            if (warmth && state !== 'warming') {
-                this.walletWarmth.set(secrets.id, { ...warmth, state: state as 'ready' | 'error', error });
-            }
-            // The prewarm job entry stays in serverPrewarmJobs on purpose: the
-            // first anchor run still awaits it (a completed job resolves instantly).
-        }
-        const sinceSeconds = warmth ? Math.round((Date.now() - warmth.startedAt) / 1000) : 0;
-        return { walletId: secrets.id, state, sinceSeconds, error };
-    };
-
-    /**
-     * Dust monitor for the fee-sponsor pool. For each configured sponsor whose
-     * signing session is already open (the boot prewarm opens them), read its
-     * NIGHT + dust balance via NIGHTGATE. A cold/errored sponsor reports its
-     * state without a balance read, so this stays a cheap, non-blocking call
-     * (it never opens a session). Runs the balance reads under the caller's
-     * user, which for the demo path is the same technical principal that opened
-     * the sponsor sessions (NIGHTGATE binds sessions to the userId).
-     */
-    /**
-     * Whether the prewarm job recorded for this session is still pending or
-     * running. Used to tell "facade not built YET" (serial prewarm queue,
-     * NIGHTGATE >= 0.13.0) apart from a genuinely dead session. Unknown job
-     * or read failure counts as not running, which falls through to the
-     * self-heal path.
-     */
-    private async prewarmStillRunning(nightgate: cds.Service, sessionId: string, user: unknown): Promise<boolean> {
-        const jobId = this.serverPrewarmJobs.get(sessionId);
-        if (!jobId) return false;
-        try {
-            const j: any = await sendDetached(nightgate, 'getJobStatus', { jobId }, user);
-            const s = String(j?.status ?? '');
-            return s === 'pending' || s === 'running';
-        } catch {
-            return false;
-        }
-    }
-
-    private sponsorPoolStatus = async (req: cds.Request) => {
-        const pool = feeSponsorWalletIds();
-        if (!pool.length) return [];
-        const labels = listProducerWallets();
-        const nightgate = await cds.connect.to('NightgateService');
-        const night = (atoms: unknown): string => {
-            try { return (Number(BigInt(String(atoms ?? 0))) / 1e6).toLocaleString('en-US'); }
-            catch { return ''; }
-        };
-        const cold = (walletId: string, label: string, state: string, error = '') => ({
-            walletId, label, state, nightDisplay: '', dustPresent: false,
-            registeredNightUtxos: 0, healthy: false, error
-        });
-        const out: unknown[] = [];
-        for (const walletId of pool) {
-            const secrets = producerWalletSecrets(walletId);
-            const label = labels.find((w) => w.id === walletId)?.label ?? walletId;
-            if (!secrets) { out.push(cold(walletId, label, 'error', 'not configured')); continue; }
-            const sessionId = this.serverSessions.get(secrets.id);
-            const warmth = this.walletWarmth.get(secrets.id);
-            if (!sessionId) {
-                out.push(cold(secrets.id, label, warmth?.state === 'error' ? 'error' : 'cold', warmth?.error ?? ''));
-                continue;
-            }
-            try {
-                // NIGHTGATE >= 0.10.2: this read holds no request tx server-side
-                // and is bounded (NIGHTGATE_WALLET_READ_SYNC_TIMEOUT_MS, default
-                // 10s) - a still-syncing facade answers 503 WALLET_SYNCING
-                // instead of blocking, so this poll is always cheap.
-                const b: any = await sendDetached(nightgate, 'getWalletBalance', { sessionId }, req.user);
-                const registered = Number(b?.registeredNightUtxoCount ?? 0);
-                const dustPresent = Number(b?.dustBalance ?? 0) > 0;
-                // A successful balance read means the facade is live and serving
-                // this wallet's state, i.e. operational. The warmth 'warming'
-                // flag only flips to 'ready' when something polls
-                // serverWalletStatus, which nothing does for sponsors, so it
-                // would stay 'warming' forever; health keys off the real fee
-                // signals instead (spendable dust + registered NIGHT UTxOs).
-                out.push({
-                    walletId: secrets.id, label, state: 'ready',
-                    nightDisplay: night(b?.unshieldedNight),
-                    dustPresent, registeredNightUtxos: registered,
-                    healthy: registered > 0 && dustPresent,
-                    error: ''
-                });
-            } catch (e: any) {
-                const msg = String(e?.message ?? e ?? 'balance read failed');
-                // 503 WALLET_SYNCING = retryable per the 0.10.2 contract; a
-                // SUPERSEDED prewarm just means a fresh one took over.
-                if (/WALLET_SYNCING|SUPERSEDED/i.test(msg)) {
-                    out.push(cold(secrets.id, label, 'warming', ''));
-                } else if (/No facade/i.test(msg) && await this.prewarmStillRunning(nightgate, sessionId, req.user)) {
-                    // NIGHTGATE >= 0.13.0 warms wallets ONE at a time, so a
-                    // freshly opened session has no facade until its queued
-                    // prewarm job actually runs. That is warming, not death;
-                    // reconnecting here would just requeue another prewarm.
-                    out.push(cold(secrets.id, label, 'warming', ''));
-                } else if (/No facade|Session not found|Session expired/i.test(msg)) {
-                    // SELF-HEAL, two known death modes of a cached session:
-                    // "No facade": NIGHTGATE's session-expiry sweep evicts
-                    // facades by accountId, so an expiring STALE session of
-                    // this wallet (from an earlier boot) takes the live facade
-                    // down with it. "Session not found or inactive": the
-                    // cached session ROW itself hit its TTL and the cleanup
-                    // removed it (long container uptime, seen live 2026-08-01).
-                    // Either way: drop the cached session and reconnect; the
-                    // fresh connectWalletForSigning restores facade + prewarm.
-                    cds.log('producer').warn(
-                        `sponsor '${secrets.id}' session dead (${msg.slice(0, 80)}); reconnecting`);
-                    this.serverSessions.delete(secrets.id);
-                    void this.serverSigningSession(secrets.id).catch(() => { /* logged inside */ });
-                    out.push(cold(secrets.id, label, 'warming', ''));
-                } else {
-                    out.push(cold(secrets.id, label, 'error', msg));
-                }
-            }
-        }
-        return out;
+        const w = this.keyWarmth;
+        if (!w) return { walletId: secrets.id, state: 'cold', sinceSeconds: 0, error: '' };
+        return { walletId: secrets.id, state: w.state, sinceSeconds: Math.round((Date.now() - w.startedAt) / 1000), error: w.error };
     };
 
     /**
@@ -734,8 +480,8 @@ export default class ProducerService extends cds.ApplicationService {
     // --- create + submit -----------------------------------------------------
 
     private createPassport = async (req: cds.Request) => {
-        const { passportJson, submit, sessionId, owner, walletId, sponsorWalletId } = req.data as
-            { passportJson?: string; submit?: boolean; sessionId?: string; owner?: string; walletId?: string; sponsorWalletId?: string };
+        const { passportJson, submit, sessionId, owner, walletId } = req.data as
+            { passportJson?: string; submit?: boolean; sessionId?: string; owner?: string; walletId?: string };
 
         let input: PassportInput;
         try { input = JSON.parse(String(passportJson ?? '')); }
@@ -801,7 +547,7 @@ export default class ProducerService extends cds.ApplicationService {
 
         const session = submit ? await this.effectiveSession(sessionId, walletId) : null;
         if (submit && session && contractAddress) {
-            return this.anchorRow(req, ID, passportId, payloadHash, passportIdHash, contractAddress, session, true, sponsorWalletId);
+            return this.anchorRow(req, ID, passportId, payloadHash, passportIdHash, contractAddress, session, true);
         }
         // Offline: record a placeholder tx row so the overview shows the draft.
         // No on-chain anchor here, so there is no content root to report.
@@ -810,8 +556,8 @@ export default class ProducerService extends cds.ApplicationService {
     };
 
     private submitPassport = async (req: cds.Request) => {
-        const { passportId, sessionId, walletId, sponsorWalletId } = req.data as
-            { passportId?: string; sessionId?: string; walletId?: string; sponsorWalletId?: string };
+        const { passportId, sessionId, walletId } = req.data as
+            { passportId?: string; sessionId?: string; walletId?: string };
         const row: any = await this.passportRef(String(passportId ?? ''));
         if (!row) return req.reject(404, `passport '${passportId}' not found`);
         const contractAddress = this.vaultFor(row, sessionId);
@@ -819,7 +565,7 @@ export default class ProducerService extends cds.ApplicationService {
         if (!session || !contractAddress) {
             return req.reject(400, 'no signing session / PASSPORT_CONTRACT_ADDRESS available; cannot submit on-chain');
         }
-        const r = await this.anchorRow(req, row.ID, row.passportId, row.payloadHash, row.passportIdHash, contractAddress, session, false, sponsorWalletId);
+        const r = await this.anchorRow(req, row.ID, row.passportId, row.payloadHash, row.passportIdHash, contractAddress, session, false);
         return { passportId: r.passportId, contentRoot: r.contentRoot ?? '', mode: r.mode, txHash: r.txHash };
     };
 
@@ -943,7 +689,7 @@ export default class ProducerService extends cds.ApplicationService {
 
         // Build the content root + inclusion proof from the passport's provable
         // fields, with the ANCHORED salt seed. Degrade gracefully (value still
-        // returned for display) if the plugin's pure circuits aren't available.
+        // returned for display) if the vault's pure circuits cannot be loaded.
         try {
             const { tree } = await this.contentTreeFor(row.ID, values);
             const proof = tree.proofFor(field);
@@ -1372,12 +1118,8 @@ export default class ProducerService extends cds.ApplicationService {
     /**
      * Verify a wallet-submitted action's on-chain effect, then finalize the row.
      *
-     * Prefers crawler-free STATE verification (`stateCheck` reads the
-     * AttestationVault ledger via `queryContractState`, so it confirms the
-     * outcome with the block crawler off, the demo default). It falls back to the
-     * tx-based indexer check (`verifyContractTx`) only when the state check is
-     * absent or inconclusive; that tx path is also the only one that can return a
-     * definitive `failed` (an indexed tx whose result is FAILURE or wrong target).
+     * `stateCheck` reads the vault's state live, so it confirms the outcome
+     * rather than the transaction.
      *
      * On `confirmed` it finalizes now; on `failed` it marks the row failed; on
      * `unknown` (nothing confirms yet: effect not settled, no live provider, or
@@ -1397,8 +1139,7 @@ export default class ProducerService extends cds.ApplicationService {
                 try { state = await o.stateCheck(); } catch { state = 'unknown'; }
                 if (state === 'confirmed' || state === 'failed') return state;
             }
-            try { return await verifyContractTx(o.txHash, { contractAddress: o.contractAddress }); }
-            catch { return 'unknown'; }
+            return 'unknown';
         };
         let verdict: ChainVerdict = 'unknown';
         try { verdict = await check(); } catch { verdict = 'unknown'; }
@@ -1442,8 +1183,7 @@ export default class ProducerService extends cds.ApplicationService {
      */
     private async anchorRow(
         req: cds.Request, ID: string, passportId: string, payloadHash: string,
-        passportIdHash: string, contractAddress: string, sessionId: string, includePayloadHash: boolean,
-        sponsorWalletId?: string
+        passportIdHash: string, contractAddress: string, sessionId: string, includePayloadHash: boolean
     ) {
         // The vault's attest circuit asserts the payload hash is not attested
         // yet, so byte-identical confidential content can never anchor twice.
@@ -1485,18 +1225,11 @@ export default class ProducerService extends cds.ApplicationService {
         } catch (e) {
             cds.log('producer').warn('content-root build skipped:', (e as Error)?.message);
         }
-        // Sponsor session must be resolved HERE (request context: session
-        // opening inherits the request's user); the detached runner just
-        // carries the id.
-        const sponsorSessionId = await this.sponsorSessionIdFor(sessionId, sponsorWalletId);
         // 'succeeded' fires after the request tx committed, so the detached
-        // runner never contends with this request for the write lock. The
-        // user is captured NOW: the NIGHTGATE calls must carry the caller's
-        // identity (wallet sessions are bound to the owning userId).
-        const user = req.user;
+        // runner never contends with this request for the write lock.
         (req as any).on('succeeded', () => {
             void detachedFromRequest(() =>
-                this.runAnchorDetached(ID, passportId, payloadHash, passportIdHash, contractAddress, sessionId, user, contentRoot, sponsorSessionId, schemaId)
+                this.runAnchorDetached(ID, passportId, payloadHash, passportIdHash, contractAddress, sessionId, contentRoot, schemaId)
             ).catch((e: unknown) =>
                 cds.log('producer').error(`detached anchor runner crashed for ${passportId}:`, e));
         });
@@ -1505,45 +1238,25 @@ export default class ProducerService extends cds.ApplicationService {
         return { passportId, payloadHash: includePayloadHash ? payloadHash : undefined, contentRoot: contentRoot ?? '', mode: 'anchoring', txHash: '' };
     }
 
+    /** The chain lane of a signer handle. */
+    private laneFor(sessionId: string): ChainLane {
+        return remoteLaneFor(sessionId);
+    }
+
     /**
      * The long-running on-chain leg of anchorRow. Runs with no ambient tx;
      * every DB write is its own short root tx (runDetached). Failures land on
      * the row (status 'failed') plus a failed PassportTransactions entry, not
      * on an HTTP response: the request that started this is long gone.
      */
-    /**
-     * The chain lane behind a session handle: a registered remote signer
-     * (the demo's run id) gives the hosted-API lane, any other id the
-     * in-process plugin lane (after its pending prewarm job, if any).
-     */
-    private async laneFor(sessionId: string, user: unknown, sponsorSessionId?: string): Promise<ChainLane> {
-        if (hasRemoteSigner(sessionId)) return remoteLaneFor(sessionId);
-        const nightgate = await cds.connect.to('NightgateService');
-        // First action on a fresh server signing session: the facade is still
-        // being built/synced by the prewarm job; submitting earlier fails with
-        // "No facade for sessionId". Await it once (detached context, short
-        // read polls only).
-        const prewarmJob = this.serverPrewarmJobs.get(sessionId);
-        if (prewarmJob) {
-            this.serverPrewarmJobs.delete(sessionId);
-            const log = cds.log('producer');
-            log.info(`awaiting server-session prewarm ${prewarmJob} before the first chain call...`);
-            await waitForJobResult(nightgate, prewarmJob, sessionId, user);
-            log.info('server-session prewarm complete');
-        }
-        return new PluginLane(nightgate, sessionId, user, sponsorSessionId);
-    }
-
     private async runAnchorDetached(
         ID: string, passportId: string, payloadHash: string, passportIdHash: string,
-        contractAddress: string, sessionId: string, user: unknown, contentRoot?: string,
-        sponsorSessionId?: string, schemaId?: string
+        contractAddress: string, sessionId: string, contentRoot?: string, schemaId?: string
     ): Promise<void> {
         const log = cds.log('producer');
         let lane: ChainLane | null = null;
         try {
-            lane = await this.laneFor(sessionId, user, sponsorSessionId);
-            if (sponsorSessionId) log.info(`anchor fees for ${passportId} sponsored by session ${sponsorSessionId.slice(0, 8)}...`);
+            lane = this.laneFor(sessionId);
             const { attestationTxHash } = await anchorPassport(lane, {
                 payloadHash, passportId, passportIdHash, contractAddress, contentRoot, schemaId,
                 onStep: async (s) => {
@@ -1556,11 +1269,11 @@ export default class ProducerService extends cds.ApplicationService {
                     log.info(`anchor step ${s.kind} for ${passportId}: ${s.txHash}`);
                 }
             });
-            // The record is keyed by the attester (lineage 4): stamp the
-            // identity that anchored. The lane knows its own; otherwise the
-            // chain's binding read names it (a fresh anchor binds the id).
+            // The record is keyed by the attester: stamp the identity that
+            // anchored. The lane knows its own; otherwise the chain's binding
+            // read names it (a fresh anchor binds the id).
             let attesterId = '';
-            try { attesterId = (await lane.attesterId?.()) ?? ''; } catch { attesterId = ''; }
+            try { attesterId = await lane.attesterId(); } catch { attesterId = ''; }
             if (!attesterId) {
                 attesterId = await resolveAnchorAttester({ contractAddress, documentId: passportIdHash, payloadHash }) ?? '';
             }
@@ -1623,18 +1336,13 @@ export default class ProducerService extends cds.ApplicationService {
         await INSERT.into(DisclosureGrantLog).entries({
             ID: grantLogId, passport_ID: row.ID, grantee, level, op, status: 'pending'
         } as any);
-        const action = op === 'grant' ? 'grantDisclosure' : 'revokeDisclosure';
-        const args: Record<string, unknown> = {
-            payloadHash: row.payloadHash, grantee, sessionId: session,
-            contractAddress, compiledArtifactRef: CONTRACT_REF
-        };
-        if (op === 'grant') args.level = level;
-        const sponsorSessionId = await this.sponsorSessionIdFor(String(session));
-        if (sponsorSessionId) args.sponsorSessionId = sponsorSessionId;
-        const user = req.user;
+        // Grant and revoke act on the signer's own record of the payload.
+        const tx: VaultTx = op === 'grant'
+            ? { label: 'grantDisclosure', calls: [{ circuit: 'grantDisclosure', args: [String(row.payloadHash), grantee, String(level)] }] }
+            : { label: 'revokeDisclosure', calls: [{ circuit: 'revokeDisclosure', args: [String(row.payloadHash), grantee] }] };
         (req as any).on('succeeded', () => {
             void detachedFromRequest(() =>
-                this.runDisclosureDetached(grantLogId, row.ID, op, action, args, String(session), user)
+                this.runDisclosureDetached(grantLogId, row.ID, op, contractAddress, tx, String(session))
             ).catch((e: unknown) =>
                 cds.log('producer').error(`detached ${op} runner crashed for ${passportId}:`, e));
         });
@@ -1644,23 +1352,18 @@ export default class ProducerService extends cds.ApplicationService {
     /** The long-running on-chain leg of disclosure(); same pattern as the anchor/prove runners. */
     private async runDisclosureDetached(
         grantLogId: string, passportRowId: string, op: 'grant' | 'revoke',
-        action: string, args: Record<string, unknown>, sessionId: string, user: unknown
+        contractAddress: string, tx: VaultTx, sessionId: string
     ): Promise<void> {
         const log = cds.log('producer');
+        let lane: ChainLane | null = null;
         try {
-            const nightgate = await cds.connect.to('NightgateService');
-            const prewarmJob = this.serverPrewarmJobs.get(sessionId);
-            if (prewarmJob) {
-                this.serverPrewarmJobs.delete(sessionId);
-                await waitForJobResult(nightgate, prewarmJob, sessionId, user);
-            }
-            const res: any = await sendDetached(nightgate, action, args, user);
-            const txHash = await waitForJob(nightgate, res.jobId, sessionId, user);
+            lane = this.laneFor(sessionId);
+            const { txHash, jobId } = await lane.submitVaultTx({ contractAddress, tx });
             await this.runDetached(async () => {
                 await UPDATE.entity(DisclosureGrantLog).set({ status: 'succeeded', txHash }).where({ ID: grantLogId });
                 await INSERT.into(PassportTransactions).entries({
-                    passport_ID: passportRowId, kind: op === 'grant' ? 'grantDisclosure' : 'revokeDisclosure',
-                    jobId: res.jobId, txHash, status: 'succeeded', explorerUrl: txExplorerUrl(txHash)
+                    passport_ID: passportRowId, kind: tx.label, jobId, txHash,
+                    status: 'succeeded', explorerUrl: txExplorerUrl(txHash)
                 } as any);
             });
             log.info(`${op} settled for log ${grantLogId}: ${txHash}`);
@@ -1670,19 +1373,20 @@ export default class ProducerService extends cds.ApplicationService {
             await this.runDetached(async () => {
                 await UPDATE.entity(DisclosureGrantLog).set({ status: 'failed' }).where({ ID: grantLogId });
                 await INSERT.into(PassportTransactions).entries({
-                    passport_ID: passportRowId, kind: op === 'grant' ? 'grantDisclosure' : 'revokeDisclosure',
-                    status: 'failed', errorMessage: msg
+                    passport_ID: passportRowId, kind: tx.label, status: 'failed', errorMessage: msg
                 } as any);
             });
+        } finally {
+            await lane?.dispose().catch(() => { /* nothing left to release */ });
         }
     }
 
     // --- predicate proof -----------------------------------------------------
 
     private provePassportValue = async (req: cds.Request) => {
-        const { passportId, sourceField, predicate, threshold, unit, sessionId, walletId, sponsorWalletId } = req.data as {
+        const { passportId, sourceField, predicate, threshold, unit, sessionId, walletId } = req.data as {
             passportId?: string; sourceField?: string; predicate?: string;
-            threshold?: number; unit?: string; sessionId?: string; walletId?: string; sponsorWalletId?: string;
+            threshold?: number; unit?: string; sessionId?: string; walletId?: string;
         };
         const row: any = await this.passportRef(String(passportId ?? ''));
         if (!row) return req.reject(404, `passport '${passportId}' not found`);
@@ -1709,7 +1413,7 @@ export default class ProducerService extends cds.ApplicationService {
                 passport_ID: row.ID, sourceField: field, predicate: pred,
                 threshold: thresholdScaled, unit: useUnit, status: 'offline', payloadHash: row.payloadHash ?? null
             } as any);
-            return { mode: 'offline', txHash: '', predicateAttestationId: '', result: null };
+            return { mode: 'offline', txHash: '', result: null };
         }
 
         // Build the field-bound inclusion proof + content root. The proven value
@@ -1750,40 +1454,36 @@ export default class ProducerService extends cds.ApplicationService {
         // so the seed it was built from becomes THE opening of that anchor and
         // must be persisted before the chain sees it.
         if (!rootAnchored) await this.persistContentTree(row.ID, tree);
-        const sponsorSessionId = await this.sponsorSessionIdFor(String(session), sponsorWalletId);
-        const args = {
-            payloadHash: row.payloadHash, fieldKey: proof.fieldKey, value: proof.value,
-            fieldSalt: proof.salt,
-            // The claim lives on the anchoring attester's record; a session
-            // other than the attester may still prove it (no attester secret
-            // in the proof circuits), so the record is named explicitly.
-            ...(row.attesterId ? { attesterId: row.attesterId } : {}),
+        const cart: ProofCartInput = {
+            contractAddress, payloadHash: row.payloadHash,
+            // The claim lives on the anchoring attester's record; another
+            // signer may still prove it, so the record is named explicitly.
+            ...(row.attesterId ? { attesterId: String(row.attesterId) } : {}),
             validUntil,
             ...(rootAnchored ? {} : { contentRoot: tree.contentRoot, schemaId: tree.schemaId }),
-            siblingsJson: JSON.stringify(proof.siblings), dirsJson: JSON.stringify(proof.dirs),
-            predicate: pred, threshold: thresholdScaled, unit: useUnit,
-            sessionId: session, contractAddress, compiledArtifactRef: CONTRACT_REF,
-            ...(sponsorSessionId ? { sponsorSessionId } : {})
+            claims: [{
+                fieldKey: proof.fieldKey, value: proof.value, salt: proof.salt,
+                siblings: proof.siblings, dirs: proof.dirs,
+                predicate: pred, threshold: thresholdScaled, unit: useUnit
+            }]
         };
-        const user = req.user;
+        const meta: ProofClaimMeta = {
+            proofLogId, fieldKey: proof.fieldKey, predicate: pred, threshold: thresholdScaled,
+            key: responseClaimKey({ fieldKey: proof.fieldKey, predicate: pred, threshold: thresholdScaled })!
+        };
         (req as any).on('succeeded', () => {
             void detachedFromRequest(() =>
-                this.runProveDetached(proofLogId, row.ID, args, user)
+                this.runProveBatchDetached([meta], row.ID, !rootAnchored, cart, String(session))
             ).catch((e: unknown) =>
                 cds.log('producer').error(`detached prove runner crashed for ${row.passportId}:`, e));
         });
-        return { mode: 'proving', txHash: '', predicateAttestationId: '', result: null, proofLogId };
+        return { mode: 'proving', txHash: '', result: null, proofLogId };
     };
 
-    /**
-     * Proof cart, server lane (NIGHTGATE >= 0.12.0). Shares the claim
-     * contract with the browser cart via proofCartPlan; the platform batch
-     * action re-validates and re-dedups server-side, so the plan here mainly
-     * buys the SAME error surface and drop reporting on both lanes.
-     */
+    /** Proof cart of a server signer. Shares the claim contract with the browser cart via proofCartPlan. */
     private provePassportValuesBatch = async (req: cds.Request) => {
-        const { passportId, claimsJson, sessionId, walletId, sponsorWalletId } = req.data as {
-            passportId?: string; claimsJson?: string; sessionId?: string; walletId?: string; sponsorWalletId?: string;
+        const { passportId, claimsJson, sessionId, walletId } = req.data as {
+            passportId?: string; claimsJson?: string; sessionId?: string; walletId?: string;
         };
         const row: any = await this.passportRef(String(passportId ?? ''));
         if (!row) return req.reject(404, `passport '${passportId}' not found`);
@@ -1928,7 +1628,6 @@ export default class ProducerService extends cds.ApplicationService {
         });
 
         if (!rootAnchored) await this.persistContentTree(row.ID, tree);
-        const sponsorSessionId = await this.sponsorSessionIdFor(String(session), sponsorWalletId);
         const cart: ProofCartInput = {
             contractAddress, payloadHash: row.payloadHash,
             ...(row.attesterId ? { attesterId: String(row.attesterId) } : {}),
@@ -1946,13 +1645,8 @@ export default class ProducerService extends cds.ApplicationService {
                     siblings: e.proof.siblings, dirs: e.proof.dirs,
                     predicate: e.pred, threshold: e.thresholdScaled,
                     ...(e.unit ? { unit: e.unit } : {})
-                })),
-            // One ZK proof per claim, so the wait budget scales with the cart.
-            // In-process (wasm) proving is minutes per claim; the default 10
-            // minutes covers an anchor batch but not a four-claim cart.
-            timeoutMs: (10 + 8 * Math.max(0, kept.length - 1)) * 60_000
+                }))
         };
-        const user = req.user;
         const claimMeta: ProofClaimMeta[] = kept.map((e, i) => ({
             proofLogId: proofLogIds[i],
             key: responseClaimKey(e.kind === 'membership'
@@ -1965,7 +1659,7 @@ export default class ProducerService extends cds.ApplicationService {
         }));
         (req as any).on('succeeded', () => {
             void detachedFromRequest(() =>
-                this.runProveBatchDetached(claimMeta, row.ID, !rootAnchored, cart, String(session), sponsorSessionId, user)
+                this.runProveBatchDetached(claimMeta, row.ID, !rootAnchored, cart, String(session))
             ).catch((e: unknown) =>
                 cds.log('producer').error(`detached proof-cart runner crashed for ${row.passportId}:`, e));
         });
@@ -1973,35 +1667,30 @@ export default class ProducerService extends cds.ApplicationService {
     };
 
     /**
-     * The long-running leg of provePassportValuesBatch: ONE tx for the whole
-     * cart. On success every log row gets the SAME txHash and its claim's
-     * predicateAttestationId. Failure paths, honestly separated:
+     * The long-running leg of the proof cart: ONE tx for the whole cart. On
+     * success every log row gets the SAME txHash. Failure paths, honestly separated:
      *   - pre-submit failure (a false predicate rejects at local proving, or
      *     the job errors before the mempool): ALL rows flip to failed;
      *   - post-submit PARTIAL_SUCCESS (ledger fallible phase applied a
      *     subset): settle EACH row from the lane's per-claim verify instead
-     *     of assuming all-or-nothing (0.12.0 contract).
+     *     of assuming all-or-nothing.
      */
     private async runProveBatchDetached(
         claimMeta: ProofClaimMeta[],
         passportRowId: string,
         rootInBatch: boolean,
         cart: ProofCartInput,
-        sessionId: string,
-        sponsorSessionId: string | undefined,
-        user: unknown
+        sessionId: string
     ): Promise<void> {
         const log = cds.log('producer');
         let lane: ChainLane | null = null;
         try {
-            lane = await this.laneFor(sessionId, user, sponsorSessionId);
+            lane = this.laneFor(sessionId);
             const out = await lane.submitProofCart(cart);
             await this.runDetached(async () => {
                 for (const m of claimMeta) {
-                    await UPDATE.entity(PredicateProofLog).set({
-                        status: 'succeeded', result: true, txHash: out.txHash,
-                        predicateAttestationId: out.claimIds.get(m.key) ?? ''
-                    }).where({ ID: m.proofLogId });
+                    await UPDATE.entity(PredicateProofLog).set({ status: 'succeeded', result: true, txHash: out.txHash })
+                        .where({ ID: m.proofLogId });
                 }
                 if (rootInBatch) {
                     // The root anchor rode in the SAME tx as the proofs.
@@ -2019,31 +1708,26 @@ export default class ProducerService extends cds.ApplicationService {
         } catch (e) {
             const msg = String((e as Error)?.message ?? e).slice(0, 500);
             const partial = e instanceof ProofCartError && e.partial;
-            const claimIds = e instanceof ProofCartError ? e.claimIds : new Map<string, string>();
             log.warn(`proof cart ${partial ? 'PARTIAL' : 'failed'} for passport row ${passportRowId}:`, e);
-            const verdicts = new Map<string, { verified: boolean; txHash: string }>();
+            const landed = new Set<string>();
             if (partial && lane) {
                 // Which claims actually landed? Ask the lane's per-claim
                 // verifier; unreachable = leave that row failed (never lie green).
                 for (const m of claimMeta) {
                     try {
-                        const v = await lane.verifyClaimLanded({
-                            key: m.key, predicateAttestationId: claimIds.get(m.key),
+                        const verified = await lane.verifyClaimLanded({
                             contractAddress: cart.contractAddress, payloadHash: cart.payloadHash, attesterId: cart.attesterId,
                             fieldKey: m.fieldKey, predicate: m.predicate, threshold: m.threshold, setRoot: m.setRoot
                         });
-                        if (v.verified) verdicts.set(m.key, v);
+                        if (verified) landed.add(m.key);
                     } catch { /* stays failed */ }
                 }
             }
             await this.runDetached(async () => {
                 for (const m of claimMeta) {
-                    const v = verdicts.get(m.key);
-                    if (v?.verified) {
-                        await UPDATE.entity(PredicateProofLog).set({
-                            status: 'succeeded', result: true, txHash: v.txHash,
-                            predicateAttestationId: claimIds.get(m.key) ?? ''
-                        }).where({ ID: m.proofLogId });
+                    if (landed.has(m.key)) {
+                        await UPDATE.entity(PredicateProofLog).set({ status: 'succeeded', result: true })
+                            .where({ ID: m.proofLogId });
                     } else {
                         await UPDATE.entity(PredicateProofLog).set({ status: 'failed', result: false })
                             .where({ ID: m.proofLogId });
@@ -2070,9 +1754,9 @@ export default class ProducerService extends cds.ApplicationService {
      * surface as an opaque circuit abort minutes into proving.
      */
     private proveVersionIntegrity = async (req: cds.Request) => {
-        const { passportId, fromVersion, allowedFieldsJson, minChangedSlots, sessionId, walletId, sponsorWalletId } = req.data as {
+        const { passportId, fromVersion, allowedFieldsJson, minChangedSlots, sessionId, walletId } = req.data as {
             passportId?: string; fromVersion?: number; allowedFieldsJson?: string; minChangedSlots?: number;
-            sessionId?: string; walletId?: string; sponsorWalletId?: string;
+            sessionId?: string; walletId?: string;
         };
         const row: any = await SELECT.one.from(Passports)
             .columns('ID', 'passportId', 'profile', 'owner', 'payloadHash', 'status', 'contractAddress',
@@ -2222,43 +1906,28 @@ export default class ProducerService extends cds.ApplicationService {
                 ...(k > 0 ? [{ ID: changeProofLogId, ...changeRow, status: 'pending' }] : [])
             ] as any);
         });
-        const sponsorSessionId = await this.sponsorSessionIdFor(String(session), sponsorWalletId);
-        // Both roots are already anchored, so no contentRootA/B rides along:
-        // anchoring is insert-once and a re-anchor of the same root is at best
-        // a no-op tx.
-        const shared = {
-            schema: JSON.parse(JSON.stringify(treeA.schema)),
-            openingA: treeA.opening,
-            openingB: treeB.opening,
-            payloadHashB: String(row.payloadHash),
-            // Each version's record is its own attester's (a handover between
-            // the two versions changes it).
-            attesterIdB: String(row.attesterId)
-        };
-        const claims = [
-            { predicate: 'documentIntegrity', allowedMask: mask, ...shared },
-            ...(k > 0 ? [{ predicate: 'documentDiff', k, ...shared }] : [])
-        ];
-        const args = {
-            // Document A is the batch's payloadHash; every claim names B itself.
-            payloadHash: String(prior.payloadHash),
-            attesterId: String(prior.attesterId),
+        // Both roots are already anchored, so the transaction carries the claims only.
+        const comparison: ComparisonInput = {
+            contractAddress,
+            // Document A is the older version. Each version's record is its
+            // own attester's (a handover between the two changes it).
+            payloadHashA: String(prior.payloadHash), attesterIdA: String(prior.attesterId),
+            payloadHashB: String(row.payloadHash), attesterIdB: String(row.attesterId),
             validUntil,
-            claimsJson: JSON.stringify(claims),
-            sessionId: session, contractAddress, compiledArtifactRef: CONTRACT_REF,
-            ...(sponsorSessionId ? { sponsorSessionId } : {})
+            schema: treeA.schema, openingA: treeA.opening, openingB: treeB.opening,
+            claims: [
+                { kind: 'documentIntegrity', allowedMask: mask },
+                ...(k > 0 ? [{ kind: 'documentDiff' as const, k }] : [])
+            ]
         };
-        const user = req.user;
         const rows = [
             { logId: proofLogId, kind: 'documentIntegrity' as const, bound: mask },
             ...(k > 0 ? [{ logId: changeProofLogId, kind: 'documentDiff' as const, bound: k }] : [])
         ];
         (req as any).on('succeeded', () => {
-            void detachedFromRequest(() => this.runIntegrityDetached(rows, String(row.ID), args, user, {
-                contractAddress, payloadHashA: String(prior.payloadHash), payloadHashB: String(row.payloadHash),
-                attesterIdA: String(prior.attesterId), attesterIdB: String(row.attesterId)
-            })).catch((e: unknown) =>
-                cds.log('producer').error(`detached integrity runner crashed for ${row.passportId}:`, e));
+            void detachedFromRequest(() => this.runIntegrityDetached(rows, String(row.ID), comparison, String(session)))
+                .catch((e: unknown) =>
+                    cds.log('producer').error(`detached integrity runner crashed for ${row.passportId}:`, e));
         });
         return { mode: 'proving', proofLogId, changeProofLogId, ...base };
     };
@@ -2266,62 +1935,29 @@ export default class ProducerService extends cds.ApplicationService {
     /**
      * The long-running leg of proveVersionIntegrity: one or two cross-root
      * proofs in ONE transaction (upper bound, and the optional lower bound).
-     * The cross-root circuit is the vault's largest (38.5 MB of prover key),
-     * so this is the slowest proof in the system and a second claim doubles
-     * the proving time even though it shares the transaction; a proof server
-     * beats in-process wasm noticeably here.
+     * The cross-root circuit is the vault's largest, so this is the slowest
+     * proof in the system; a proof server beats in-process wasm noticeably.
      */
     private async runIntegrityDetached(
         rows: Array<{ logId: string; kind: 'documentIntegrity' | 'documentDiff'; bound: number }>,
         passportRowId: string,
-        args: Record<string, unknown> & { sessionId: string; contractAddress: string },
-        user: unknown,
-        pair: { contractAddress: string; payloadHashA: string; payloadHashB: string; attesterIdA: string; attesterIdB: string }
+        comparison: ComparisonInput,
+        sessionId: string
     ): Promise<void> {
         const log = cds.log('producer');
         const logIds = rows.map((r) => r.logId);
+        const pair = comparison;
+        let lane: ChainLane | null = null;
         try {
-            const nightgate = await cds.connect.to('NightgateService');
-            const prewarmJob = this.serverPrewarmJobs.get(args.sessionId);
-            if (prewarmJob) {
-                this.serverPrewarmJobs.delete(args.sessionId);
-                await waitForJobResult(nightgate, prewarmJob, args.sessionId, user);
-            }
-            let res: any = null;
-            const jobResult: any = await runChainStep('integrity proof', async () => {
-                // The batch action carries both cross-root kinds, so the pair
-                // of claims shares one balancing round, one submit and one fee.
-                res = await sendDetached(nightgate, 'issueFieldPredicateAttestationBatch', args, user);
-                // The cross-root circuit is the vault's largest (38.5 MB prover
-                // key). In-process wasm proving plus submit plus confirmation
-                // ran past the 10 minute default here, and the wait timing out
-                // is NOT the proof failing: the transaction landed anyway
-                // (measured live, tx 7698bd13…). Give it a real budget, and
-                // treat a timeout as "unknown", never as "failed" (see below).
-                return waitForJobResult(nightgate, res.jobId, args.sessionId, user, {
-                    requireChainSuccess: true, timeoutMs: 40 * 60_000
-                });
-            });
-            const txHash = String(jobResult?.proof?.proofValue ?? jobResult?.txHash ?? '');
-            // Per-claim attestation ids from the batch response, joined by
-            // claim kind (cross-root claims carry no fieldKey, so the field
-            // claim join key does not apply here).
-            const idByKind = new Map<string, string>();
-            const collect = (c: any) => {
-                const kind = String(c?.predicate ?? c?.claim?.predicate ?? '');
-                if (kind && c?.predicateAttestationId) idByKind.set(kind, String(c.predicateAttestationId));
-            };
-            try { for (const c of JSON.parse(String(res?.claims ?? '[]'))) collect(c); } catch { /* job result below */ }
-            for (const c of (Array.isArray(jobResult?.claims) ? jobResult.claims : [])) collect(c);
+            lane = this.laneFor(sessionId);
+            const { txHash, jobId } = await lane.submitComparison(comparison);
             await this.runDetached(async () => {
                 for (const r of rows) {
-                    await UPDATE.entity(PredicateProofLog).set({
-                        status: 'succeeded', result: true, txHash,
-                        predicateAttestationId: idByKind.get(r.kind) ?? ''
-                    }).where({ ID: r.logId });
+                    await UPDATE.entity(PredicateProofLog).set({ status: 'succeeded', result: true, txHash })
+                        .where({ ID: r.logId });
                 }
                 await INSERT.into(PassportTransactions).entries({
-                    passport_ID: passportRowId, kind: 'provePredicate', jobId: res.jobId, txHash,
+                    passport_ID: passportRowId, kind: 'provePredicate', jobId, txHash,
                     status: 'succeeded', explorerUrl: txExplorerUrl(txHash)
                 } as any);
             });
@@ -2330,8 +1966,8 @@ export default class ProducerService extends cds.ApplicationService {
             // A version that changed outside the mask also lands here (the
             // circuit rejects at local proving; nothing was submitted).
             const msg = String((e as Error)?.message ?? e).slice(0, 500);
-            // ... but so does a wait that simply ran out while the proof was
-            // still being proven or confirmed. Marking that 'failed' would lie
+            // ... but so does a submission whose outcome never came back.
+            // Marking that 'failed' would lie
             // red about a claim that IS on-chain, so ask the ledger PER CLAIM
             // before writing the verdict: each claim key is fully determined by
             // the two payload hashes plus its own bound. Asking per claim also
@@ -2369,76 +2005,8 @@ export default class ProducerService extends cds.ApplicationService {
                     passport_ID: passportRowId, kind: 'provePredicate', status: 'failed', errorMessage: msg
                 } as any);
             });
-        }
-    }
-
-    /** Claim key -> predicateAttestationId from the batch action response
-     *  (res.claims, JSON string) or the job result (claims array). Both sides
-     *  of the join key through proof-plan's responseClaimKey. */
-    /**
-     * The long-running leg of provePassportValue. The field-bound proof job
-     * submits TWO txs (anchorContentRoot, then proveFieldPredicate); the job
-     * result is a PAC envelope whose tx hash sits at `proof.proofValue`. The
-     * content-root tx hash is not in the result at all, so it is read back
-     * from the plugin's `midnight.PendingSubmissions` log.
-     */
-    private async runProveDetached(
-        proofLogId: string, passportRowId: string,
-        args: Record<string, unknown> & { sessionId: string; contractAddress: string },
-        user: unknown
-    ): Promise<void> {
-        const log = cds.log('producer');
-        const startedAt = new Date().toISOString();
-        try {
-            const nightgate = await cds.connect.to('NightgateService');
-            // First action on a fresh server session: await the facade prewarm
-            // once, same as the anchor runner.
-            const prewarmJob = this.serverPrewarmJobs.get(args.sessionId);
-            if (prewarmJob) {
-                this.serverPrewarmJobs.delete(args.sessionId);
-                await waitForJobResult(nightgate, prewarmJob, args.sessionId, user);
-            }
-            // Same 1014 retry as the anchor steps and the cart (see there).
-            let res: any = null;
-            const jobResult: any = await runChainStep('proof', async () => {
-                res = await sendDetached(nightgate, 'issueFieldPredicateAttestation', args, user);
-                return waitForJobResult(
-                    nightgate, res.jobId, args.sessionId, user, { requireChainSuccess: true }
-                );
-            });
-            const txHash = String(jobResult?.proof?.proofValue ?? jobResult?.txHash ?? '');
-            const paId = String(res.predicateAttestationId ?? jobResult?.predicateAttestationId ?? '');
-            const rootTx = await this.contentRootTxOf(args.sessionId, args.contractAddress, startedAt);
-            await this.runDetached(async () => {
-                await UPDATE.entity(PredicateProofLog).set({
-                    status: 'succeeded', result: true, txHash, predicateAttestationId: paId
-                }).where({ ID: proofLogId });
-                if (rootTx) {
-                    // Stamp the row with the tx's real submit time: both proof
-                    // rows are inserted together here, and identical createdAt
-                    // values make the (root, prove) pair sort randomly.
-                    await INSERT.into(PassportTransactions).entries({
-                        passport_ID: passportRowId, kind: 'anchorContentRoot', jobId: res.jobId,
-                        txHash: rootTx.txHash, status: 'succeeded', explorerUrl: txExplorerUrl(rootTx.txHash),
-                        ...(rootTx.submittedAt ? { createdAt: rootTx.submittedAt } : {})
-                    } as any);
-                }
-                await INSERT.into(PassportTransactions).entries({
-                    passport_ID: passportRowId, kind: 'provePredicate', jobId: res.jobId, txHash,
-                    status: 'succeeded', explorerUrl: txExplorerUrl(txHash)
-                } as any);
-            });
-            log.info(`predicate proven for log ${proofLogId}: ${txHash}`);
-        } catch (e) {
-            // A rejected predicate (value fails the bound) also lands here.
-            const msg = String((e as Error)?.message ?? e).slice(0, 500);
-            log.warn(`predicate proof failed for log ${proofLogId}:`, e);
-            await this.runDetached(async () => {
-                await UPDATE.entity(PredicateProofLog).set({ status: 'failed', result: false }).where({ ID: proofLogId });
-                await INSERT.into(PassportTransactions).entries({
-                    passport_ID: passportRowId, kind: 'provePredicate', status: 'failed', errorMessage: msg
-                } as any);
-            });
+        } finally {
+            await lane?.dispose().catch(() => { /* nothing left to release */ });
         }
     }
 
@@ -2450,10 +2018,10 @@ export default class ProducerService extends cds.ApplicationService {
      * 'offline'. The chain leg runs DETACHED after commit; clients poll the row.
      */
     private uploadDiligenceDoc = async (req: cds.Request) => {
-        const { passportId, docType, fileName, mimeType, contentBase64, sessionId, walletId, sponsorWalletId } =
+        const { passportId, docType, fileName, mimeType, contentBase64, sessionId, walletId } =
             req.data as {
                 passportId?: string; docType?: string; fileName?: string; mimeType?: string;
-                contentBase64?: string; sessionId?: string; walletId?: string; sponsorWalletId?: string;
+                contentBase64?: string; sessionId?: string; walletId?: string;
             };
         if (!passportId) return req.reject(400, 'passportId is required');
         const row: any = await SELECT.one.from(Passports)
@@ -2478,51 +2046,30 @@ export default class ProducerService extends cds.ApplicationService {
         } as any);
         if (mode === 'offline') return { docId, sha256, mode };
 
-        const sponsorSessionId = await this.sponsorSessionIdFor(String(session), sponsorWalletId);
-        const args = {
-            sha256, contentType: String(mimeType), size: bytes.length,
-            storageRef: `passport-diligence://${passportId}/${docId}`,
-            sessionId: String(session), contractAddress: String(contractAddress), compiledArtifactRef: CONTRACT_REF,
-            ...(sponsorSessionId ? { sponsorSessionId } : {})
-        };
-        const user = req.user;
+        // The file's sha256 is attested as a record of its own, with the hash of an empty metadata text.
+        const tx: VaultTx = { label: 'anchorDoc', calls: [{ circuit: 'attest', args: [sha256, sha256Hex(Buffer.alloc(0))] }] };
         (req as any).on('succeeded', () => {
             void detachedFromRequest(() =>
-                this.runDiligenceAnchorDetached(docId, String(row.ID), args, user)
+                this.runDiligenceAnchorDetached(docId, String(row.ID), String(contractAddress), tx, String(session))
             ).catch((e: unknown) =>
                 cds.log('producer').error(`detached diligence anchor crashed for ${passportId}:`, e));
         });
         return { docId, sha256, mode };
     };
 
-    /** The long-running leg of uploadDiligenceDoc (single anchorDocument tx). */
+    /** The long-running leg of uploadDiligenceDoc: one attest transaction. */
     private async runDiligenceAnchorDetached(
-        docId: string, passportRowId: string,
-        args: Record<string, unknown> & { sessionId: string; contractAddress: string },
-        user: unknown
+        docId: string, passportRowId: string, contractAddress: string, tx: VaultTx, sessionId: string
     ): Promise<void> {
         const log = cds.log('producer');
+        let lane: ChainLane | null = null;
         try {
-            const nightgate = await cds.connect.to('NightgateService');
-            // First action on a fresh server session: await the facade prewarm
-            // once, same as the anchor and prove runners.
-            const prewarmJob = this.serverPrewarmJobs.get(args.sessionId);
-            if (prewarmJob) {
-                this.serverPrewarmJobs.delete(args.sessionId);
-                await waitForJobResult(nightgate, prewarmJob, args.sessionId, user);
-            }
-            const res: any = await sendDetached(nightgate, 'anchorDocument', args, user);
-            const jobResult: any = await waitForJobResult(
-                nightgate, res.jobId, args.sessionId, user, { requireChainSuccess: true }
-            );
-            const txHash = norm(String(jobResult?.txHash ?? ''));
+            lane = this.laneFor(sessionId);
+            const { txHash, jobId } = await lane.submitVaultTx({ contractAddress, tx });
             await this.runDetached(async () => {
-                await UPDATE.entity(DiligenceDoc).set({
-                    status: 'succeeded', anchorTxHash: txHash,
-                    ...(res.documentId ? { documentRef_ID: String(res.documentId) } : {})
-                } as any).where({ ID: docId });
+                await UPDATE.entity(DiligenceDoc).set({ status: 'succeeded', anchorTxHash: txHash } as any).where({ ID: docId });
                 await INSERT.into(PassportTransactions).entries({
-                    passport_ID: passportRowId, kind: 'anchorDoc', jobId: String(res.jobId ?? ''),
+                    passport_ID: passportRowId, kind: 'anchorDoc', jobId,
                     txHash, status: 'succeeded', explorerUrl: txExplorerUrl(txHash)
                 } as any);
             });
@@ -2536,6 +2083,8 @@ export default class ProducerService extends cds.ApplicationService {
                     passport_ID: passportRowId, kind: 'anchorDoc', status: 'failed', errorMessage: msg
                 } as any);
             });
+        } finally {
+            await lane?.dispose().catch(() => { /* nothing left to release */ });
         }
     }
 
@@ -2567,8 +2116,8 @@ export default class ProducerService extends cds.ApplicationService {
      * foreign wallet fails on-chain with a clean 'failed' status.
      */
     private reanchorPassport = async (req: cds.Request) => {
-        const { passportId, reason, sessionId, walletId, sponsorWalletId } = req.data as {
-            passportId?: string; reason?: string; sessionId?: string; walletId?: string; sponsorWalletId?: string;
+        const { passportId, reason, sessionId, walletId } = req.data as {
+            passportId?: string; reason?: string; sessionId?: string; walletId?: string;
         };
         const pid = String(passportId ?? '').trim();
         if (!pid) return req.reject(400, 'passportId is required');
@@ -2601,7 +2150,7 @@ export default class ProducerService extends cds.ApplicationService {
         // and there the vault's attester check IS the enforcement.
         if (!sessionId) this.assertWalletOwnsPassport(req, row, walletId);
 
-        const core = await this.reanchorCore(req, row, why, session, contractAddress, sponsorWalletId);
+        const core = await this.reanchorCore(req, row, why, session, contractAddress);
         return { passportId: pid, ...core };
     };
 
@@ -2631,7 +2180,7 @@ export default class ProducerService extends cds.ApplicationService {
      */
     private async reanchorCore(
         req: cds.Request, row: any, why: string,
-        session: string, contractAddress: string, sponsorWalletId?: string
+        session: string, contractAddress: string
     ) {
         const pid = String(row.passportId);
         const versionRows: any[] = await SELECT.from(PassportAnchorVersions)
@@ -2690,7 +2239,7 @@ export default class ProducerService extends cds.ApplicationService {
             .filter((g) => g.op === 'grant')
             .map(({ grantee, level }) => ({ grantee, level }));
 
-        const r = await this.anchorRow(req, String(row.ID), pid, newHash, String(row.passportIdHash), contractAddress, session, true, sponsorWalletId);
+        const r = await this.anchorRow(req, String(row.ID), pid, newHash, String(row.passportIdHash), contractAddress, session, true);
         return {
             archivedVersion,
             payloadHash: newHash, previousPayloadHash: String(row.payloadHash ?? ''),
@@ -2708,8 +2257,8 @@ export default class ProducerService extends cds.ApplicationService {
      * drift and the next re-anchor (manual or batch) commits it on-chain.
      */
     private changeBatteryStatus = async (req: cds.Request) => {
-        const { passportId, newStatus, sessionId, walletId, sponsorWalletId } = req.data as {
-            passportId?: string; newStatus?: string; sessionId?: string; walletId?: string; sponsorWalletId?: string;
+        const { passportId, newStatus, sessionId, walletId } = req.data as {
+            passportId?: string; newStatus?: string; sessionId?: string; walletId?: string;
         };
         const pid = String(passportId ?? '').trim();
         if (!pid) return req.reject(400, 'passportId is required');
@@ -2747,7 +2296,7 @@ export default class ProducerService extends cds.ApplicationService {
             cds.log('producer').warn(`status change of '${pid}' recorded WITHOUT re-anchor (no session/contract); content is now drifted`);
             return { passportId: pid, previousStatus, newStatus, mode: 'offline', archivedVersion: 0, payloadHash: '', grantsToRegrant: [] };
         }
-        const core = await this.reanchorCore(req, row, 'status-change', session, contractAddress, sponsorWalletId);
+        const core = await this.reanchorCore(req, row, 'status-change', session, contractAddress);
         return {
             passportId: pid, previousStatus, newStatus,
             mode: (core as any).mode, archivedVersion: (core as any).archivedVersion,
@@ -2770,13 +2319,7 @@ export default class ProducerService extends cds.ApplicationService {
         if (secrets.attesterId) return secrets.attesterId;
         const cached = this.attesterIdCache.get(secrets.id);
         if (cached) return cached;
-        const nightgate = await cds.connect.to('NightgateService');
-        const info: any = await (nightgate as any).send('deriveWalletInfo', { mnemonic: secrets.mnemonic });
-        const attesterId = String(info?.attesterId ?? '');
-        if (!/^[0-9a-f]{64}$/i.test(attesterId)) {
-            req.reject(502, `deriveWalletInfo returned no attesterId for wallet '${secrets.id}' (NIGHTGATE >= 0.10.1 required)`);
-            return '';
-        }
+        const { attesterId } = await remoteIdentity(remoteLaneConfigFromEnv(), producerSeedHex(secrets.mnemonic));
         this.attesterIdCache.set(secrets.id, attesterId);
         return attesterId;
     }
@@ -2789,8 +2332,8 @@ export default class ProducerService extends cds.ApplicationService {
      * plumbing as the operator handover, without the owner flip.
      */
     private claimPassportId = async (req: cds.Request) => {
-        const { passportId, walletId, sponsorWalletId } = req.data as {
-            passportId?: string; walletId?: string; sponsorWalletId?: string;
+        const { passportId, walletId } = req.data as {
+            passportId?: string; walletId?: string;
         };
         const pid = String(passportId ?? '').trim();
         if (!pid) return req.reject(400, 'passportId is required');
@@ -2805,9 +2348,9 @@ export default class ProducerService extends cds.ApplicationService {
         const contractAddress = this.vaultFor(row);
         if (!contractAddress) return req.reject(400, 'no PASSPORT_CONTRACT_ADDRESS available');
         const registrarId = process.env.PASSPORT_REGISTRAR_WALLET?.trim() || 'default';
-        const regSession = await this.serverSigningSession(registrarId);
+        const regSession = this.serverSigner(registrarId);
         if (!regSession) {
-            return req.reject(400, `claiming needs the registrar wallet's signing session ('${registrarId}', PASSPORT_REGISTRAR_WALLET); none available`);
+            return req.reject(400, `claiming needs the registrar wallet ('${registrarId}', PASSPORT_REGISTRAR_WALLET); it is not configured`);
         }
         const attesterId = await this.attesterIdFor(req, wid);
 
@@ -2822,23 +2365,16 @@ export default class ProducerService extends cds.ApplicationService {
             return req.reject(400, `passport '${pid}' is already claimed by wallet '${wid}'`);
         }
 
-        const sponsorSessionId = await this.sponsorSessionIdFor(regSession, sponsorWalletId);
         const txRowId = cds.utils.uuid();
         await INSERT.into(PassportTransactions).entries({
             ID: txRowId, passport_ID: row.ID, kind: 'registerPassport',
             identifier: attesterId, status: 'pending'
         } as any);
 
-        const args = {
-            passportId: String(row.passportIdHash ?? '') || blake2b256Hex(pid),
-            ownerId: attesterId,
-            sessionId: regSession, contractAddress,
-            ...(sponsorSessionId ? { sponsorSessionId } : {})
-        };
-        const user = req.user;
+        const documentId = String(row.passportIdHash ?? '') || blake2b256Hex(pid);
         (req as any).on('succeeded', () => {
             void detachedFromRequest(() =>
-                this.runRegisterDetached(txRowId, String(row.ID), pid, args, user, { what: 'id claim' })
+                this.runRegisterDetached(txRowId, String(row.ID), pid, contractAddress, documentId, attesterId, regSession, { what: 'id claim' })
             ).catch((e: unknown) =>
                 cds.log('producer').error(`detached passport claim crashed for ${pid}:`, e));
         });
@@ -2853,8 +2389,8 @@ export default class ProducerService extends cds.ApplicationService {
      * side owner guard the moment the owner flips.
      */
     private transferPassportOperator = async (req: cds.Request) => {
-        const { passportId, newWalletId, sponsorWalletId } = req.data as {
-            passportId?: string; newWalletId?: string; sponsorWalletId?: string;
+        const { passportId, newWalletId } = req.data as {
+            passportId?: string; newWalletId?: string;
         };
         const pid = String(passportId ?? '').trim();
         if (!pid) return req.reject(400, 'passportId is required');
@@ -2894,12 +2430,11 @@ export default class ProducerService extends cds.ApplicationService {
         const contractAddress = this.vaultFor(row);
         if (!contractAddress) return req.reject(400, 'no PASSPORT_CONTRACT_ADDRESS available');
         const registrarId = process.env.PASSPORT_REGISTRAR_WALLET?.trim() || 'default';
-        const regSession = await this.serverSigningSession(registrarId);
+        const regSession = this.serverSigner(registrarId);
         if (!regSession) {
-            return req.reject(400, `operator handover needs the registrar wallet's signing session ('${registrarId}', PASSPORT_REGISTRAR_WALLET); none available`);
+            return req.reject(400, `operator handover needs the registrar wallet ('${registrarId}', PASSPORT_REGISTRAR_WALLET); it is not configured`);
         }
         const attesterId = await this.attesterIdFor(req, targetId);
-        const sponsorSessionId = await this.sponsorSessionIdFor(regSession, sponsorWalletId);
 
         const txRowId = cds.utils.uuid();
         await INSERT.into(PassportTransactions).entries({
@@ -2907,17 +2442,11 @@ export default class ProducerService extends cds.ApplicationService {
             identifier: attesterId, status: 'pending'
         } as any);
 
-        const args = {
-            passportId: String(row.passportIdHash), ownerId: attesterId,
-            sessionId: regSession, contractAddress,
-            ...(sponsorSessionId ? { sponsorSessionId } : {})
-        };
         const previousOwner = String(row.owner ?? '');
         const newOwner = target.owner;
-        const user = req.user;
         (req as any).on('succeeded', () => {
             void detachedFromRequest(() =>
-                this.runRegisterDetached(txRowId, String(row.ID), pid, args, user, { what: 'operator transfer', newOwner })
+                this.runRegisterDetached(txRowId, String(row.ID), pid, contractAddress, String(row.passportIdHash), attesterId, regSession, { what: 'operator transfer', newOwner })
             ).catch((e: unknown) =>
                 cds.log('producer').error(`detached operator transfer crashed for ${pid}:`, e));
         });
@@ -2932,22 +2461,18 @@ export default class ProducerService extends cds.ApplicationService {
      */
     private async runRegisterDetached(
         txRowId: string, passportRowId: string, passportId: string,
-        args: Record<string, unknown> & { sessionId: string },
-        user: unknown, opts: { what: string; newOwner?: string }
+        contractAddress: string, documentId: string, ownerId: string, sessionId: string,
+        opts: { what: string; newOwner?: string }
     ): Promise<void> {
         const log = cds.log('producer');
+        let lane: ChainLane | null = null;
         try {
-            const nightgate = await cds.connect.to('NightgateService');
-            const prewarmJob = this.serverPrewarmJobs.get(args.sessionId);
-            if (prewarmJob) {
-                this.serverPrewarmJobs.delete(args.sessionId);
-                await waitForJobResult(nightgate, prewarmJob, args.sessionId, user);
-            }
-            const res: any = await sendDetached(nightgate, 'registerPassport', args, user);
-            const jobResult: any = await waitForJobResult(
-                nightgate, String(res.jobId), args.sessionId, user, { requireChainSuccess: true }
-            );
-            const txHash = norm(String(jobResult?.txHash ?? ''));
+            lane = this.laneFor(sessionId);
+            // Mode 0 assigns the document id to the owner's attester id.
+            const { txHash } = await lane.submitVaultTx({
+                contractAddress,
+                tx: { label: 'registerDocument', calls: [{ circuit: 'registerDocument', args: ['0', documentId, ownerId] }] }
+            });
             await this.runDetached(async () => {
                 // Owner flips ONLY on chain success: until then the previous
                 // operator remains the owner in every server-side check.
@@ -2965,6 +2490,8 @@ export default class ProducerService extends cds.ApplicationService {
             await this.runDetached(async () => {
                 await UPDATE.entity(PassportTransactions).set({ status: 'failed', errorMessage: msg } as any).where({ ID: txRowId });
             }).catch(() => { /* best effort */ });
+        } finally {
+            await lane?.dispose().catch(() => { /* nothing left to release */ });
         }
     }
 
@@ -3089,28 +2616,5 @@ export default class ProducerService extends cds.ApplicationService {
         // Bump the aggregate so Date-timeOfLatestUpdateOfDPP moves with the data.
         await UPDATE.entity(Passports).set({ modifiedAt: now } as any).where({ ID: passport.ID });
         return results;
-    }
-
-    /**
-     * The content-root anchor tx of the proof job just completed: the newest
-     * `anchorContentRoot` submission of this session/contract since the job
-     * started, from the plugin's own submission log. Best-effort (null if the
-     * lookup fails); the proof tx itself never depends on it.
-     */
-    private async contentRootTxOf(sessionId: string, contractAddress: string, sinceIso: string):
-        Promise<{ txHash: string; submittedAt?: string } | null> {
-        try {
-            const rows: any[] = await cds.db.read('midnight.PendingSubmissions')
-                .columns('txHash', 'submittedAt')
-                .where({ sessionId, contractAddress, circuitName: 'anchorContentRoot' })
-                .and('submittedAt >=', sinceIso)
-                .orderBy('submittedAt desc')
-                .limit(1);
-            const hit = rows?.[0];
-            return hit?.txHash ? { txHash: hit.txHash, submittedAt: hit.submittedAt } : null;
-        } catch (e) {
-            cds.log('producer').warn('content-root tx lookup skipped:', (e as Error)?.message);
-            return null;
-        }
     }
 }

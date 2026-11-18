@@ -2,7 +2,8 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
     artifactCacheDir, cacheDirForManifest,
-    isRebuildable, remoteLaneConfigFromEnv, resolveTxHash,
+    isRebuildable, shouldRebuild, cartMayHaveLanded, SubmittedTxError,
+    remoteLaneConfigFromEnv, resolveTxHash, chainLaneConfigured, apiUrlFromEnv,
     registerRemoteSigner, releaseRemoteSigner, hasRemoteSigner, remoteLaneFor, remoteVaultFor,
     REMOTE_LANE_CIRCUITS
 } from '../../srv/lib/lane-remote';
@@ -12,7 +13,7 @@ import {
 
 const ENV = {
     NIGHTGATE_API_URL: 'https://api.example/',
-    DEMO_NIGHTGATE_AGENT_TOKEN: 'ngat_x',
+    NIGHTGATE_AGENT_TOKEN: 'ngat_x',
     NIGHTGATE_NETWORK: 'preprod'
 };
 
@@ -37,9 +38,16 @@ describe('remoteLaneConfigFromEnv', () => {
         assert.equal(cfg.ttlMinutes, 20);
     });
 
+    it('knows whether both settings of the API access are present', () => {
+        assert.equal(chainLaneConfigured(ENV), true);
+        assert.equal(chainLaneConfigured({ ...ENV, NIGHTGATE_AGENT_TOKEN: ' ' }), false);
+        assert.equal(chainLaneConfigured({ NIGHTGATE_AGENT_TOKEN: 'ngat_x' }), false);
+        assert.equal(apiUrlFromEnv({ NIGHTGATE_API_URL: 'https://ng.example/' }), 'https://ng.example');
+    });
+
     it('names the missing key', () => {
-        const { DEMO_NIGHTGATE_AGENT_TOKEN: _t, ...rest } = ENV;
-        assert.throws(() => remoteLaneConfigFromEnv(rest), /DEMO_NIGHTGATE_AGENT_TOKEN is not set/);
+        const { NIGHTGATE_AGENT_TOKEN: _t, ...rest } = ENV;
+        assert.throws(() => remoteLaneConfigFromEnv(rest), /NIGHTGATE_AGENT_TOKEN is not set/);
         assert.throws(() => remoteLaneConfigFromEnv({ ...ENV, NIGHTGATE_API_URL: ' ' }), /NIGHTGATE_API_URL is not set/);
     });
 });
@@ -67,6 +75,38 @@ describe('isRebuildable', () => {
     }
 });
 
+describe('rebuild policy', () => {
+    const busy = Object.assign(new Error('busy'), { status: 503 });
+
+    it('rebuilds a retryable failure until the last attempt', () => {
+        assert.equal(shouldRebuild(busy, 0), true);
+        assert.equal(shouldRebuild(busy, 1), true);
+        assert.equal(shouldRebuild(busy, 2), false);
+        assert.equal(shouldRebuild(new Error('predicate does not hold'), 0), false);
+    });
+
+    it('never rebuilds once the sponsor took the transaction', () => {
+        const late = new SubmittedTxError('transaction 00ab... was sponsored but the server has not indexed it after 240s', { cause: busy });
+        assert.equal(shouldRebuild(late, 0), false);
+        assert.equal(shouldRebuild(new SubmittedTxError('lookup -> HTTP 503'), 0), false);
+    });
+});
+
+describe('cartMayHaveLanded', () => {
+    it('is true for a transaction the sponsor took, and for a partial result of the job', () => {
+        const submitted = new Error('proof cart: not indexed', { cause: new SubmittedTxError('not indexed') });
+        assert.equal(cartMayHaveLanded(submitted), true);
+        assert.equal(cartMayHaveLanded(new Error('proof cart: OnChainStatus PartialSuccess')), true);
+        assert.equal(cartMayHaveLanded(new Error('proof cart: failed', { cause: { job: { errorCode: 'PARTIAL_SUCCESS' } } })), true);
+    });
+
+    it('is false for a failure before the hand-over', () => {
+        assert.equal(cartMayHaveLanded(new Error('proof cart: predicate does not hold')), false);
+        assert.equal(cartMayHaveLanded(new Error('proof cart: busy', { cause: Object.assign(new Error('busy'), { status: 503 }) })), false);
+        assert.equal(cartMayHaveLanded('boom'), false);
+    });
+});
+
 describe('remote signer registry', () => {
     const seed = 'ab'.repeat(64);
     const RUN = '0d052525-fcbd-44e0-9ad9-c19d33893819';
@@ -74,7 +114,7 @@ describe('remote signer registry', () => {
         registerRemoteSigner(RUN, seed);
         assert.equal(hasRemoteSigner(RUN), true);
         const lane = remoteLaneFor(RUN, remoteLaneConfigFromEnv(ENV));
-        assert.equal(lane.kind, 'remote');
+        assert.equal(typeof lane.submitVaultTx, 'function');
         releaseRemoteSigner(RUN);
         assert.equal(hasRemoteSigner(RUN), false);
         assert.throws(() => remoteLaneFor(RUN, remoteLaneConfigFromEnv(ENV)), /no signer registered/);
@@ -97,8 +137,11 @@ describe('remote signer registry', () => {
         assert.throws(() => registerRemoteSigner(RUN, 'abc'), /128 hex chars/);
     });
 
-    it('pins the demo circuit set', () => {
-        assert.deepEqual(REMOTE_LANE_CIRCUITS, ['attest', 'bindDocument', 'anchorContentRoot', 'proveFieldPredicate', 'proveFieldMembership']);
+    it('pins the circuit set the lane proves', () => {
+        assert.deepEqual(REMOTE_LANE_CIRCUITS, [
+            'attest', 'bindDocument', 'anchorContentRoot', 'proveFieldPredicate', 'proveFieldMembership',
+            'proveFieldEquality', 'grantDisclosure', 'revokeDisclosure', 'registerDocument', 'proveDocumentComparison'
+        ]);
     });
 });
 

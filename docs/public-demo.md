@@ -101,8 +101,8 @@ a passport during the demo and the audience verifies it seconds later:
 
 | Variable | Value |
 |---|---|
-| `PRODUCER_WALLET_MNEMONIC` or `PRODUCER_WALLET_SEED_HEX` | testnet wallet with tDUST |
-| `PRODUCER_VIEWING_KEY` | matching viewing key |
+| `PRODUCER_WALLET_MNEMONIC` | the signing identity; it needs no funds, the API sponsors the fees |
+| `NIGHTGATE_API_URL`, `NIGHTGATE_AGENT_TOKEN` | the NIGHTGATE API and the grant |
 | `NIGHTGATE_PROOF_SERVER_URL` | `http://proof-server:6300` (the sidecar below) |
 | `ERP_WEBHOOK_SECRET` | only if the EQUINOX webhook should be reachable |
 
@@ -133,7 +133,7 @@ services:
       cds_requires_db_credentials_host: postgres-preprod
       cds_requires_db_credentials_database: nightpass_preprod
   proof-server:
-    image: midnightnetwork/proof-server:latest
+    image: midnightntwrk/proof-server:9.0.2
     command: ["midnight-proof-server", "--port", "6300"]
 ```
 
@@ -254,16 +254,14 @@ the head fields and the proven `claims`; rows without a profile are batteries.
       (defaults equal the user names and are public knowledge).
 - [ ] `ENCRYPTION_KEY` is a fresh random 32-byte hex, not the dev default.
 - [ ] Mode A: no `LACE_*` / `PRODUCER_*` / `ERP_WEBHOOK_SECRET` on the host.
-- [ ] PostgreSQL contains no copied `midnight_WalletSyncStates` /
-      `midnight_WalletSessions` rows from live development runs.
 - [ ] `pg_dump` backup and restore have been tested outside the live volume.
 - [ ] Page labels the demo as a Midnight testnet; a network reset
       requires re-anchoring.
 - [ ] `PASSPORT_CORS_ORIGINS` is unset unless a specific external wallet or
       frontend requires connector access; never use `*` on the write-capable
       work surface.
-- [ ] Each NIGHTPASS service runs exactly one container/process and declares
-      `NIGHTGATE_REPLICA_COUNT=1`; do not use Compose `--scale` for it.
+- [ ] Each NIGHTPASS service runs exactly one container/process (the demo
+      queue lives in memory); do not use Compose `--scale` for it.
 - [ ] Write actions are producer-gated: `generatePassport`, `registerPartner`,
       `triggerGoodsReceipt` and the whole ProducerService reject anonymous
       callers. `verifyOnChain`, the viewer entities and the credential export

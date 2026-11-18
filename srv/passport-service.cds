@@ -3,8 +3,7 @@ using {passport} from '../db/passport-schema';
 /**
  * PassportService is the NIGHTPASS consumer surface.
  *
- * Read-side projections of the passport-domain entities, co-served with the
- * NIGHTGATE plugin services on one port. Passport creation lives in
+ * Read-side projections of the passport-domain entities. Passport creation lives in
  * ProducerService.createPassport; this surface reads, verifies and resolves.
  *
  * These projections ARE the Annex XIII disclosure boundary: after-READ
@@ -71,9 +70,8 @@ service PassportService {
 
     /**
      * Partner registration (Catena-X-style): register a dataspace partner's
-     * DID/BPN + a login secret and receive its `granteeId` (sha256(did)). Also
-     * binds the DID → granteeId in the plugin's GranteeIdentities so the read gate
-     * resolves the partner at read time.
+     * DID/BPN + a login secret and receive its `granteeId` (sha256(did)). The
+     * read gate resolves the partner through that id.
      *
      * Producer-gated: partner onboarding is producer-led, not anonymous. This
      * prevents an attacker from (re)setting the secret of a DID that already holds

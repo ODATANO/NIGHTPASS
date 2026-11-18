@@ -31,7 +31,7 @@ node --experimental-strip-types tractusx/pac/build-pac.mts
 # -> writes pac/samples/battery-pass-pac.json
 ```
 
-NIGHTPASS hosts `@odatano/nightgate` (from npm) as a CAP plugin (T16). Bring-up and
+NIGHTPASS works against a NIGHTGATE API through `@odatano/nightgate-tx`. Bring-up and
 local-dev gotchas are in [`../docs/development.md`](../docs/development.md).
 
 ## The three disclosure modes (why PAC matters)

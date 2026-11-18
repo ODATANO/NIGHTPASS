@@ -1,12 +1,11 @@
 // "Try it" demo UI smoke: drives the FULL visitor flow in a real browser
 // against a self-started throwaway instance (scratch DB): landing -> start ->
 // form -> submit -> live timeline -> done view. The run is a REAL sponsored
-// anchor + ZK proof on Midnight preview, so the test takes a few minutes.
+// anchor + ZK proof on Midnight, so the test takes a few minutes.
 //
 //   node test/ui-demo-smoke.mjs [--db <scratch.db>] [--port 4020]
 //
-// With --db pointing at a prior zz-demo-e2e scratch DB the sponsor wallet is
-// already warm; without it the sponsor cold-syncs first (adds ~1 min).
+// Needs NIGHTGATE_API_URL, NIGHTGATE_AGENT_TOKEN and PASSPORT_CONTRACT_ADDRESS in the environment.
 import { chromium } from 'playwright';
 import { spawn, execSync } from 'node:child_process';
 import { mkdtempSync } from 'node:fs';
@@ -34,12 +33,7 @@ const env = {
   ...process.env,
   PORT: String(PORT),
   cds_requires_db_credentials_database: scratchDb,
-  NIGHTGATE_NETWORK: 'preview',
-  NIGHTGATE_SIGNING_KEY_RATE_LIMIT: '1000',
-  NODE_OPTIONS: '--max-old-space-size=12288',
-  PASSPORT_CONTRACT_ADDRESS: process.env.PASSPORT_CONTRACT_ADDRESS
-    || 'f7c755235cc9408bc6664f7cae88b445798726ccdf9a6a560e7c873c807aabe1',
-  PASSPORT_FEE_SPONSOR_WALLET: 'default',
+  NIGHTGATE_NETWORK: process.env.NIGHTGATE_NETWORK || 'preprod',
   DEMO_ENABLED: 'true',
   PASSPORT_PUBLISH_URL: '',
 };

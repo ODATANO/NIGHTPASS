@@ -1,35 +1,11 @@
-import cds from '@sap/cds';
-import type { ChainVerdict } from './chain-verify';
-import { readState, verifyParamAvailable } from './verify-reader';
+import { readState } from './verify-reader';
+
+/** Outcome of an on-chain check: the effect is there, is definitely not, or cannot be told yet. */
+export type ChainVerdict = 'confirmed' | 'failed' | 'unknown';
 
 /**
- * Crawler-free verification of a wallet-submitted action's ON-CHAIN EFFECT.
- *
- * The tx-based path (srv/lib/chain-verify.ts) resolves a client-reported txHash
- * against the plugin's `midnight.Transactions` table, which only the block
- * crawler populates. With the crawler off (the demo default) that table stays
- * empty, so a wallet action can never self-confirm and its row is stuck PENDING.
- *
- * NIGHTGATE's state readers answer the stronger question instead: not "did this txHash
- * land?" but "does the AttestationVault ledger now reflect the intended effect?".
- * Both surfaces below read live contract state via the indexer
- * (`queryContractState`), so they work with the crawler disabled and verify the
- * outcome rather than the transaction mechanics (idempotent, self-healing):
- *
- *   - `verifyAttestationState`  confirms a record is anchored in the vault.
- *   - `reindexDisclosures`      reconciles `midnight.DisclosureGrants` from live
- *                               state, after which we read back the grant's row.
- *
- * Records are keyed by attester AND payload (vault lineage 4). A read names the
- * record by `attesterId` + `payloadHash`, or resolves it through the bound
- * document id (`passportIdHash`); the `RecordSelector` carries whichever the
- * caller has. A row without an attester id and without a live binding cannot be
- * read and answers `unknown`.
- *
- * Both map an on-chain effect that is present to `confirmed`, and everything else
- * (absent yet, or no live provider configured) to `unknown`, never `failed`: a
- * not-yet-settled action must keep waiting, not be marked a failure on a negative
- * read. That leaves the tx-based verdict as the only source that can say `failed`.
+ * Checks of an action's effect on chain: each reads the vault's state through the NIGHTGATE API.
+ * A present effect is `confirmed`; anything else is `unknown`, never `failed`, so an unsettled action keeps waiting.
  */
 
 const CONTRACT_REF = 'attestation-vault';
@@ -77,7 +53,7 @@ export async function verifyAttestState(o: RecordSelector & { contentRoot?: stri
         });
         return res?.verified === true ? 'confirmed' : 'unknown';
     } catch {
-        return 'unknown'; // No live provider or the plugin is unreachable. Stay pending.
+        return 'unknown'; // The API is unreachable. Stay pending.
     }
 }
 
@@ -127,7 +103,7 @@ export async function attestRootState(o: RecordSelector & {
     const contentRoot = norm(o.contentRoot);
     const schemaId = norm(o.schemaId);
     if (!sel || !contentRoot) return 'unknown';
-    const wantsSchema = !!schemaId && verifyParamAvailable('verifyAttestationState', 'schemaId');
+    const wantsSchema = !!schemaId;
     try {
         const res: any = await readState('verifyAttestationState', {
             ...sel, contentRoot,
@@ -148,12 +124,9 @@ export async function attestRootState(o: RecordSelector & {
 }
 
 /**
- * Confirm a disclosure grant/revoke effect. Reindexes `midnight.DisclosureGrants`
- * from live on-chain state (`reindexDisclosures`), then reads back whether the
- * grant for `(contractAddress, payloadHash, grantee)` is now active (grant) or
- * absent/inactive (revoke). The `grantee` is the Bytes<32> grantee id: the same
- * key the read gate matches on, and exactly what the cockpit's partner picker sends.
- * With an `attesterId` the read-back is narrowed to that attester's record.
+ * Confirm a disclosure grant/revoke effect: the grantee's entry on the
+ * attester's record is there (grant) or gone (revoke). `grantee` is the
+ * Bytes<32> grantee id, the same key the read gate matches on.
  */
 export async function verifyGrantState(o: {
     contractAddress?: string | null;
@@ -165,28 +138,22 @@ export async function verifyGrantState(o: {
     const contractAddress = norm(o.contractAddress);
     const payloadHash = norm(o.payloadHash);
     const attesterId = norm(o.attesterId);
-    const grantee = String(o.grantee ?? '');
-    if (!contractAddress || !payloadHash || !grantee) return 'unknown';
+    const grantee = norm(o.grantee);
+    if (!contractAddress || !payloadHash || !HEX64.test(attesterId) || !HEX64.test(grantee)) return 'unknown';
     try {
-        const nightgate = await cds.connect.to('NightgateService');
-        await nightgate.send('reindexDisclosures', { contractAddress, compiledArtifactRef: CONTRACT_REF });
+        const res: any = await readState('verifyDisclosureState', {
+            contractAddress, attesterId, payloadHash, grantee, compiledArtifactRef: CONTRACT_REF
+        });
+        // A grant still there after a revoke, or not there yet after a grant,
+        // is `unknown` (keep waiting), never `failed`.
+        const granted = res?.granted === true;
+        if (o.op === 'grant') return granted ? 'confirmed' : 'unknown';
+        if (granted) return 'unknown';
+        // A record the read cannot find has no grant either, so only a present record confirms a revoke.
+        return verifyAttestState({ contractAddress, payloadHash, attesterId });
     } catch {
-        return 'unknown'; // No live provider. Leave the row pending; a later retry re-checks.
+        return 'unknown'; // The API is unreachable. Leave the row pending; a later retry re-checks.
     }
-    let active = false;
-    try {
-        const rows: unknown = await cds.db.read('midnight.DisclosureGrants')
-            .columns('active')
-            .where({ contractAddress, payloadHash, grantee, active: true, ...(HEX64.test(attesterId) ? { attesterId } : {}) });
-        active = Array.isArray(rows) && rows.length > 0;
-    } catch {
-        return 'unknown'; // grants table absent
-    }
-    // A grant is confirmed once its row is active on-chain; a revoke once no
-    // active grant remains. A still-active grant after a revoke, or a not-yet
-    // -present grant, is `unknown` (keep waiting), never `failed`.
-    if (o.op === 'grant') return active ? 'confirmed' : 'unknown';
-    return active ? 'unknown' : 'confirmed';
 }
 
 /**
@@ -220,8 +187,6 @@ export async function verifyCrossRootState(o: {
     const attesterId = norm(o.attesterIdA);
     const attesterIdB = norm(o.attesterIdB) || attesterId;
     if (!contractAddress || !payloadHash || !payloadHashB || !HEX64.test(attesterId)) return 'unknown';
-    const needed = verifyParamAvailable('verifyPredicateState', o.kind === 'documentDiff' ? 'k' : 'allowedMask');
-    if (!verifyParamAvailable('verifyPredicateState', 'payloadHashB') || !needed) return 'unknown';
     try {
         const res: any = await readState('verifyPredicateState', {
             contractAddress, attesterId, payloadHash, payloadHashB,
@@ -247,10 +212,7 @@ export async function verifyCrossRootState(o: {
  * passed straight through here (do NOT scale again). Membership kind:
  * (record, fieldKey, 'setMembership', setRoot); threshold is not part of
  * the claim key and is omitted. The record is `attesterId` + `payloadHash`;
- * without the attester the read cannot name it and stays 'unknown'. On a
- * plugin that predates the setMembership kind (no `setRoot` param in the
- * model), a membership check returns 'unknown' instead of sending an arg the
- * action would reject.
+ * without the attester the read cannot name it and stays 'unknown'.
  */
 export async function verifyPredicateState(o: {
     contractAddress?: string | null;
@@ -266,10 +228,7 @@ export async function verifyPredicateState(o: {
     const attesterId = norm(o.attesterId);
     if (!contractAddress || !payloadHash || !HEX64.test(attesterId)) return 'unknown';
     const membership = o.predicate === 'setMembership';
-    if (membership) {
-        const hasSetRootParam = verifyParamAvailable('verifyPredicateState', 'setRoot');
-        if (!hasSetRootParam || !norm(o.setRoot)) return 'unknown';
-    }
+    if (membership && !norm(o.setRoot)) return 'unknown';
     try {
         const res: any = await readState('verifyPredicateState', {
             contractAddress,
@@ -282,6 +241,6 @@ export async function verifyPredicateState(o: {
         });
         return res?.verified === true ? 'confirmed' : 'unknown';
     } catch {
-        return 'unknown'; // No live provider or the plugin is unreachable. Stay pending.
+        return 'unknown'; // The API is unreachable. Stay pending.
     }
 }

@@ -2,7 +2,7 @@ import cds from '@sap/cds';
 import { Passport, Passports, PredicateProofLog, Partners } from '#cds-models/passport';
 import { effectiveNetwork, explorerTxUrl, verifyPeers, fieldKeyHex, blake2b256Hex } from './lib/passport-anchor';
 import { recordSelectorArgs } from './lib/state-verify';
-import { readState, verifyNetworkOverrideAvailable } from './lib/verify-reader';
+import { readState } from './lib/verify-reader';
 import { granteeIdForDid } from './lib/grantee';
 import { claimSetById, setLabelFor } from './lib/claim-sets';
 import { restrictedProbe } from './lib/query-guard';
@@ -44,14 +44,13 @@ const CHILD_SPECS: ReadonlyArray<{ entity: string; spec: ChildSpec }> = PROFILE_
 // On-chain disclosure ACL ----------------------------------
 //
 // The AttestationVault `disclosures` Map is the tamper-evident, attester-
-// controlled tier ACL; NIGHTGATE indexes it into `midnight.DisclosureGrants`
-// (level 0/1/2) and binds principals to Bytes<32> grantee ids via
-// `midnight.GranteeIdentities`. An active on-chain grant ELEVATES the tier
-// above the requester's local role (never lowers it): additive, so the
-// configured-role path keeps working when no grants exist. Grants are scoped
-// per attestation (payloadHash), so elevation is resolved per passport row to
-// avoid leaking one passport's grant onto another. All lookups degrade to
-// 'consumer' on any failure, so a read can never break on the on-chain path.
+// controlled tier ACL (level 0/1/2). A principal is bound to a Bytes<32>
+// grantee id in `passport.Partners`. A grant ELEVATES the tier above the
+// requester's local role (never lowers it): additive, so the configured-role
+// path keeps working when no grants exist. Grants are scoped per attestation
+// (payloadHash), so elevation is resolved per passport row to avoid leaking
+// one passport's grant onto another. All lookups degrade to 'consumer' on any
+// failure, so a read can never break on the grant path.
 
 /** The requester's on-chain grantee ids (memoized per request). */
 async function granteesOf(req: cds.Request): Promise<string[]> {
@@ -61,21 +60,20 @@ async function granteesOf(req: cds.Request): Promise<string[]> {
     const userId = req.user?.id;
     if (userId && userId !== 'anonymous') {
         try {
-            const rows = await cds.db.read('midnight.GranteeIdentities')
-                .columns('granteeId').where({ userId });
-            grantees = rows.map((r: Record<string, unknown>) => r.granteeId as string).filter(Boolean);
-        } catch { /* plugin tables absent → no on-chain elevation */ }
+            const rows = await SELECT.from(Partners).columns('granteeId').where({ did: userId });
+            grantees = rows.map((r) => r.granteeId).filter((g): g is string => !!g);
+        } catch { /* no partner registry → no elevation */ }
     }
     (req as any).__grantees = grantees;
     return grantees;
 }
 
 /**
- * Effective disclosure grants for a set of grantee ids → Map(payloadHash → maxLevel).
- * Unions two sources so the demo works offline and stays on-chain-ready:
- *   (a) on-chain indexed grants (`midnight.DisclosureGrants`, active), the real ACL.
- *   (b) producer-side offline log (`passport.DisclosureGrantLog`): latest op per
- *       (payloadHash, grantee); counts only if the newest op is `grant`.
+ * Effective disclosure grants for a set of grantee ids → Map(payloadHash → maxLevel),
+ * from the producer's grant log (`passport.DisclosureGrantLog`): the latest op per
+ * (passport, grantee) counts when it is a `grant`. Only settled rows count:
+ * `succeeded` is verified against the vault's state, `offline` is a no-chain
+ * demo grant. A `pending` grant must NOT elevate a tier before it is verified.
  */
 async function effectiveGrantsFor(grantees: string[]): Promise<Map<string, number>> {
     const out = new Map<string, number>();
@@ -85,16 +83,6 @@ async function effectiveGrantsFor(grantees: string[]): Promise<Map<string, numbe
         const n = Number(lvl) || 0;
         out.set(ph, Math.max(out.get(ph) ?? -1, n));
     };
-    // (a) on-chain
-    try {
-        const rows = await cds.db.read('midnight.DisclosureGrants')
-            .columns('payloadHash', 'level').where({ grantee: { in: grantees }, active: true });
-        for (const g of rows as Record<string, unknown>[]) bump(g.payloadHash, g.level);
-    } catch { /* plugin tables absent */ }
-    // (b) offline producer log: latest op per (passport, grantee); if it's a
-    // `grant`, map passport_ID → payloadHash and count it. Only settled rows count
-    // (`succeeded` = chain-verified, `offline` = no-chain demo grant); a `pending`
-    // wallet grant must NOT elevate a tier before its tx is verified on-chain.
     try {
         const rows = await SELECT.from('passport.DisclosureGrantLog')
             .columns('grantee', 'level', 'op', 'createdAt', 'passport_ID')
@@ -106,7 +94,7 @@ async function effectiveGrantsFor(grantees: string[]): Promise<Map<string, numbe
         if (granted.length) {
             const ids = [...new Set(granted.map((r) => r.passport_ID))];
             const ps = await SELECT.from(Passports).columns('ID', 'payloadHash').where({ ID: { in: ids } });
-            const idToHash = new Map((ps as Record<string, unknown>[]).map((p) => [p.ID, p.payloadHash]));
+            const idToHash = new Map<unknown, unknown>(ps.map((p) => [p.ID, p.payloadHash]));
             for (const r of granted) bump(idToHash.get(r.passport_ID), r.level);
         }
     } catch { /* no offline grants */ }
@@ -291,13 +279,8 @@ export default class PassportService extends cds.ApplicationService {
 
     /**
      * Live on-chain verification for the public viewer (anonymous). Reads the
-     * vault state through the indexer via NIGHTGATE `verifyAttestationState`
-     * (crawler-free), so it works on a read-only public host without a wallet.
-     *
-     * NightgateService is service-level `@requires: 'authenticated-user'`, but
-     * this check is public by design (anyone holding the QR may verify), so the
-     * in-process call runs under a fixed technical principal. A failed or
-     * unreachable ledger read yields `verified:false`, never a 5xx.
+     * vault state through the API's public verify service, so it needs no wallet
+     * and no token. A failed or unreachable read yields `verified:false`, never a 5xx.
      */
     private verifyOnChain = async (req: cds.Request) => {
         const passportId = String((req.data as { passportId?: string }).passportId ?? '').trim();
@@ -318,21 +301,18 @@ export default class PassportService extends cds.ApplicationService {
             documentId: (row as any).passportIdHash || blake2b256Hex(String(row.passportId))
         });
 
-        // A row anchored on a DIFFERENT Midnight network than this server queries
-        // needs the `network` override on NIGHTGATE's verifyAttestationState.
-        // Feature-detect it on the loaded model: on plugin versions without it
-        // the doomed read is skipped and the caller shows the honest reason.
+        // A row anchored on a DIFFERENT Midnight network than this server works on
+        // is read with the `network` parameter of the verify service.
         const serverNetwork = effectiveNetwork();
-        const anchorNetwork = (row as Record<string, unknown>).anchorNetwork as string | null ?? null;
+        const anchorNetwork = row.anchorNetwork ?? null;
         const crossNetwork = !!anchorNetwork && anchorNetwork !== serverNetwork;
-        const canOverride = verifyNetworkOverrideAvailable();
 
         let verified = false;
         let checkedNetwork: string | null = null;
         let attesterId: string | null = (row as any).attesterId ? norm((row as any).attesterId) : null;
         let bindingRegistered: boolean | null = null;
         const peerBase = crossNetwork && anchorNetwork ? verifyPeers()[anchorNetwork] : undefined;
-        if (selector && (!crossNetwork || canOverride)) {
+        if (selector) {
             checkedNetwork = crossNetwork ? anchorNetwork : serverNetwork;
             try {
                 const res: any = await readState('verifyAttestationState', {
@@ -345,7 +325,7 @@ export default class PassportService extends cds.ApplicationService {
                 if (typeof res?.bindingRegistered === 'boolean') bindingRegistered = res.bindingRegistered;
             } catch { /* indexer unreachable or contract unknown: stay unverified */ }
         } else if (payloadHash && contractAddress && peerBase) {
-            // No plugin-side network override, but a PEER instance configured for
+            // No record to name here, but a PEER instance configured for
             // the row's network exists (PASSPORT_VERIFY_PEERS): delegate the live
             // check to it server-side over its public API. On any peer failure
             // the read counts as NOT performed (checkedNetwork stays null), so
@@ -387,8 +367,7 @@ export default class PassportService extends cds.ApplicationService {
     /**
      * Live verification of a superseded anchor version: same vault read as
      * verifyOnChain, but against the archived version's payload hash. No peer
-     * delegation here; a cross-network row without the plugin network override
-     * honestly reports checkedNetwork:null.
+     * delegation here.
      */
     private verifyAnchorVersion = async (req: cds.Request) => {
         const { passportId: pidRaw, version } = req.data as { passportId?: string; version?: number };
@@ -408,7 +387,6 @@ export default class PassportService extends cds.ApplicationService {
         const serverNetwork = effectiveNetwork();
         const anchorNetwork = (v.anchorNetwork as string | null) ?? null;
         const crossNetwork = !!anchorNetwork && anchorNetwork !== serverNetwork;
-        const canOverride = verifyNetworkOverrideAvailable();
         // A superseded version is no longer the bound one, so only its
         // attester names its record; the document-id fallback would resolve
         // the current version and answer false (the payload differs).
@@ -419,7 +397,7 @@ export default class PassportService extends cds.ApplicationService {
 
         let verified = false;
         let checkedNetwork: string | null = null;
-        if (selector && (!crossNetwork || canOverride)) {
+        if (selector) {
             checkedNetwork = crossNetwork ? anchorNetwork : serverNetwork;
             try {
                 const res: any = await readState('verifyAttestationState', {
@@ -498,9 +476,9 @@ export default class PassportService extends cds.ApplicationService {
      * state record a true result for the claim key (payloadHash, field,
      * predicate, threshold)? Crawler-free via NIGHTGATE verifyPredicateState;
      * `threshold` arrives in RAW units and is scaled x1000 to the same integer
-     * the circuit hashed into the claim key. Mirrors verifyOnChain: technical
-     * user for the plugin call, network override for cross-network rows,
-     * failures degrade to verified:false (never 5xx).
+     * the circuit hashed into the claim key. Mirrors verifyOnChain: the
+     * `network` parameter for cross-network rows, failures degrade to
+     * verified:false (never 5xx).
      */
     private verifyClaimOnChain = async (req: cds.Request) => {
         const { passportId, sourceField, predicate, threshold } = req.data as {
@@ -538,10 +516,7 @@ export default class PassportService extends cds.ApplicationService {
         const probe = await this.probeClaimOnChain(req, {
             passportId, sourceField,
             proofLogWhere: { predicate: 'setMembership', setRoot: root },
-            claimArgs: { predicate: 'setMembership', setRoot: root },
-            // A plugin without the membership kind cannot check this claim;
-            // skip the live read and stay honestly unverified.
-            requireModelParam: 'setRoot'
+            claimArgs: { predicate: 'setMembership', setRoot: root }
         });
         if (!probe) return; // req already rejected
         return {
@@ -621,12 +596,6 @@ export default class PassportService extends cds.ApplicationService {
         const serverNetwork = effectiveNetwork();
         const anchorNetwork = (row.anchorNetwork as string | null) ?? null;
         const crossNetwork = !!anchorNetwork && anchorNetwork !== serverNetwork;
-        const params = (cds.model?.definitions?.['NightgateService.verifyPredicateState'] as any)?.params;
-        const canOverride = !!params?.network;
-        // A plugin without the cross-root params cannot answer this at all;
-        // stay honestly unverified rather than sending args it would reject.
-        const kindSupported = !!params?.payloadHashB
-            && !!(o.kind === 'documentDiff' ? params?.k : params?.allowedMask);
         // Each record is its attester's: the current row's and the archived
         // versions' attesters, by payload hash.
         const attesterByHash = new Map<string, string>();
@@ -639,7 +608,7 @@ export default class PassportService extends cds.ApplicationService {
 
         let verified = false;
         let checkedNetwork: string | null = null;
-        if (contractAddress && kindSupported && attesterIdA && attesterIdB && (!crossNetwork || canOverride)) {
+        if (contractAddress && attesterIdA && attesterIdB) {
             checkedNetwork = crossNetwork ? anchorNetwork : serverNetwork;
             try {
                 const res: any = await readState('verifyPredicateState', {
@@ -678,7 +647,6 @@ export default class PassportService extends cds.ApplicationService {
         passportId?: string; sourceField?: string;
         proofLogWhere: Record<string, unknown>;
         claimArgs: Record<string, unknown>;
-        requireModelParam?: string;
     }) {
         const pid = String(o.passportId ?? '').trim();
         if (!pid) { req.reject(400, 'passportId is required'); return null; }
@@ -691,11 +659,8 @@ export default class PassportService extends cds.ApplicationService {
         const norm = (h: unknown) => String(h ?? '').replace(/^0x/, '').toLowerCase();
         const contractAddress = norm(row.contractAddress);
         const serverNetwork = effectiveNetwork();
-        const anchorNetwork = (row as Record<string, unknown>).anchorNetwork as string | null ?? null;
+        const anchorNetwork = row.anchorNetwork ?? null;
         const crossNetwork = !!anchorNetwork && anchorNetwork !== serverNetwork;
-        const params = (cds.model?.definitions?.['NightgateService.verifyPredicateState'] as any)?.params;
-        const canOverride = !!params?.network;
-        const kindSupported = !o.requireModelParam || !!params?.[o.requireModelParam];
 
         // On-chain claim keys live per (CONTRACT, payloadHash): after a
         // same-network vault redeploy a re-anchored row points at the NEW
@@ -738,7 +703,7 @@ export default class PassportService extends cds.ApplicationService {
 
         let verified = false;
         let checkedNetwork: string | null = null;
-        if (probes.length && contractAddress && kindSupported && (!crossNetwork || canOverride)) {
+        if (probes.length && contractAddress) {
             checkedNetwork = crossNetwork ? anchorNetwork : serverNetwork;
             try {
                 for (const cand of probes) {
@@ -824,7 +789,7 @@ export default class PassportService extends cds.ApplicationService {
         }
         const norm = (h: unknown) => String(h ?? '').replace(/^0x/, '').toLowerCase();
         const rank: Record<string, number> = { anchored: 0, anchoring: 1, failed: 2, draft: 3 };
-        return (rows as Record<string, unknown>[])
+        return rows
             .sort((a, b) => (rank[String(a.status)] ?? 9) - (rank[String(b.status)] ?? 9))
             .map((r) => ({
                 passportId: r.passportId,
@@ -863,7 +828,7 @@ export default class PassportService extends cds.ApplicationService {
         const proofs = await SELECT.from(PredicateProofLog)
             .columns('sourceField', 'predicate', 'threshold', 'unit', 'txHash', 'result', 'status')
             .where({ passport_ID: p.ID, status: 'succeeded' });
-        const explorer = (h: unknown) => explorerTxUrl(h as string | null, (p as Record<string, unknown>).anchorNetwork as string | null);
+        const explorer = (h: unknown) => explorerTxUrl(h as string | null, p.anchorNetwork);
         const credential = {
             '@context': ['https://www.w3.org/ns/credentials/v2', 'https://catena-x.net/schema/pac/v1'],
             type: ['VerifiableCredential', 'BatteryPassportCredential'],
@@ -885,7 +850,7 @@ export default class PassportService extends cds.ApplicationService {
                     locallyAnchored: p.status === 'anchored' && !!p.attestationTxHash,
                     explorer: explorer(p.attestationTxHash)
                 },
-                predicateProofs: (proofs as Record<string, unknown>[]).map((pr) => ({
+                predicateProofs: proofs.map((pr) => ({
                     sourceField: pr.sourceField,
                     claim: `${pr.sourceField} ${pr.predicate} ${pr.threshold}${pr.unit ? ' ' + pr.unit : ''}`,
                     operator: pr.predicate,
@@ -922,21 +887,6 @@ export default class PassportService extends cds.ApplicationService {
         if (existing) return req.reject(409, `partner '${d}' already registered`);
         await INSERT.into(Partners).entries({ did: d, name, role: r, granteeId, secret } as any);
 
-        // Bind DID → granteeId in the plugin's GranteeIdentities (global scope),
-        // so granteesOf(req) resolves this partner at read time. Idempotent.
-        const now = new Date().toISOString();
-        const gi: any = await cds.db.run(
-            SELECT.one.from('midnight.GranteeIdentities').where({ userId: d, scope: null })
-        );
-        if (gi) {
-            await cds.db.run(UPDATE.entity('midnight.GranteeIdentities')
-                .set({ granteeId, bindingKind: 'did', modifiedAt: now }).where({ ID: gi.ID }));
-        } else {
-            await cds.db.run(INSERT.into('midnight.GranteeIdentities').entries({
-                ID: cds.utils.uuid(), userId: d, granteeId, bindingKind: 'did', scope: null,
-                createdAt: now, modifiedAt: now
-            }));
-        }
         return { did: d, name, role: r, granteeId };
     };
 }

@@ -2,17 +2,21 @@ import cds from '@sap/cds';
 import { randomBytes, createHash } from 'node:crypto';
 import { Testers } from '#cds-models/demo';
 import { Runs } from '#cds-models/sandbox';
-import { feeSponsorWalletIds, producerWalletSecrets } from './lib/producer-wallets';
 import { encryptSecret, decryptSecret } from './lib/demo-crypto';
-import { sendDetached, waitForJobResult, detachedFromRequest, explorerTxUrl, effectiveNetwork } from './lib/passport-anchor';
+import { detachedFromRequest, explorerTxUrl, effectiveNetwork } from './lib/passport-anchor';
+import {
+    apiClient, chainLaneConfigured, remoteIdentity, remoteLaneConfigFromEnv, remoteLaneFor, registerRemoteSigner, releaseRemoteSigner,
+    type RemoteChainLane
+} from './lib/lane-remote';
+import type { ComparisonOpening, ComparisonSchemaSlot } from './lib/chain-lane';
 
 const { INSERT, SELECT, UPDATE } = cds.ql;
 
 type ClaimSpec =
     | { kind: 'equality'; doc: 'A' | 'B'; fieldKey: string; expectedValue: string; fieldSalt: string; siblings: string[]; dirs: boolean[]; expectedDigest: string }
     | { kind: 'predicate'; doc: 'A' | 'B'; fieldKey: string; value: string; fieldSalt: string; op: 'greaterOrEqual' | 'lessOrEqual'; threshold: number; siblings: string[]; dirs: boolean[] }
-    | { kind: 'documentDiff'; k: number; schema: unknown; openingA: unknown; openingB: unknown }
-    | { kind: 'documentIntegrity'; allowedMask: number; schema: unknown; openingA: unknown; openingB: unknown };
+    | { kind: 'documentDiff'; k: number; schema: ComparisonSchemaSlot[]; openingA: ComparisonOpening; openingB: ComparisonOpening }
+    | { kind: 'documentIntegrity'; allowedMask: number; schema: ComparisonSchemaSlot[]; openingA: ComparisonOpening; openingB: ComparisonOpening };
 
 interface DocCoords { payloadHash: string; storageRef?: string; metadata?: string; contentRoot: string; schemaId: string }
 interface RunSpec { documents: { A: DocCoords; B?: DocCoords }; claims: ClaimSpec[] }
@@ -20,20 +24,18 @@ interface RunCtx { runId: string; testerRowId: string; testerId: string; label: 
 
 /**
  * SandboxService: sponsored anchor + proof runs for outside NIGHTGATE testers.
- * Mirrors DemoService's safety machinery (cap lock, detached writes, sponsor
- * pool lease, single-flight queue), but the run body is the raw attestation-
- * vault lane against ONE shared vault instead of the battery passport lane.
+ * Mirrors DemoService's safety machinery (cap lock, detached writes,
+ * single-flight queue), but the run body works on the raw vault calls
+ * against ONE shared vault instead of the battery passport flow.
  *
  * The tester's client does the compute-only prep (prepareDocumentProof) and
- * sends coordinates; this service only performs the DUST-SPENDING submits,
- * each carrying the leased sponsor's session so the sponsor pays.
+ * sends coordinates; this service builds and signs the transactions with the
+ * tester's seed, and the NIGHTGATE API's pool pays the fees.
  */
 export default class SandboxService extends cds.ApplicationService {
     private queue: string[] = [];
     private running = new Set<string>();
     private pending = new Map<string, RunCtx>();
-    /** walletId -> runId currently holding it; one run per sponsor at a time. */
-    private sponsorLeases = new Map<string, string>();
 
     override async init(): Promise<void> {
         this.on('startTester', this.startTester);
@@ -42,9 +44,17 @@ export default class SandboxService extends cds.ApplicationService {
         this.on('sandboxRunStatus', this.sandboxRunStatus);
         this.on('sandboxInfo', this.sandboxInfo);
         cds.on('served', () => {
-            if (process.env.DEMO_ENABLED === 'true' && !this.encryptionKeyOk()) {
-                cds.log('sandbox').error(
-                    'DEMO_ENABLED is set but ENCRYPTION_KEY is missing or not 64 hex chars; sandbox stays DISABLED');
+            if (process.env.DEMO_ENABLED === 'true' && process.env.SANDBOX_CONTRACT_ADDRESS) {
+                const log = cds.log('sandbox');
+                if (!this.encryptionKeyOk()) {
+                    log.error('DEMO_ENABLED is set but ENCRYPTION_KEY is missing or not 64 hex chars; sandbox stays DISABLED');
+                }
+                if (!chainLaneConfigured()) {
+                    log.error('NIGHTGATE_API_URL or NIGHTGATE_AGENT_TOKEN is missing; sandbox stays DISABLED');
+                }
+                if (!this.contractAddress()) {
+                    log.error('SANDBOX_CONTRACT_ADDRESS is not a vault address (64 hex); sandbox stays DISABLED');
+                }
             }
             void this.failStaleRuns().catch(() => { /* best-effort */ });
         });
@@ -54,9 +64,12 @@ export default class SandboxService extends cds.ApplicationService {
     // --- config / helpers -----------------------------------------------------
 
     private encryptionKeyOk(): boolean { return /^[0-9a-fA-F]{64}$/.test(process.env.ENCRYPTION_KEY ?? ''); }
-    private contractAddress(): string | null { return process.env.SANDBOX_CONTRACT_ADDRESS ?? null; }
+    private contractAddress(): string | null {
+        const v = String(process.env.SANDBOX_CONTRACT_ADDRESS ?? '').trim().toLowerCase();
+        return /^[0-9a-f]{64}$/.test(v) ? v : null;
+    }
     private enabled(): boolean {
-        return process.env.DEMO_ENABLED === 'true' && this.encryptionKeyOk() && !!this.contractAddress();
+        return process.env.DEMO_ENABLED === 'true' && this.encryptionKeyOk() && !!this.contractAddress() && chainLaneConfigured();
     }
     private queueDepth(): number { return this.queue.length + this.running.size; }
     private maxPerDay(): number { return Number(process.env.SANDBOX_MAX_PER_DAY || 50); }
@@ -64,8 +77,7 @@ export default class SandboxService extends cds.ApplicationService {
     private maxPerTester(): number { return Number(process.env.SANDBOX_MAX_PER_TESTER || 3); }
     private maxQueue(): number { return Number(process.env.SANDBOX_MAX_QUEUE || 5); }
     private concurrency(): number {
-        const pool = feeSponsorWalletIds().length;
-        return Math.max(1, Math.min(pool || 1, Number(process.env.SANDBOX_CONCURRENCY || 1)));
+        return Math.max(1, Number(process.env.SANDBOX_CONCURRENCY) || 1);
     }
     private techUser(): any { return new (cds.User as any)({ id: 'producer', roles: ['producer'] }); }
     private clientKeyOf(req: cds.Request): string {
@@ -101,13 +113,6 @@ export default class SandboxService extends cds.ApplicationService {
     private patchRun(runId: string, patch: Record<string, unknown>): Promise<unknown> {
         return this.detachedWrite(() => UPDATE.entity(Runs).set(patch).where({ ID: runId }) as any);
     }
-    private acquireSponsor(runId: string): string | null {
-        const free = feeSponsorWalletIds().find((w) => !this.sponsorLeases.has(w));
-        if (!free) return null;
-        this.sponsorLeases.set(free, runId);
-        return free;
-    }
-
     private async failStaleRuns(): Promise<void> {
         await this.detachedWrite(() =>
             UPDATE.entity(Runs).set({ state: 'failed', error: 'process restarted mid-run' })
@@ -132,8 +137,7 @@ export default class SandboxService extends cds.ApplicationService {
             return req.reject(400, 'seedHex must be 128 hex chars (64 bytes); omit it to get a throwaway identity');
         }
         const seedHex = ownIdentity ? supplied : randomBytes(64).toString('hex');
-        const nightgate: any = await cds.connect.to('NightgateService');
-        const info: any = await nightgate.tx({ user: this.techUser() }, (tx: any) => tx.send('deriveWalletInfo', { seedHex }));
+        const info = await remoteIdentity(remoteLaneConfigFromEnv(), seedHex);
         const testerId = cds.utils.uuid();
         await this.withCapLock(async () => {
             if (!ipExempt && await this.countToday(Testers, { clientKey }) >= this.maxPerIpPerDay()) {
@@ -143,16 +147,15 @@ export default class SandboxService extends cds.ApplicationService {
                 testerId,
                 nickname: String((req.data as any).nickname ?? '').slice(0, 24),
                 encSeedHex: encryptSecret(seedHex, testerId),
-                encViewingKey: encryptSecret(String(info.viewingKey), testerId),
-                shieldedAddress: String(info.shieldedAddress),
-                nightAddress: String(info.nightAddress),
+                shieldedAddress: info.attesterId,
+                nightAddress: info.nightAddress,
                 clientKey,
                 passportCount: 0
             } as any));
         });
         return {
-            testerId, attesterId: String(info.attesterId ?? ''),
-            shieldedAddress: String(info.shieldedAddress), nightAddress: String(info.nightAddress),
+            testerId, attesterId: info.attesterId,
+            shieldedAddress: info.attesterId, nightAddress: info.nightAddress,
             ownIdentity
         };
     };
@@ -161,17 +164,21 @@ export default class SandboxService extends cds.ApplicationService {
         if (!this.enabled()) return req.reject(503, 'sandbox is not enabled on this instance');
         const d = req.data as Record<string, unknown>;
         if (!d.documentJson || !d.proofFieldsJson) return req.reject(400, 'documentJson and proofFieldsJson are required');
-        const nightgate: any = await cds.connect.to('NightgateService');
-        // Compute-only: no session, no sponsor, no dust. Runs under the tech
-        // principal so a hosted instance need not expose /nightgate publicly.
-        const out: any = await nightgate.tx({ user: this.techUser() }, (tx: any) => tx.send('prepareDocumentProof', {
-            documentJson: String(d.documentJson),
-            proofFieldsJson: String(d.proofFieldsJson),
+        let document: unknown, proofFields: unknown;
+        try {
+            document = JSON.parse(String(d.documentJson));
+            proofFields = JSON.parse(String(d.proofFieldsJson));
+        } catch { return req.reject(400, 'documentJson and proofFieldsJson must be valid JSON'); }
+        // Compute-only on the NIGHTGATE API: no signer, no sponsor, no dust.
+        const ng = await apiClient();
+        const out: any = await ng.prepareDocumentProof({
+            document,
+            proofFields,
             ...(d.saltSeed ? { saltSeed: String(d.saltSeed) } : {})
-        }));
+        });
         return {
             contentRoot: String(out.contentRoot), schemaId: String(out.schemaId),
-            schema: String(out.schema), fields: String(out.fields), opening: String(out.opening)
+            schema: JSON.stringify(out.schema), fields: JSON.stringify(out.fields), opening: JSON.stringify(out.opening)
         };
     };
 
@@ -278,9 +285,8 @@ export default class SandboxService extends cds.ApplicationService {
             const ctx = this.pending.get(runId);
             this.pending.delete(runId);
             if (!ctx) continue;
-            const sponsor = this.acquireSponsor(runId);
             this.running.add(runId);
-            void detachedFromRequest(() => this.executeRun(ctx, sponsor ?? undefined))
+            void detachedFromRequest(() => this.executeRun(ctx))
                 .catch(async (e: unknown) => {
                     const msg = String((e as Error)?.message ?? e).slice(0, 480);
                     cds.log('sandbox').warn(`run ${runId} failed:`, e);
@@ -288,19 +294,15 @@ export default class SandboxService extends cds.ApplicationService {
                 })
                 .finally(() => {
                     this.running.delete(runId);
-                    if (sponsor) this.sponsorLeases.delete(sponsor);
                     this.processQueue();
                 });
         }
     }
 
-    private async executeRun(ctx: RunCtx, sponsorWalletId?: string): Promise<void> {
+    private async executeRun(ctx: RunCtx): Promise<void> {
         const log = cds.log('sandbox');
         const { runId, spec } = ctx;
-        const user = this.techUser();
         const contractAddress = this.contractAddress()!;
-        const nightgate: any = await cds.connect.to('NightgateService');
-        const producer: any = await cds.connect.to('ProducerService');
         const steps = this.initialSteps(spec);
         const result: any = { network: effectiveNetwork(), contractAddress, documents: {}, claims: [] };
 
@@ -311,109 +313,82 @@ export default class SandboxService extends cds.ApplicationService {
             catch (e) { log.warn(`run ${runId}: timeline write failed (continuing):`, (e as Error)?.message); }
         };
 
-        // A sponsor is required: the tester wallet is zero-funded.
-        if (!sponsorWalletId) throw new Error('no fee sponsor available (PASSPORT_FEE_SPONSOR_WALLET); the tester wallet holds no dust');
-        const warm: any = await producer.tx({ user }, (tx: any) => tx.send('prewarmServerWallet', { walletId: sponsorWalletId }));
-        if (warm?.state === 'error') throw new Error(`fee sponsor '${sponsorWalletId}' unavailable: ${warm?.error || 'no signing session'}`);
-        const sess: any = await producer.tx({ user }, (tx: any) => tx.send('serverWalletSession', { walletId: sponsorWalletId }));
-        const sponsorSessionId = String(sess.sessionId);
-
         await this.patchRun(runId, { state: 'running' });
 
-        // Open the tester's zero-funded signing session; SPONSORED_CALLER_SYNC=skip
-        // means it needs no chain sync (the sponsor carries the fees).
+        // The tester's seed signs for the length of the run; the API's pool pays the fees.
         const tester: any = await SELECT.one.from(Testers).where({ ID: ctx.testerRowId });
-        const seedHex = decryptSecret(tester.encSeedHex, tester.testerId);
-        const viewingKey = decryptSecret(tester.encViewingKey, tester.testerId);
-        const conn: any = await sendDetached(nightgate, 'connectWallet', { viewingKey }, user);
-        const sessionId = String(conn.sessionId);
-        const skipCallerSync = process.env.NIGHTGATE_SPONSORED_CALLER_SYNC === 'skip';
-        const signing: any = await sendDetached(nightgate, 'connectWalletForSigning',
-            { sessionId, seedHex, ...(skipCallerSync ? { prewarm: false } : {}) }, user);
-        if (signing?.prewarmJobId && !skipCallerSync) {
-            await waitForJobResult(nightgate, String(signing.prewarmJobId), sessionId, user);
-        }
-
-        // The tester's attester id names every record it anchors (lineage 4);
-        // the anchor job reports it, and the verify coordinates carry it.
-        let attesterId = '';
-        const submit = async (action: string, args: Record<string, unknown>): Promise<string> => {
-            const job: any = await sendDetached(nightgate, action, { ...args, sessionId, sponsorSessionId, contractAddress }, user);
-            if (!attesterId && /^[0-9a-f]{64}$/i.test(String(job?.attesterId ?? ''))) attesterId = String(job.attesterId).toLowerCase();
-            const res: any = await waitForJobResult(nightgate, String(job.jobId), sessionId, user, { requireChainSuccess: true });
-            if (!attesterId && /^[0-9a-f]{64}$/i.test(String(res?.attesterId ?? ''))) attesterId = String(res.attesterId).toLowerCase();
-            return String(res.txHash ?? res.proof?.proofValue ?? '');
-        };
-
+        registerRemoteSigner(runId, decryptSecret(tester.encSeedHex, tester.testerId), { contractAddress });
+        let opened: RemoteChainLane | null = null;
         try {
-            // 1. Anchor document A (and B if present): payload_hash = the caller's leaf.
+            const lane = opened = remoteLaneFor(runId);
+            // The tester's attester id names every record it anchors.
+            const attesterId = await lane.attesterId();
+
+            // 1. Anchor document A (and B if present): the hash and its content root in one transaction.
             const anchorDoc = async (label: 'A' | 'B', d: DocCoords) => {
                 await setStep(`anchor:${label}`, { status: 'running' });
-                const tx = await submit('anchorDocument', {
-                    sha256: d.payloadHash, storageRef: d.storageRef ?? `sandbox/${label}`,
-                    metadata: d.metadata ?? JSON.stringify({ via: 'nightgate-sandbox' })
+                const metadataHash = createHash('sha256').update(d.metadata ?? JSON.stringify({ via: 'nightgate-sandbox' })).digest('hex');
+                const { txHash } = await lane.submitVaultTx({
+                    contractAddress,
+                    tx: {
+                        label: `anchor:${label}`,
+                        calls: [
+                            { circuit: 'attest', args: [d.payloadHash, metadataHash] },
+                            { circuit: 'anchorContentRoot', args: [d.payloadHash, d.contentRoot, d.schemaId] }
+                        ]
+                    }
                 });
-                result.documents[label] = { payloadHash: d.payloadHash, contentRoot: d.contentRoot, anchorTx: tx };
-                await setStep(`anchor:${label}`, { status: 'succeeded', txHash: tx, explorerUrl: explorerTxUrl(tx) });
+                result.documents[label] = { payloadHash: d.payloadHash, contentRoot: d.contentRoot, anchorTx: txHash };
+                await setStep(`anchor:${label}`, { status: 'succeeded', txHash, explorerUrl: explorerTxUrl(txHash) });
             };
             await anchorDoc('A', spec.documents.A);
             if (spec.documents.B) await anchorDoc('B', spec.documents.B);
             result.attesterId = attesterId;
 
-            // 2. Each claim, sponsored, against the shared vault.
+            // 2. Each claim against the shared vault.
             for (let i = 0; i < spec.claims.length; i++) {
                 const c = spec.claims[i];
                 const stepKind = `claim:${i}:${c.kind}`;
                 await setStep(stepKind, { status: 'running' });
-                const { tx, verify } = await this.runClaim(submit, spec, c);
+                const { tx, verify } = await this.runClaim(lane, contractAddress, attesterId, spec, c);
                 result.claims.push({ index: i, kind: c.kind, txHash: tx, verify: { attesterId, ...verify } });
                 await setStep(stepKind, { status: 'succeeded', txHash: tx, explorerUrl: explorerTxUrl(tx) });
             }
 
             await this.patchRun(runId, { state: 'done', resultJson: JSON.stringify(result) });
         } finally {
-            try { await sendDetached(nightgate, 'disconnectWallet', { sessionId }, user); } catch { /* best-effort */ }
+            await opened?.dispose().catch(() => { /* nothing left to release */ });
+            releaseRemoteSigner(runId);
         }
     }
 
-    /** One claim -> the matching sponsored action + the crawler-free verify coordinates. */
+    /** One claim as its own transaction, with the coordinates a verifier needs. */
     private async runClaim(
-        submit: (action: string, args: Record<string, unknown>) => Promise<string>,
-        spec: RunSpec, c: ClaimSpec
+        lane: RemoteChainLane, contractAddress: string, attesterId: string, spec: RunSpec, c: ClaimSpec
     ): Promise<{ tx: string; verify: Record<string, unknown> }> {
         const A = spec.documents.A, B = spec.documents.B;
-        if (c.kind === 'equality') {
+        if (c.kind === 'equality' || c.kind === 'predicate') {
             const d = c.doc === 'B' && B ? B : A;
-            const tx = await submit('issueFieldEqualityAttestation', {
-                payloadHash: d.payloadHash, fieldKey: c.fieldKey, expectedValue: c.expectedValue,
-                fieldSalt: c.fieldSalt, contentRoot: d.contentRoot, schemaId: d.schemaId,
-                siblingsJson: JSON.stringify(c.siblings), dirsJson: JSON.stringify(c.dirs)
+            const path = { fieldKey: c.fieldKey, salt: c.fieldSalt, siblings: c.siblings, dirs: c.dirs };
+            const { txHash } = await lane.submitProofCart({
+                contractAddress, payloadHash: d.payloadHash,
+                claims: [c.kind === 'equality'
+                    ? { ...path, expectedDigest: c.expectedDigest, predicate: 'bytesEquality' }
+                    : { ...path, value: c.value, predicate: c.op, threshold: c.threshold }]
             });
-            return { tx, verify: { payloadHash: d.payloadHash, fieldKey: c.fieldKey, predicate: 'bytesEquality', expectedDigest: c.expectedDigest } };
+            return c.kind === 'equality'
+                ? { tx: txHash, verify: { payloadHash: d.payloadHash, fieldKey: c.fieldKey, predicate: 'bytesEquality', expectedDigest: c.expectedDigest } }
+                : { tx: txHash, verify: { payloadHash: d.payloadHash, fieldKey: c.fieldKey, predicate: c.op, threshold: c.threshold } };
         }
-        if (c.kind === 'predicate') {
-            const d = c.doc === 'B' && B ? B : A;
-            const tx = await submit('issueFieldPredicateAttestation', {
-                payloadHash: d.payloadHash, fieldKey: c.fieldKey, value: c.value, fieldSalt: c.fieldSalt,
-                predicate: c.op, threshold: c.threshold, contentRoot: d.contentRoot, schemaId: d.schemaId,
-                siblingsJson: JSON.stringify(c.siblings), dirsJson: JSON.stringify(c.dirs)
-            });
-            return { tx, verify: { payloadHash: d.payloadHash, fieldKey: c.fieldKey, predicate: c.op, threshold: c.threshold } };
-        }
-        if (c.kind === 'documentDiff') {
-            const tx = await submit('issueDocumentDiffAttestation', {
-                payloadHashA: A.payloadHash, payloadHashB: B!.payloadHash, k: c.k,
-                schemaJson: JSON.stringify(c.schema), openingAJson: JSON.stringify(c.openingA), openingBJson: JSON.stringify(c.openingB),
-                contentRootB: B!.contentRoot, schemaId: B!.schemaId
-            });
-            return { tx, verify: { payloadHash: A.payloadHash, payloadHashB: B!.payloadHash, predicate: 'documentDiff', k: c.k } };
-        }
-        // documentIntegrity
-        const tx = await submit('issueDocumentIntegrityAttestation', {
-            payloadHashA: A.payloadHash, payloadHashB: B!.payloadHash, allowedMask: c.allowedMask,
-            schemaJson: JSON.stringify(c.schema), openingAJson: JSON.stringify(c.openingA), openingBJson: JSON.stringify(c.openingB),
-            contentRootB: B!.contentRoot, schemaId: B!.schemaId
+        const { txHash } = await lane.submitComparison({
+            contractAddress,
+            payloadHashA: A.payloadHash, attesterIdA: attesterId,
+            payloadHashB: B!.payloadHash, attesterIdB: attesterId,
+            schema: c.schema, openingA: c.openingA, openingB: c.openingB,
+            claims: [c.kind === 'documentDiff' ? { kind: 'documentDiff', k: c.k } : { kind: 'documentIntegrity', allowedMask: c.allowedMask }]
         });
-        return { tx, verify: { payloadHash: A.payloadHash, payloadHashB: B!.payloadHash, predicate: 'documentIntegrity', allowedMask: c.allowedMask } };
+        return c.kind === 'documentDiff'
+            ? { tx: txHash, verify: { payloadHash: A.payloadHash, payloadHashB: B!.payloadHash, predicate: 'documentDiff', k: c.k } }
+            : { tx: txHash, verify: { payloadHash: A.payloadHash, payloadHashB: B!.payloadHash, predicate: 'documentIntegrity', allowedMask: c.allowedMask } };
     }
 }

@@ -815,9 +815,8 @@ sap.ui.define([
     },
 
     // ---- proof cart: collect claims, prove them all in ONE wallet tx --------
-    // Wallet mode only for now: the server lane submits one tx per proof until
-    // NIGHTGATE ships the batch pendant (feature request pending); the shared
-    // proof-plan module keeps both lanes on the same contract.
+    // The shared proof-plan module keeps the wallet lane and the server lane
+    // on the same claim plan.
 
     _CART_MAX: 5, // N sequential wasm provings in the browser; keep it modest
 

@@ -1,18 +1,15 @@
-// LIVE membership-claims e2e against a RUNNING NIGHTPASS server on preprod
-// (NIGHTGATE >= 0.15.1, vault redeployed with the membership circuits):
+// LIVE membership-claims e2e against a RUNNING NIGHTPASS server:
 //
 //   prewarm wallet -> create + anchor a chemistry-bearing passport (10-leaf
 //   content root) -> server-lane mixed cart (1 numeric + 1 membership claim)
-//   in ONE tx -> both PredicateProofLog rows succeed with a SHARED txHash and
-//   their own predicateAttestationId -> verifyClaimOnChain AND
-//   verifyMembershipClaimOnChain confirm crawler-free -> a wrong setRoot
-//   honestly fails to verify.
+//   in ONE tx -> both PredicateProofLog rows succeed with a SHARED txHash
+//   -> verifyClaimOnChain AND verifyMembershipClaimOnChain confirm on chain
+//   -> a wrong setRoot honestly fails to verify.
 //
-//   Server: npm run start:wallets  (PASSPORT_CONTRACT_ADDRESS = the NEW
-//   vault; proof server on :6300 or wasm proving).
+//   Server: npm run start:wallets  (NIGHTGATE_API_URL, NIGHTGATE_AGENT_TOKEN,
+//   PASSPORT_CONTRACT_ADDRESS; proof server on :6300 or wasm proving).
 //   Then: node test/integration/membership-e2e.mjs
-//   Env: NIGHTPASS_BASE (default :4004), WALLET_ID (default 'default'),
-//   PASSPORT_FEE_SPONSOR_WALLET on the server when the wallet is fundless.
+//   Env: NIGHTPASS_BASE (default :4004), WALLET_ID (default 'default').
 
 const BASE = process.env.NIGHTPASS_BASE || 'http://localhost:4004';
 const WALLET_ID = process.env.WALLET_ID || 'default';
@@ -119,7 +116,6 @@ const rows = [];
 console.log('');
 for (const r of rows) {
     if (r.status !== 'succeeded' || r.result !== true) fail(`proof row ${r.sourceField} ended ${r.status}: ${pretty(r)}`);
-    if (!r.predicateAttestationId) fail(`proof row ${r.sourceField} has no predicateAttestationId`);
 }
 const txs = new Set(rows.map((r) => r.txHash));
 if (txs.size !== 1) fail(`claims landed in ${txs.size} txs, expected 1`);

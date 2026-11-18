@@ -1,18 +1,12 @@
 // NIGHTPASS wallet-connector flow (Lace). Bundled to app/connector/lib by vite
 // (npm run build:connector-lib); the producer cockpit dynamic-imports it in-app.
 //
-// Uses NIGHTGATE's verified browser building blocks (@odatano/nightgate/browser)
-// + the DApp-Connector wallet (window.midnight, e.g. Lace) to attest / grant /
-// revoke on the AttestationVault. This is the human-attester path. attest+grant+revoke
+// Uses NIGHTGATE's browser export (@odatano/nightgate-tx/calls: connectContract
+// with call, batch and deploy) + the DApp-Connector wallet (window.midnight, e.g. Lace)
+// to attest / grant / revoke on the AttestationVault. This is the human-attester path. attest+grant+revoke
 // all run with the SAME wallet-derived attester secret, so a full self-contained
 // cycle works (a server-created grant uses a different secret and would fail the
 // on-chain "not attester" assert; a known cross-path caveat).
-//
-// Verified building blocks (NIGHTGATE Phases 1-4): manifest discovery,
-// FetchZkConfigProvider, providers assembly, attester-secret derivation, typed
-// call inputs. The FINAL prove+balance+submit round-trip
-// (makeConnectorWalletAdapter) is the live-integration boundary. Finalize it
-// against real Lace + chain.
 
 // Node-global polyfills for the browser. Parts of the Midnight SDK (tx/zswap
 // serialization in the submit path) use Node's `Buffer`, which Vite does not
@@ -22,20 +16,19 @@ if (typeof globalThis.Buffer === 'undefined') globalThis.Buffer = NodeBuffer;
 if (typeof globalThis.global === 'undefined') globalThis.global = globalThis;
 
 // Shared anchor call plan (pure TS, bundled by vite): the SAME ordered circuit
-// list the server submits via NIGHTGATE submitContractCallBatch, so the two
-// anchor paths cannot drift.
+// list the server submits, so the two anchor paths cannot drift.
 import { anchorTxPlan } from '../../srv/lib/anchor-plan';
+import { prepareVaultCall } from '../../srv/lib/chain-lane';
 import { proofCartPlan, claimKey, claimValidUntil } from '../../srv/lib/proof-plan';
 
 // NOTE: all heavy SDK/WASM imports are LAZY (loaded inside the action functions)
 // so the page + wallet connect work even before any ZK artifact loads. Importing
-// @odatano/nightgate/browser eagerly would pull ledger/runtime WASM at page load
+// the SDK eagerly would pull ledger/runtime WASM at page load
 // and a failure there would leave the page blank with no connect button.
-const loadBrowserSdk = () => import('@odatano/nightgate/browser');
-const loadVaultContract = () => import('@odatano/nightgate/browser/attestation-vault');
+const loadBrowserSdk = () => import('@odatano/nightgate-tx/calls');
+const loadVaultContract = () => import('@odatano/nightgate-tx/attestation-vault');
 
 const CONTRACT = 'attestation-vault';
-const PRIVATE_STATE_ID = 'attestationVaultPrivateState';
 
 // Lace's getConfiguration() points the prover at the hosted
 // https://proof-server.preprod.midnight.network, but that host omits the
@@ -46,8 +39,11 @@ const PRIVATE_STATE_ID = 'attestationVaultPrivateState';
 // server to be running.
 const LOCAL_PROVER_URL = 'http://localhost:6300';
 
+// Lifetime of a built transaction.
+const TX_TTL_MINUTES = 30;
+
 /**
- * Opt-in switch for wallet-delegated proving (NIGHTGATE 0.12.1 `proving: 'wallet'`).
+ * Opt-in switch for wallet-delegated proving (`proving: 'wallet'`).
  *
  * Set `localStorage['nightpass:wallet-prover'] = '1'` in the cockpit tab and contract circuits are
  * proved INSIDE the connected wallet; no docker proof server is needed at all. Off by default
@@ -79,8 +75,8 @@ async function runtimeConfig() {
         }
     } catch { /* no server config reachable, use the fallback below */ }
     _runtimeConfig = {
-        network: 'preview',
-        indexerHttpUrl: 'https://indexer.preview.midnight.network/api/v4/graphql'
+        network: 'preprod',
+        indexerHttpUrl: 'https://indexer.preprod.midnight.network/api/v4/graphql'
     };
     return _runtimeConfig;
 }
@@ -183,12 +179,6 @@ export async function connect(walletKey) {
     return initial.connect(network); // v4 ConnectedAPI
 }
 
-async function fetchManifest() {
-    const res = await fetch('/contract-manifest');
-    if (!res.ok) throw new Error(`/contract-manifest -> HTTP ${res.status}`);
-    return res.json();
-}
-
 // App-managed attester secret.
 //
 // The Midnight DApp Connector (Lace v4) does NOT implement message signing.
@@ -221,14 +211,13 @@ async function walletStoreKey(api) {
 
 let _cachedSecret = null;
 /**
- * The attester identity of this wallet's app-managed secret, 64 hex:
- * persistentHash(secret), byte-exact to the vault's caller_id(). Records are
- * keyed by it (lineage 4), so the cockpit stores it next to the anchor.
+ * The attester identity of this wallet's app-managed secret, 64 hex, as the
+ * vault's caller_id(). Records are keyed by it, so the cockpit stores it next
+ * to the anchor.
  */
 export async function attesterIdOf(api) {
-    const secret = await deriveAttesterSecret(api);
-    const rt = await import('@midnight-ntwrk/compact-runtime');
-    return toHex(rt.persistentHash(new rt.CompactTypeBytes(32), secret));
+    const [{ computeAttesterId }, secret] = await Promise.all([loadBrowserSdk(), deriveAttesterSecret(api)]);
+    return computeAttesterId(secret);
 }
 
 /**
@@ -257,247 +246,61 @@ export async function deriveAttesterSecret(api) {
     return _cachedSecret;
 }
 
-// --- LIVE-INTEGRATION BOUNDARY (finalize against Lace) ----------------------
-// Adapts the v4 connector (serialized tx strings) to midnight-js
-// WalletProvider/MidnightProvider (typed ledger objects). The exact ledger
-// serialize/deserialize boundary + whether balanceUnsealed vs balanceSealed is
-// correct MUST be confirmed against a real Lace + chain.
-// Short, safe description of a value for diagnostic logging.
-function describe(x) {
-    if (x === null) return 'null';
-    if (x === undefined) return 'undefined';
-    const t = typeof x;
-    if (t === 'string') return `string(${x.length} chars)`;
-    if (t !== 'object') return `${t}(${String(x)})`;
-    const ctor = x.constructor && x.constructor.name;
-    let keys = '?';
-    try { keys = Object.keys(x).slice(0, 10).join(','); } catch {}
-    const len = (x instanceof Uint8Array || Array.isArray(x)) ? ` len=${x.length}` : '';
-    return `object ctor=${ctor}${len} keys=[${keys}]`;
-}
-
-/** Decode a serialized tx (hex or base64 string, or Uint8Array) to bytes. */
-function txStringToBytes(s) {
-    if (s instanceof Uint8Array) return s;
-    if (typeof s !== 'string') throw new Error('cannot decode tx of type ' + typeof s);
-    if (/^[0-9a-fA-F]+$/.test(s) && s.length % 2 === 0) {
-        const out = new Uint8Array(s.length / 2);
-        for (let i = 0; i < out.length; i++) out[i] = parseInt(s.substr(i * 2, 2), 16);
-        return out;
-    }
-    const bin = atob(s);
-    const out = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-    return out;
-}
-
 /**
- * Recover a transaction's identifiers from its serialized (balanced) form. The
- * indexer's watchForTxData(txId) matches `offset.identifier` against a tx's
- * `identifiers`, so this is what submitTx must return, NOT the serialized tx.
- * A fully built+balanced contract tx is signature/proof/binding; we try a few
- * marker combos defensively. Returns null if none deserialize.
+ * Connects the vault through the wallet. The wallet balances, pays and submits
+ * every transaction. Without `contractAddress` the object can only deploy.
  */
-function identifiersFromSerialized(ledger, serialized, log) {
-    let bytes;
-    try { bytes = txStringToBytes(serialized); } catch (e) { log(`txId decode failed: ${e?.message}`); return null; }
-    const combos = [
-        ['signature', 'proof', 'binding'],
-        ['signature-erased', 'proof', 'binding'],
-        ['signature', 'proof', 'no-binding']
-    ];
-    for (const [s, p, b] of combos) {
-        try {
-            const t = ledger.Transaction.deserialize(s, p, b, bytes);
-            const ids = t.identifiers();
-            if (ids && ids.length) { log(`deserialized balanced tx (${s}/${p}/${b}) -> ${ids.length} identifier(s)`); return ids; }
-        } catch { /* try next marker combo */ }
-    }
-    return null;
-}
-
-function makeConnectorWalletAdapter(api, walletKeys, ledger, log) {
-    // Captured from the proven (pre-balance) Transaction object the SDK hands to
-    // balanceTx. The contract deploy/call identifier is balancing-independent, so
-    // these survive into the balanced tx and serve as a fallback if we can't
-    // deserialize Lace's balanced string.
-    let preBalanceIdentifiers = null;
-    return {
-        getCoinPublicKey() { return walletKeys.coinPublicKey; },
-        getEncryptionPublicKey() { return walletKeys.encryptionPublicKey; },
-        async balanceTx(tx /*, ttl */) {
-            log(`balanceTx in: ${describe(tx)} serialize=${typeof tx?.serialize}`);
-            try { if (typeof tx?.identifiers === 'function') { preBalanceIdentifiers = tx.identifiers(); log(`pre-balance identifiers: ${preBalanceIdentifiers?.length}`); } } catch {}
-            const serialized = typeof tx?.serialize === 'function' ? tx.serialize() : tx;
-            log(`balanceTx serialized: ${describe(serialized)}`);
-            let res;
-            try {
-                res = await api.balanceUnsealedTransaction(serialized);
-            } catch (e) {
-                log(`balanceUnsealedTransaction THREW: name=${e?.name} msg=${e?.message || '(empty)'} code=${e?.code}`);
-                // Lace wraps errors in an Effect-ts FiberFailure; the real cause is
-                // nested. toString()/stack usually pretty-print it; also walk .cause.
-                try { log('  toString: ' + String(e)); } catch {}
-                try { log('  stack: ' + String(e?.stack || '').split('\n').slice(0, 5).join(' | ')); } catch {}
-                let c = e?.cause, depth = 0;
-                while (c && depth < 8) {
-                    const real = c.error ?? c.defect ?? c.failure ?? c.value;
-                    log(`  cause[${depth}] tag=${c._tag ?? c._id} ${real != null ? 'err=' + (real.message ?? String(real)) : ''}`);
-                    c = c.cause ?? c.error ?? c.defect ?? c.failure ?? c.left ?? c.right;
-                    depth++;
-                }
-                throw e;
-            }
-            log(`balanceUnsealedTransaction returned: ${describe(res)}`);
-            // Lace returns the balanced tx as { tx: <serialized string> }. The SDK
-            // passes balanceTx's result straight to submitTx (submitTxCore calls no
-            // ledger methods on it), so we pass the serialized form through as-is
-            // rather than deserializing into a Transaction object and re-serializing.
-            const balanced = (res && typeof res === 'object' && 'tx' in res) ? res.tx : res;
-            log(`balanceTx out (passthrough): ${describe(balanced)}`);
-            return balanced;
-        },
-        async submitTx(tx) {
-            log(`submitTx in: ${describe(tx)} serialize=${typeof tx?.serialize}`);
-            const serialized = typeof tx?.serialize === 'function' ? tx.serialize() : tx;
-            // The SDK watches by transaction IDENTIFIER, not the serialized tx.
-            // Derive it from the balanced tx (Lace's submitTransaction returns
-            // undefined). Returning the serialized tx here is what produced the
-            // 29KB "txId" → indexer "Failed to fetch".
-            let ids = identifiersFromSerialized(ledger, serialized, log);
-            if ((!ids || !ids.length) && preBalanceIdentifiers?.length) {
-                ids = preBalanceIdentifiers;
-                log(`using pre-balance identifiers as fallback (${ids.length})`);
-            }
-            const txId = ids && ids[0];
-            log(`watch txId: ${txId ?? '(none, watch will fail)'}`);
-            let res;
-            try {
-                res = await api.submitTransaction(serialized);
-            } catch (e) {
-                log(`submitTransaction THREW: name=${e?.name} msg=${e?.message || '(empty)'}`);
-                try { log('  toString: ' + String(e)); } catch {}
-                throw e;
-            }
-            log(`submitTransaction returned: ${describe(res)}`);
-            // submitTx must return a TransactionId. Prefer Lace's return value if
-            // it's a real (short) id string; otherwise the derived identifier.
-            if (typeof res === 'string' && res && res.length < 200) { _lastSubmittedTxId = res; return res; }
-            if (txId) { _lastSubmittedTxId = txId; return txId; }
-            throw new Error('submitTx: could not determine a transaction identifier to watch');
-        }
-    };
-}
-
-/**
- * Assemble providers + load the SDK + set the network + build the wallet adapter
- * and the witness-bound compiled contract. Shared by deploy and call. `witnesses`
- * is the AttestationVault witness object (attester secret, etc.). For deploy it
- * binds the deployer identity, for a call it satisfies the circuit witnesses.
- */
-async function prepareSdkContext(api, witnesses, log) {
-    log('fetching manifest…');
-    const manifest = await fetchManifest();
-
-    log('assembling providers (zk-config from /zk-config, indexer from wallet)…');
-    const { createNightgateConnectorProviders } = await loadBrowserSdk();
-    const providers = await createNightgateConnectorProviders({
-        connector: api,
-        manifest,
-        contract: CONTRACT,
-        // 'wallet' delegates contract proving to the connected wallet's own prover; no local
-        // proof server at all (NIGHTGATE 0.12.1). Opt-in per browser via
-        //   localStorage['nightpass:wallet-prover'] = '1'
-        // because it costs MINUTES of the user's CPU per circuit, versus seconds against the
-        // docker prover. 'wallet' THROWS on a wallet that cannot prove rather than silently
-        // sending the preimage to a server, which is exactly why this is not 'auto'.
-        proving: walletProvingRequested() ? 'wallet' : 'server'
-    });
-    _lastIndexerUri = providers.config?.indexerUri || _lastIndexerUri;
-    log(`indexer: ${providers.config?.indexerUri} (ws ${providers.config?.indexerWsUri})`);
-    log(`prover: ${providers.config?.proverServerUri ?? '(none, wallet-delegated)'}`);
-    log(`wallet: ${providers.walletKeys?.shieldedAddress ?? '(no address)'}`);
-
-    log('loading SDK (contracts + ledger)…');
-    const [contracts, ledger, { Contract }, { CompiledContract }, networkIdMod, proofMod] = await Promise.all([
-        import('@midnight-ntwrk/midnight-js-contracts'),
-        import('@midnight-ntwrk/ledger-v8'),
-        loadVaultContract(),
-        import('@midnight-ntwrk/compact-js'),
-        import('@midnight-ntwrk/midnight-js-network-id'),
-        import('@midnight-ntwrk/midnight-js-http-client-proof-provider')
+async function connectVault(api, contractAddress, log) {
+    _lastSubmittedTxId = null;
+    log('connecting the vault (manifest, zk-config, wallet; the first call downloads ~10MB WASM)…');
+    const [{ connectContract }, { Contract }, walletConfig] = await Promise.all([
+        loadBrowserSdk(), loadVaultContract(), api.getConfiguration()
     ]);
+    _lastIndexerUri = walletConfig?.indexerUri ?? _lastIndexerUri;
+    const vault = await connectContract({
+        connector: api,
+        contract: CONTRACT,
+        contractClass: Contract,
+        manifestUrl: new URL('/contract-manifest', location.origin).href,
+        ...(contractAddress ? { contractAddress } : {}),
+        // 'wallet' throws on a wallet that cannot prove, so private inputs never reach a server unasked.
+        proving: walletProvingRequested() ? 'wallet' : 'server',
+        proofServerUrl: LOCAL_PROVER_URL,
+        ttlMinutes: TX_TTL_MINUTES
+    });
+    log(`network id: ${vault.networkId}, indexer: ${walletConfig?.indexerUri ?? '(not reported)'}`);
+    log(vault.provingModality === 'wallet'
+        ? 'prover: WALLET-DELEGATED (in-wallet prover; expect minutes per circuit)'
+        : `prover: ${LOCAL_PROVER_URL}`);
+    return vault;
+}
 
-    // The SDK keeps the active network as process-global state; every
-    // wallet/contract call reads it via getNetworkId() and throws if unset.
-    // Source it from the connector's own configuration (Lace's network).
-    const networkId = providers.config?.networkId;
-    if (networkId == null) throw new Error('connector did not report a networkId');
-    networkIdMod.setNetworkId(networkId);
-    log(`network id set: ${networkId}`);
-
-    // Wallet modality: the provider assembled above already proves in the wallet, so nothing is
-    // overridden. Server modality: keep pointing at the LOCAL proof server rather than the hosted
-    // one the connector reported (see the LOCAL_PROVER_URL note; the hosted one is CORS-unusable).
-    let proofProvider;
-    if (providers.provingModality === 'wallet') {
-        proofProvider = providers.proofProvider;
-        log('prover: WALLET-DELEGATED (in-wallet WASM prover; expect minutes per circuit)');
-    } else {
-        proofProvider = proofMod.httpClientProofProvider(LOCAL_PROVER_URL, providers.zkConfigProvider);
-        log(`prover override: ${LOCAL_PROVER_URL}`);
-    }
-
-    const walletAdapter = makeConnectorWalletAdapter(api, providers.walletKeys, ledger, log);
-    const fullProviders = {
-        publicDataProvider: providers.publicDataProvider,
-        zkConfigProvider: providers.zkConfigProvider,
-        proofProvider,
-        privateStateProvider: providers.privateStateProvider,
-        walletProvider: walletAdapter,
-        midnightProvider: walletAdapter
-    };
-
-    // midnight-js-contracts@4.1.0 expects a compact-js `CompiledContract`
-    // (tagged + witnesses), not a raw `new Contract(witnesses)` instance. Wrap
-    // our classic compactc artifact: make(tag, ctor) attaches the constructor,
-    // withWitnesses attaches the witnesses, and the SDK then does
-    // `new ctor(witnesses)` internally. (Without this the SDK passes `undefined`
-    // to compact-js getContractContext → "reading 'Symbol()'" crash.)
-    const compiledContract = CompiledContract.withWitnesses(
-        CompiledContract.make(CONTRACT, Contract),
-        witnesses
-    );
-    // AttestationVault has NO contract private state (all ledger is public,
-    // witnesses pass ctx.privateState through). We still must seed a DEFINED
-    // value: deploy, findDeployedContract and the callTx scoped transaction all
-    // read the private state and assertDefined rejects null/undefined. An empty
-    // object satisfies that and flows through the witnesses unchanged.
-    await fullProviders.privateStateProvider.set(PRIVATE_STATE_ID, {});
-
-    return { fullProviders, compiledContract, contracts };
+/** Runs one prepared call ({ circuitId, args, witnesses }) as one transaction. */
+async function runCall(api, contractAddress, call, log) {
+    if (!contractAddress) throw new Error('contractAddress is required (the deployed vault address)');
+    const vault = await connectVault(api, contractAddress, log);
+    log(`submitting ${call.circuitId} (prove + balance + submit via wallet)…`);
+    const tx = await vault.call(call);
+    _lastSubmittedTxId = tx.txHash;
+    log(`submitted ${call.circuitId}: ${tx.txHash}`);
+    return tx;
 }
 
 /**
- * Shared path: assemble providers, find the deployed vault bound with the
- * prepared call's witnesses, and invoke the circuit. `call` comes from one of
- * the prepare* helpers ({ circuitId, args, witnesses }).
+ * Runs prepared calls on one vault as ONE transaction with one wallet approval.
+ * They apply in array order unless `order.independentCalls` is set. A batch the
+ * ledger would refuse fails before proving, with nothing submitted.
  */
-async function runPreparedCall(api, contractAddress, call, log) {
+async function runBatch(api, contractAddress, prepared, attestationSecret, log, order = {}) {
     if (!contractAddress) throw new Error('contractAddress is required (the deployed vault address)');
-    const { fullProviders, compiledContract, contracts } = await prepareSdkContext(api, call.witnesses, log);
-
-    log(`finding deployed contract for ${call.circuitId}…`);
-    const deployed = await contracts.findDeployedContract(fullProviders, {
-        contractAddress, compiledContract,
-        privateStateId: PRIVATE_STATE_ID,
-        initialPrivateState: {}
-    });
-
-    log(`submitting ${call.circuitId} (prove + balance + submit via wallet)…`);
-    const result = await deployed.callTx[call.circuitId](...call.args);
-    log(`submitted ${call.circuitId}: ${JSON.stringify(result?.public?.txId ?? result)}`);
-    return result;
+    const [{ prepareVaultBatch }, vault] = await Promise.all([loadBrowserSdk(), connectVault(api, contractAddress, log)]);
+    const { calls, witnesses } = prepareVaultBatch(prepared, { attestationSecret });
+    const label = calls.map((c) => c.circuitId).join('+');
+    log(`submitting batch [${label}] (ONE prove + balance + submit via wallet)…`);
+    const tx = await vault.batch(calls, { witnesses, ...order });
+    _lastSubmittedTxId = tx.txHash;
+    log(`submitted batch [${label}]: ${tx.txHash}`);
+    return tx;
 }
 
 /**
@@ -505,37 +308,28 @@ async function runPreparedCall(api, contractAddress, call, log) {
  * the deployed contract address. Uses the SAME app-managed attester secret as
  * attest/grant/revoke so the deployer-bound attester identity matches: a vault
  * deployed here can be attested + disclosure-managed by this same wallet.
- *
- * This is also the first real exercise of makeConnectorWalletAdapter's
- * prove→balance→submit path; if deploy lands on-chain the adapter boundary is
- * confirmed and the circuit calls follow the identical wallet round-trip.
  */
 export async function deployVault(api, log = console.log) {
     const L = mklog(log);
-    L('deploy: loading browser SDK (first call downloads ~10MB WASM, please wait)…');
+    L('deploy: loading browser SDK…');
     const { buildAttestationVaultWitnesses } = await loadBrowserSdk();
     L('deploy: deriving app-managed attester secret (binds the deployer identity)…');
     const attestationSecret = await deriveAttesterSecret(api);
-    const witnesses = buildAttestationVaultWitnesses({ attestationSecret });
-    const { fullProviders, compiledContract, contracts } = await prepareSdkContext(api, witnesses, L);
 
-    // Lineage 4 constructor: (registrar, recovery). The deployer's attester
-    // id becomes the registrar; a zero recovery id disables the recovery
-    // modes (a lost registrar key then locks the id registry for good).
+    // Constructor: (registrar, recovery). The deployer's attester id becomes
+    // the registrar. A zero recovery id disables the recovery modes, so a
+    // lost registrar key locks the id registry for good.
     const registrarId = fromHex(await attesterIdOf(api));
     const recoveryId = new Uint8Array(32);
+    const vault = await connectVault(api, undefined, L);
     L(`deploying attestation-vault (registrar ${toHex(registrarId).slice(0, 12)}…, no recovery; prove + balance + submit via wallet)…`);
-    const result = await contracts.deployContract(fullProviders, {
-        compiledContract,
-        privateStateId: PRIVATE_STATE_ID,
-        initialPrivateState: {},
-        args: [registrarId, recoveryId]
+    const tx = await vault.deploy({
+        args: [registrarId, recoveryId],
+        witnesses: buildAttestationVaultWitnesses({ attestationSecret })
     });
-    const addr = result?.deployTxData?.public?.contractAddress
-        ?? result?.public?.contractAddress
-        ?? result?.contractAddress;
-    L(`deployed attestation-vault at: ${addr ?? '(address not found in result)'}`);
-    return { contractAddress: addr, result };
+    _lastSubmittedTxId = tx.txHash;
+    L(`deployed attestation-vault at: ${tx.contractAddress}`);
+    return { contractAddress: tx.contractAddress, result: tx };
 }
 
 function mklog(log) {
@@ -545,11 +339,11 @@ function mklog(log) {
 /** attest(payload_hash, metadata_hash) */
 export async function attest(api, { contractAddress, payloadHash, metadataHash }, log = console.log) {
     const L = mklog(log);
-    L('attest: loading browser SDK (first call downloads ~10MB WASM, please wait)…');
+    L('attest: loading browser SDK…');
     const { prepareAttest } = await loadBrowserSdk();
     L('attest: deriving app-managed attester secret (no wallet popup)…');
     const attestationSecret = await deriveAttesterSecret(api);
-    return runPreparedCall(api, contractAddress, prepareAttest({ payloadHash, metadataHash, attestationSecret }), L);
+    return runCall(api, contractAddress, prepareAttest({ payloadHash, metadataHash, attestationSecret }), L);
 }
 
 /** grantDisclosure(payload_hash, grantee, level): level 0=public,1=legit,2=authority */
@@ -559,7 +353,7 @@ export async function grantDisclosure(api, { contractAddress, payloadHash, grant
     const { prepareGrantDisclosure } = await loadBrowserSdk();
     L('grant: deriving app-managed attester secret (no wallet popup)…');
     const attestationSecret = await deriveAttesterSecret(api);
-    return runPreparedCall(api, contractAddress, prepareGrantDisclosure({ payloadHash, grantee, level, attestationSecret }), L);
+    return runCall(api, contractAddress, prepareGrantDisclosure({ payloadHash, grantee, level, attestationSecret }), L);
 }
 
 /** revokeDisclosure(payload_hash, grantee) */
@@ -569,7 +363,7 @@ export async function revokeDisclosure(api, { contractAddress, payloadHash, gran
     const { prepareRevokeDisclosure } = await loadBrowserSdk();
     L('revoke: deriving app-managed attester secret (no wallet popup)…');
     const attestationSecret = await deriveAttesterSecret(api);
-    return runPreparedCall(api, contractAddress, prepareRevokeDisclosure({ payloadHash, grantee, attestationSecret }), L);
+    return runCall(api, contractAddress, prepareRevokeDisclosure({ payloadHash, grantee, attestationSecret }), L);
 }
 
 // --- Field-bound Predicate (value bound to a SPECIFIC passport field) --------
@@ -594,152 +388,13 @@ export async function revokeDisclosure(api, { contractAddress, payloadHash, gran
  */
 export async function anchorContentRoot(api, { contractAddress, payloadHash, contentRoot, schemaId }, log = console.log) {
     const L = mklog(log);
-    if (!schemaId) throw new Error('anchorContentRoot: schemaId is required (third circuit argument since 0.16.0)');
+    if (!schemaId) throw new Error('anchorContentRoot: schemaId is required (the third circuit argument)');
     L('anchorContentRoot: loading browser SDK…');
-    const { buildAttestationVaultWitnesses } = await loadBrowserSdk();
+    const { prepareAnchorContentRoot } = await loadBrowserSdk();
     L('anchorContentRoot: deriving app-managed attester secret…');
     const attestationSecret = await deriveAttesterSecret(api);
-    const call = {
-        circuitId: 'anchorContentRoot',
-        args: [fromHex(payloadHash), fromHex(contentRoot), fromHex(schemaId)],
-        witnesses: buildAttestationVaultWitnesses({ attestationSecret })
-    };
     L('anchoring content root (binds the passport fields for later field-bound proofs)…');
-    return runPreparedCall(api, contractAddress, call, L);
-}
-
-// --- Batched anchor: attest + anchorContentRoot + bindDocument in ONE tx -----
-// Ported from NIGHTGATE's server-side batch submitter (srv/midnight/
-// batch-segment-order.ts + batch-call-scope.ts, plugin >= 0.10.0).
-// midnight-js-contracts builds each circuit call via
-// Transaction.fromPartsRandomized, which RANDOMIZES the intent's segment id,
-// and the ledger applies merged intents in ascending segment order. A batch of
-// dependent calls (bindDocument asserts the attest) would only land when the
-// dice fell in call order. The fix window: the scope hands the merged tx to
-// the proof provider FIRST, still unbound and unproven, and ledger-v8
-// documents Transaction.intents as writable exactly then. So before proving
-// we reassign the EXISTING segment ids, sorted ascending, to the batch's
-// intents in call order: apply order == call order, deterministically.
-
-const utf8Decoder = new TextDecoder();
-function entryPointName(ep) {
-    if (typeof ep === 'string') return ep;
-    if (ep instanceof Uint8Array) return utf8Decoder.decode(ep);
-    return String(ep ?? '');
-}
-
-/**
- * Rewrite `tx.intents` so the intents matching `circuitsInOrder` (via their
- * first action's entryPoint) carry ascending segment ids in call order. Only
- * the matched intents' own ids are permuted; unmatched intents keep theirs, so
- * nothing can collide with segments added later (fee/dust balancing). Returns
- * true when a rewrite happened; on ANY mismatch the tx is left untouched and
- * false is returned (the wrapper below treats that as fatal for multi-call
- * batches).
- */
-function orderBatchSegments(tx, circuitsInOrder) {
-    const intents = tx?.intents;
-    if (!intents || typeof intents.entries !== 'function') return false;
-    if (circuitsInOrder.length < 2 || intents.size < 2) return false;
-    const entries = Array.from(intents.entries());
-    const pools = new Map();
-    for (const [segId, intent] of entries) {
-        const name = entryPointName(intent?.actions?.[0]?.entryPoint);
-        const pool = pools.get(name);
-        if (pool) pool.push([segId, intent]);
-        else pools.set(name, [[segId, intent]]);
-    }
-    const picked = [];
-    for (const circuit of circuitsInOrder) {
-        const pool = pools.get(circuit);
-        if (!pool || pool.length === 0) return false;
-        picked.push(pool.shift());
-    }
-    const pickedIntents = new Set(picked.map(([, intent]) => intent));
-    const pickedIdsAsc = picked.map(([segId]) => segId).sort((a, b) => a - b);
-    const next = new Map();
-    for (const [segId, intent] of entries) {
-        if (!pickedIntents.has(intent)) next.set(segId, intent);
-    }
-    picked.forEach(([, intent], i) => next.set(pickedIdsAsc[i], intent));
-    if (next.size !== intents.size) return false;
-    tx.intents = next; // ledger-v8 re-computes binding (unbound + unproven only)
-    return true;
-}
-
-/**
- * Wrap a proof provider so `proveTx` first rewrites the batch's segment ids
- * into call order, then delegates. Prototype-preserving (Object.create), so
- * any extra provider surface stays reachable. FAIL-CLOSED for multi-call
- * batches: if the ordering cannot be established the wrapper THROWS before
- * proving, so nothing reaches the chain instead of silently proving in
- * randomized order and risking PARTIAL_SUCCESS with partial on-chain effects.
- */
-function withOrderedBatchSegments(proofProvider, circuitsInOrder) {
-    const wrapped = Object.create(proofProvider);
-    wrapped.proveTx = async (tx, ...rest) => {
-        if (circuitsInOrder.length >= 2) {
-            let ordered = false;
-            try {
-                ordered = orderBatchSegments(tx, circuitsInOrder);
-            } catch (err) {
-                throw new Error(`batch segment ordering failed for [${circuitsInOrder.join('+')}]: ${err?.message ?? err}; ` +
-                    'aborting before proving (nothing submitted) because the deterministic apply order cannot be guaranteed');
-            }
-            if (!ordered) {
-                throw new Error(`batch segment ordering could not match the transaction intents to the call list [${circuitsInOrder.join('+')}]; ` +
-                    'aborting before proving (nothing submitted) because the deterministic apply order cannot be guaranteed');
-            }
-        }
-        return proofProvider.proveTx(tx, ...rest);
-    };
-    return wrapped;
-}
-
-/**
- * Run an ordered list of prepared calls ({ circuitId, args, witnesses })
- * against the SAME vault as ONE transaction: the SDK's
- * withContractScopedTransaction batches the circuit calls and proves,
- * balances and submits ONCE at scope end (one wallet approval). All calls
- * share the first call's witnesses (findDeployedContract binds ONE witness
- * set; the anchor circuits all take just the attester secret). A call may
- * carry an optional `before()` hook, invoked right before its callTx: the
- * proof cart uses it to swap per-call witness data (Merkle proofs) behind
- * the ONE bound witness object. Mirrors NIGHTGATE's runBatchInScope.
- */
-async function runPreparedBatch(api, contractAddress, calls, log) {
-    if (!contractAddress) throw new Error('contractAddress is required (the deployed vault address)');
-    const { fullProviders, compiledContract, contracts } = await prepareSdkContext(api, calls[0].witnesses, log);
-    if (typeof contracts.withContractScopedTransaction !== 'function') {
-        throw new Error('the installed midnight-js SDK has no withContractScopedTransaction; batched call transactions are not supported');
-    }
-    const circuits = calls.map((c) => c.circuitId);
-    log(`finding deployed contract for batch [${circuits.join('+')}]…`);
-    const deployed = await contracts.findDeployedContract(fullProviders, {
-        contractAddress, compiledContract,
-        privateStateId: PRIVATE_STATE_ID,
-        initialPrivateState: {}
-    });
-    for (const c of calls) {
-        if (typeof deployed?.callTx?.[c.circuitId] !== 'function') {
-            throw new Error(`circuit '${c.circuitId}' not found on contract at ${contractAddress}`);
-        }
-    }
-    // Deterministic apply order: only the scope's providers get the wrapped
-    // proof provider (findDeployedContract above proves nothing).
-    const scopedProviders = {
-        ...fullProviders,
-        proofProvider: withOrderedBatchSegments(fullProviders.proofProvider, circuits)
-    };
-    log(`submitting batch [${circuits.join('+')}] (ONE prove + balance + submit via wallet)…`);
-    const finalized = await contracts.withContractScopedTransaction(scopedProviders, async (txCtx) => {
-        for (const c of calls) {
-            if (typeof c.before === 'function') c.before();
-            await deployed.callTx[c.circuitId](txCtx, ...c.args);
-        }
-    }, { scopeName: `batch:${circuits.join('+')}` });
-    log(`submitted batch [${circuits.join('+')}]: ${safeStr(finalized?.public?.txId ?? finalized?.public?.txHash ?? '')}`);
-    return finalized;
+    return runCall(api, contractAddress, prepareAnchorContentRoot({ payloadHash, contentRoot, schemaId, attestationSecret }), L);
 }
 
 /**
@@ -747,26 +402,24 @@ async function runPreparedBatch(api, contractAddress, calls, log) {
  * bindDocument against the same vault, one wallet approval. The call list
  * comes from the shared anchorTxPlan (the same source as the server lanes).
  * bindDocument binds the passportIdHash to this wallet's record and asserts
- * the attest, which is exactly why the deterministic call order above is
- * required. Returns the submit result plus the attester id the record is
- * keyed by.
+ * the attest, so the calls apply in plan order. Returns the submit result
+ * plus the attester id the record is keyed by.
  */
 export async function anchorBatch(api, { contractAddress, payloadHash, metadataHash, passportIdHash, contentRoot, schemaId }, log = console.log) {
     const L = mklog(log);
-    L('anchorBatch: loading browser SDK (first call downloads ~10MB WASM, please wait)…');
-    const { buildAttestationVaultWitnesses } = await loadBrowserSdk();
+    L('anchorBatch: loading browser SDK…');
+    const sdk = await loadBrowserSdk();
     L('anchorBatch: deriving app-managed attester secret (no wallet popup)…');
     const attestationSecret = await deriveAttesterSecret(api);
-    const attesterId = await attesterIdOf(api);
-    const witnesses = buildAttestationVaultWitnesses({ attestationSecret });
+    const attesterId = await sdk.computeAttesterId(attestationSecret);
     const txs = anchorTxPlan({ payloadHash, metadataHash, passportIdHash, ...(contentRoot ? { contentRoot, schemaId } : {}) });
     let last = null;
     for (let i = 0; i < txs.length; i++) {
-        const calls = txs[i].calls.map((c) => ({ circuitId: c.circuit, args: c.args.map((h) => fromHex(h)), witnesses }));
-        L(`anchorBatch: transaction ${i + 1}/${txs.length} [${txs[i].label}] — please approve in your wallet`);
-        last = await runPreparedBatch(api, contractAddress, calls, L);
+        const prepared = txs[i].calls.map((c) => prepareVaultCall(sdk, attestationSecret, c));
+        L(`anchorBatch: transaction ${i + 1}/${txs.length} [${txs[i].label}], please approve in your wallet`);
+        last = await runBatch(api, contractAddress, prepared, attestationSecret, L);
     }
-    return { ...(last && typeof last === 'object' ? last : { result: last }), attesterId };
+    return { ...last, attesterId };
 }
 
 /**
@@ -796,9 +449,9 @@ export async function proveFieldPredicate(api, { contractAddress, payloadHash, a
         attestationSecret
     });
     L(`proving field ${fieldValue} ${opNum === 0 ? '≤' : '≥'} ${threshold}, bound to this passport's content root, value hidden…`);
-    const result = await runPreparedCall(api, contractAddress, call, L);
+    const tx = await runCall(api, contractAddress, call, L);
     L(`✓ field-bound predicate proven on-chain: the passport's own value ${opNum === 0 ? '≤' : '≥'} ${threshold} holds.`);
-    return { ...(result && typeof result === 'object' ? result : { result }), validUntil: until };
+    return { ...tx, validUntil: until };
 }
 
 /**
@@ -815,12 +468,8 @@ export async function proveFieldPredicate(api, { contractAddress, payloadHash, a
  * The claim list is validated/deduped by the shared proofCartPlan (same
  * source the server lane consumes).
  *
- * Witness mechanics: findDeployedContract binds ONE witness object, but each
- * call needs its own Merkle material. All witness functions therefore read a
- * mutable holder, and each call's before() hook (runPreparedBatch) points
- * the holder at that call's pre-converted data. Calls run sequentially
- * inside the scope, and each circuit only invokes the witnesses it
- * declares, so one merged witness object serves mixed carts.
+ * Each claim carries its own Merkle material. The SDK's prepareVaultBatch
+ * puts it behind the one witnesses object a transaction takes.
  *
  * Failure semantics: a claim that does not hold rejects during LOCAL
  * proving ("predicate false" / non-member), so the whole cart aborts with
@@ -831,7 +480,7 @@ export async function proveFieldPredicateBatch(api, { contractAddress, payloadHa
     const L = mklog(log);
     if (!Array.isArray(proofs) || !proofs.length) throw new Error('proveFieldPredicateBatch: proofs must be a non-empty array');
     L('proveFieldPredicateBatch: loading browser SDK…');
-    const { buildAttestationVaultWitnesses } = await loadBrowserSdk();
+    const { prepareProveFieldPredicate, prepareProveFieldMembership } = await loadBrowserSdk();
     L('proveFieldPredicateBatch: deriving app-managed attester secret…');
     const attestationSecret = await deriveAttesterSecret(api);
     // The claims name the RECORD (attester + payload); the passport's stamped
@@ -843,69 +492,36 @@ export async function proveFieldPredicateBatch(api, { contractAddress, payloadHa
         : { fieldKey: p.fieldKey, threshold: p.threshold, op: Number(p.op) });
     const plan = proofCartPlan({ recordKey, claims: proofs.map(planClaimOf), ...(validUntil ? { validUntil: Number(validUntil) } : {}) });
     if (plan.dropped.length) L(`proveFieldPredicateBatch: dropped ${plan.dropped.length} duplicate claim(s) (already in the cart)`);
-    // Pre-convert each kept claim's witness data; the holder swaps between
-    // calls. Claims were deduped by their canonical claim key, so matching
-    // the original proofs entry by the same key is unambiguous.
+    // Claims were deduped by their canonical claim key, so matching the
+    // original proofs entry by the same key is unambiguous. The helpers
+    // refuse a claim without its salt, digest or full-depth paths.
     const byKey = new Map(proofs.map((p) => [claimKey(planClaimOf(p)), p]));
-    const converted = plan.claims.map((c) => {
+    const prepared = plan.claims.map((c) => {
         const src = byKey.get(claimKey(c));
         if (!src) throw new Error(`no inclusion proof supplied for claim on field key ${c.fieldKey.slice(0, 16)}…`);
-        const siblings = (src.siblings || []).map((h) => fromHex(h));
-        const dirs = (src.dirs || []).map(Boolean);
-        if (siblings.length !== 4 || dirs.length !== 4) {
-            throw new Error('each proof needs a depth-4 inclusion proof (4 siblings + 4 dirs)');
-        }
-        // Salted leaves: every field-bound circuit recomputes the leaf from
-        // value + SALT, so a cart item without its slot salt can only fail at
-        // proving time, minutes in.
-        if (!src.fieldSalt) throw new Error('each proof needs its fieldSalt (salted leaves)');
-        const fieldSalt = fromHex(src.fieldSalt);
+        const base = { recordKey, fieldKey: c.fieldKey, validUntil: plan.validUntil, attestationSecret };
+        const path = { fieldSalt: src.fieldSalt, siblings: src.siblings, dirs: src.dirs };
         if (c.kind === 'membership') {
-            const setSiblings = (src.setSiblings || []).map((h) => fromHex(h));
-            const setDirs = (src.setDirs || []).map(Boolean);
-            if (setSiblings.length !== 6 || setDirs.length !== 6) {
-                throw new Error('each membership proof needs a depth-6 set inclusion proof (6 siblings + 6 dirs)');
-            }
-            if (!src.fieldDigest) throw new Error('each membership proof needs the fieldDigest (blake2b-256 of the exact value)');
-            return { fieldDigest: fromHex(src.fieldDigest), fieldSalt, siblings, dirs, setSiblings, setDirs };
+            return prepareProveFieldMembership({
+                ...base, setRoot: c.setRoot,
+                merkleProof: { ...path, fieldDigest: src.fieldDigest, setProof: { siblings: src.setSiblings, dirs: src.setDirs } }
+            });
         }
-        return { fieldValue: BigInt(src.fieldValue), fieldSalt, siblings, dirs };
+        return prepareProveFieldPredicate({
+            ...base, threshold: BigInt(c.threshold), op: c.op,
+            merkleProof: { ...path, fieldValue: String(src.fieldValue) }
+        });
     });
-    const holder = { current: null };
-    // Base witnesses carry the attester secret; the Merkle witnesses read the
-    // holder so ONE bound witness object serves every call's distinct proof.
-    // Each circuit only invokes the witnesses it declares (predicate:
-    // field_value; membership: field_digest + set_*; both: merkle_*).
-    const witnesses = {
-        ...buildAttestationVaultWitnesses({ attestationSecret }),
-        field_value: (ctx) => [ctx.privateState, holder.current.fieldValue],
-        field_salt: (ctx) => [ctx.privateState, holder.current.fieldSalt],
-        merkle_siblings: (ctx) => [ctx.privateState, holder.current.siblings],
-        merkle_dirs: (ctx) => [ctx.privateState, holder.current.dirs],
-        field_digest: (ctx) => [ctx.privateState, holder.current.fieldDigest],
-        set_siblings: (ctx) => [ctx.privateState, holder.current.setSiblings],
-        set_dirs: (ctx) => [ctx.privateState, holder.current.setDirs]
-    };
-    const calls = plan.calls.map((c, i) => ({
-        circuitId: c.circuit,
-        // Per-circuit arg conversion: predicate = 2 hex + 3 BigInt (threshold,
-        // op, valid_until), membership = 3 hex (recordKey, fieldKey, setRoot)
-        // + valid_until.
-        args: c.circuit === 'proveFieldMembership'
-            ? [fromHex(c.args[0]), fromHex(c.args[1]), fromHex(c.args[2]), BigInt(c.args[3])]
-            : [fromHex(c.args[0]), fromHex(c.args[1]), BigInt(c.args[2]), BigInt(c.args[3]), BigInt(c.args[4])],
-        witnesses,
-        before: () => { holder.current = converted[i]; }
-    }));
-    L(`proveFieldPredicateBatch: ${calls.length} proof(s) in one tx (proving runs once per claim, please wait)…`);
-    const result = await runPreparedBatch(api, contractAddress, calls, L);
-    L(`✓ ${calls.length} field-bound claim(s) proven on-chain in one transaction, values hidden.`);
-    return { ...(result && typeof result === 'object' ? result : { result }), claims: plan.claims, dropped: plan.dropped, validUntil: plan.validUntil };
+    L(`proveFieldPredicateBatch: ${prepared.length} proof(s) in one tx (proving runs once per claim, please wait)…`);
+    // The claims write distinct keys, so the batch may group them by execution stage.
+    const tx = await runBatch(api, contractAddress, prepared, attestationSecret, L, { independentCalls: true });
+    L(`✓ ${prepared.length} field-bound claim(s) proven on-chain in one transaction, values hidden.`);
+    return { ...tx, claims: plan.claims, dropped: plan.dropped, validUntil: plan.validUntil };
 }
 
 // --- On-chain verification (indexer scan) -----------------------------------
 // The verification model is indexer-trust: a tx that landed in a block with
-// status SUCCESS is confirmed. Polls the Preview indexer (HTTP GraphQL) for the
+// status SUCCESS is confirmed. Polls the indexer (HTTP GraphQL) for the
 // transaction by its identifier and reports status via onStatus(kind, text):
 //   'scanning' (in progress) | 'ok' (found, SUCCESS) | 'fail' (failed / not found).
 const VERIFY_TX_QUERY = `query VerifyTx($offset: TransactionOffset!) {

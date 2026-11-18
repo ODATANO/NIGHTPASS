@@ -164,16 +164,13 @@ describe('buildContentRoot (v4 salted)', () => {
     });
 });
 
-// Golden vector against NIGHTGATE's OWN document-proof builder: our tree is a
-// field-registry-specific twin of it, and a byte-level drift would only show
+// Golden vector against the contract kit's document-proof builder: our tree is
+// a field-registry-specific twin of it, and a byte-level drift would only show
 // up as claims failing at local proving time (minutes of wasted proving, then
-// an opaque abort). The package does not export the module, so it is required
-// by absolute path (the deep-import trap: `exports` does not cover it).
+// an opaque abort).
 describe('parity with NIGHTGATE buildDocumentContentRoot', () => {
     it('produces the same root, schema id and opening for the same seed', async () => {
-        const require_ = createRequire(import.meta.url);
-        const pkgRoot = path.dirname(require_.resolve('@odatano/nightgate/package.json'));
-        const ng = require_(path.join(pkgRoot, 'srv', 'submission', 'document-proof.js'));
+        const ng = await import('@odatano/contract-kit');
 
         const values = { ...NUMERIC_VALUES, cellChemistry: 'Li-ion NMC' };
         const specs = PROVABLE_FIELDS.map((f) => (

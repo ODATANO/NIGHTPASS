@@ -1,4 +1,3 @@
-import cds from '@sap/cds';
 import { anchorTxPlan } from './anchor-plan';
 import type { ChainLane } from './chain-lane';
 import { randomBytes } from 'node:crypto';
@@ -25,47 +24,9 @@ const detachedRequestScope = new AsyncResource('nightpass.detached-service-call'
  * transaction-log rows via the `onStep` hook.
  */
 
-/**
- * The Midnight network this server effectively runs on. Same precedence as the
- * NIGHTGATE plugin and the /runtime-config endpoint: env override first, then
- * cds.requires.nightgate.network. Rows store this at anchor time so a verifier
- * can tell a cross-network anchor from a failed ledger read.
- */
+/** The Midnight network this server works on (`NIGHTGATE_NETWORK`, default preprod). Rows store it at anchor time. */
 export function effectiveNetwork(): string {
-    const cfg = ((cds.env as unknown as Record<string, any>).requires?.nightgate ?? {}) as { network?: string };
-    return process.env.NIGHTGATE_NETWORK?.trim() || cfg.network || 'preprod';
-}
-
-/**
- * Whether NIGHTGATE runs its block crawler. Mirrors the plugin's own resolution
- * (env `NIGHTGATE_CRAWLER_ENABLED` overrides `cds.requires.nightgate.crawler.enabled`,
- * with false/0/no/off read as off).
- */
-export function crawlerEnabled(): boolean {
-    const env = process.env.NIGHTGATE_CRAWLER_ENABLED?.trim();
-    if (env != null && env !== '') return !/^(false|0|no|off)$/i.test(env);
-    const cfg = ((cds.env as unknown as Record<string, any>).requires?.nightgate?.crawler ?? {}) as { enabled?: boolean };
-    return cfg.enabled === true;
-}
-
-/**
- * Whether NIGHTGATE can advance a job's `chainStatus` past `pending` at all, i.e.
- * whether waiting on chain success can ever succeed. Two sources exist:
- *   - the block crawler (populates Transactions/TransactionResults), or
- *   - the crawler-free chain-outcome confirmer (NIGHTGATE >= 0.9.2, a per-tx
- *     indexer lookup; defaults ON when the crawler is off, opt out with
- *     `NIGHTGATE_CRAWLERLESS_CHAIN_CONFIRM=false` / `crawlerlessChainConfirm:false`).
- * Mirrors the plugin's `resolveCrawlerlessChainConfirmEnabled`. When neither runs
- * (crawler off AND confirmer opted out) chainStatus stays pending forever, so a
- * caller must not block on it (see waitForJobResult).
- */
-export function chainConfirmationAvailable(): boolean {
-    if (crawlerEnabled()) return true;
-    const env = process.env.NIGHTGATE_CRAWLERLESS_CHAIN_CONFIRM?.trim();
-    if (env != null && env !== '') return !/^(false|0|no|off)$/i.test(env);
-    const cfg = ((cds.env as unknown as Record<string, any>).requires?.nightgate ?? {}) as { crawlerlessChainConfirm?: boolean };
-    if (typeof cfg.crawlerlessChainConfirm === 'boolean') return cfg.crawlerlessChainConfirm;
-    return true; // crawler off + no opt-out: the 0.9.2 confirmer runs by default
+    return process.env.NIGHTGATE_NETWORK?.trim() || 'preprod';
 }
 
 /** Public explorer URL of a transaction on the given network (both testnets exist). */
@@ -94,8 +55,8 @@ function parseNetMap(envName: string): Record<string, string> {
  * `PASSPORT_VERIFY_PEERS=preprod=http://localhost:4005,mainnet=https://...`.
  * Each peer is a second instance of this very app configured for that network
  * (shared or synced DB); verifyOnChain delegates cross-network rows to it
- * server-side over its public API. Fallback only: NIGHTGATE's native `network`
- * override on the verify surface wins whenever the loaded plugin has it.
+ * server-side over its public API. Fallback only: the verify service's own
+ * `network` parameter is used whenever the record can be named.
  */
 export function verifyPeers(): Record<string, string> {
     return parseNetMap('PASSPORT_VERIFY_PEERS');
@@ -136,7 +97,7 @@ export { sortKeys, canonicalize, blake2b256Hex, hashPayload };
 // passport field by recomputing a Merkle leaf and folding an inclusion path up
 // to a root anchored on-chain (`anchorContentRoot`). We build that same tree
 // off-chain here using the contract's EXPORTED pure circuits
-// (`@odatano/nightgate/browser/attestation-vault` → pureCircuits.leafHash /
+// (`@odatano/nightgate-tx/attestation-vault` → pureCircuits.leafHash /
 // nodeHash), so the off-chain root is byte-identical to the in-circuit one.
 //
 // Layout: a fixed depth-4 tree (16 leaves). Leaf i holds the i-th field of the
@@ -170,7 +131,7 @@ export interface VaultPureCircuits {
 let _pureCircuitsPromise: Promise<VaultPureCircuits> | null = null;
 export async function loadPureCircuits(): Promise<VaultPureCircuits> {
     if (!_pureCircuitsPromise) {
-        _pureCircuitsPromise = import('@odatano/nightgate/browser/attestation-vault')
+        _pureCircuitsPromise = import('@odatano/nightgate-tx/attestation-vault')
             .then((m: any) => m.pureCircuits);
     }
     return _pureCircuitsPromise;
@@ -432,160 +393,15 @@ export function decryptPayload(cipher: Buffer | Uint8Array, passportId: string):
     return sdkDecryptPayload(cipher, passportId, encryptionMasterKey());
 }
 
-// --- NIGHTGATE job polling ---------------------------------------------------
+// --- Detached work -----------------------------------------------------------
 
 /**
- * Run `fn` with the ambient CAP transaction context cleared.
- *
- * Every NIGHTGATE job flow (send the action, then poll getJobStatus) MUST run
- * outside the calling request's transaction. NIGHTGATE detaches its job work
- * to cds.spawn, and that work needs a free pooled connection plus (on SQLite)
- * the single write lock. A caller that keeps its own request tx open while
- * waiting inline starves exactly the job it is waiting on: the job can only
- * start once the caller times out and releases the connection. Diagnosed
- * live: "10-15 minutes per anchor step" was precisely the caller's own
- * waitForJob timeout; the attest itself completes in seconds once the job
- * is allowed to start.
+ * Run `fn` with the ambient CAP transaction context cleared. Chain work
+ * takes minutes, and a request transaction held open that long starves the
+ * writes of the work it waits for.
  */
 export function detachedFromRequest<T>(fn: () => Promise<T>): Promise<T> {
     return detachedRequestScope.runInAsyncScope(fn);
-}
-
-/**
- * `srv.send` with NO ambient transaction at all, but WITH the caller's user
- * identity carried explicitly on the request.
- *
- * Why not `srv.tx({user}, ...)`: that wrapper holds a root tx (and, after the
- * handler's first INSERT, the sqlite write lock) for the whole action call.
- * NIGHTGATE commits its BackgroundJobs row DETACHED inside startJob,
- * on a second connection, synchronously within the same handler: with a
- * write-holding wrapper both sides wait on each other until the busy timeout
- * fires as "database is locked". So the context is cleared (every db.run in
- * the handler becomes its own short tx) and the user rides on the request
- * itself, which keeps NIGHTGATE's session-to-userId binding satisfied.
- */
-export function sendDetached(nightgate: cds.Service, action: string, args: Record<string, unknown>, user?: unknown): Promise<any> {
-    return detachedFromRequest(() =>
-        (nightgate as any).send({ event: action, data: args, user }) as Promise<any>);
-}
-
-/**
- * Poll a NIGHTGATE async job to completion and return its parsed result
- * object. With `requireChainSuccess`, workflow completion alone is not enough:
- * polling continues until NIGHTGATE has indexed the canonical chain outcome.
- * Each poll runs in its own short root tx so it sees committed status updates.
- *
- * Chain-success enforcement applies whenever NIGHTGATE can advance `chainStatus`
- * at all: with the block crawler, or with the crawler-free confirmer (>= 0.9.2,
- * on by default when the crawler is off). Only when neither runs would the status
- * never arrive; there the server-side workflow `succeeded` is accepted and the
- * anchor is confirmed via verifyAttestationState instead.
- */
-export async function waitForJobResult(
-    nightgate: cds.Service,
-    jobId: string,
-    sessionId: string,
-    user?: unknown,
-    options: { requireChainSuccess?: boolean; pollIntervalMs?: number; timeoutMs?: number } = {}
-): Promise<any> {
-    const pollIntervalMs = options.pollIntervalMs ?? 5000;
-    // 10 minutes by default, which covers an anchor batch. Proving is the leg
-    // that outgrows it: a multi-claim proof cart runs one ZK proof per claim,
-    // and in-process (wasm) proving is several minutes each, so those callers
-    // pass a budget scaled to the claim count.
-    const timeoutMs = options.timeoutMs ?? 600_000;
-    const attempts = Math.max(1, Math.ceil(timeoutMs / pollIntervalMs));
-    // Only wait on chainStatus when NIGHTGATE can actually advance it.
-    const enforceChain = options.requireChainSuccess === true && chainConfirmationAvailable();
-    for (let i = 0; i < attempts; i++) {
-        const job: any = await sendDetached(nightgate, 'getJobStatus', { jobId, sessionId }, user);
-        if (job.status === 'succeeded') {
-            if (enforceChain) {
-                if (job.chainStatus === 'failure') {
-                    const handle = job.txHash || job.submissionId || 'no submission handle persisted';
-                    throw new Error(`chain execution failed (${handle}): CHAIN_EXECUTION_FAILED`);
-                }
-                // `succeeded` only describes NIGHTGATE's server-side workflow.
-                // A submitted transaction remains pending until the indexer has
-                // observed its canonical System.Events outcome.
-                if (job.chainStatus !== 'success') {
-                    await new Promise(r => setTimeout(r, pollIntervalMs));
-                    continue;
-                }
-            }
-            if (!job.result) return {};
-            return typeof job.result === 'string' ? JSON.parse(job.result) : job.result;
-        }
-        if (job.status === 'failed') {
-            throw new Error(`job failed: ${job.errorCode ?? ''} ${job.errorMessage ?? ''}`.trim());
-        }
-        if (job.status === 'reconciliation_required') {
-            const handle = job.txHash || job.submissionId || 'no submission handle persisted';
-            throw new Error(
-                `job requires reconciliation (${handle}): ` +
-                `${job.errorCode ?? ''} ${job.errorMessage ?? ''}`.trim()
-            );
-        }
-        await new Promise(r => setTimeout(r, pollIntervalMs));
-    }
-    throw new Error(`job ${jobId} did not complete within timeout`);
-}
-
-/**
- * waitForJobResult narrowed to the common case: the job result's top-level
- * tx hash. NOT suitable for `issueFieldPredicateAttestation`, whose result is
- * a PAC envelope carrying the hash at `proof.proofValue` instead.
- */
-export async function waitForJob(nightgate: cds.Service, jobId: string, sessionId: string, user?: unknown): Promise<string> {
-    const result = await waitForJobResult(nightgate, jobId, sessionId, user, { requireChainSuccess: true });
-    const txHash = result.txHash ?? result.txId;
-    if (!txHash) throw new Error(`chain job ${jobId} succeeded without a transaction hash`);
-    return String(txHash);
-}
-
-/**
- * Run one chain step (send + poll) with a bounded retry on Substrate 1014.
- * Used by the anchor sequence below AND by the proof paths in
- * ProducerService: both submit back-to-back calls from the same wallet.
- *
- * Back-to-back contract calls from the same wallet can race the wallet's own
- * dust-state update: the next tx balances against a dust note the previous tx
- * just spent, and the node rejects the submission as invalid (1014). The
- * wallet state settles as soon as its indexer stream delivers the previous
- * block, so a short backoff plus a freshly built tx resolves it. Only 1014 is
- * retried: that code means the pool rejected the tx outright, so a retry can
- * never double-anchor.
- */
-export async function runChainStep<T>(kind: string, fn: () => Promise<T>): Promise<T> {
-    let lastErr: unknown;
-    for (let attempt = 0; attempt < 3; attempt++) {
-        if (attempt > 0) await new Promise(r => setTimeout(r, 15_000));
-        try { return await fn(); }
-        catch (e) {
-            lastErr = e;
-            const msg = String((e as Error)?.message ?? e);
-            // Retryable, and only these:
-            //   1014      the pool rejected the tx outright (wallet dust state
-            //             settling),
-            //   1010/170  InvalidDustSpendProof: the dust note this tx spends
-            //             moved between build and submit. Hit reliably on the
-            //             SECOND transaction of the split anchor, which is
-            //             built right after the first one spent dust. A retry
-            //             rebuilds against fresh dust state.
-            //   sqlite write contention (a facade-persist of the multi-MB dust
-            //             blob can hold the write lock past the busy timeout).
-            // All three are provably pre-mempool, so a retry can never
-            // double-anchor. Deliberately NOT retried: 1010/188 (the ledger's
-            // sequencing check) is deterministic for a given batch shape, so
-            // retrying only burns proving time; and upstream HTTP 4xx, whose
-            // 'Received status code 4xx' string is the GraphQL client's generic
-            // error for EVERY indexer call, including reads AFTER the node
-            // accepted the tx, so retrying could resubmit a landed tx.
-            if (!/\b1014\b|\b1010\/170\b|database is locked/i.test(msg)) break;
-            cds.log('producer').warn(`${kind} hit a retryable error (${msg.slice(0, 60)}), retrying...`);
-        }
-    }
-    throw new Error(`${kind}: ${String((lastErr as Error)?.message ?? lastErr)}`);
 }
 
 // --- On-chain anchor sequence ------------------------------------------------
@@ -618,7 +434,7 @@ export interface AnchorOpts {
     onStep?: (step: AnchorStep) => Promise<void> | void;
 }
 
-/** The consolidated contract shipped by the plugin, also served by the hosted API. */
+/** The vault contract's registered name on the NIGHTGATE API. */
 export const CONTRACT_REF = 'attestation-vault';
 
 /**
@@ -642,7 +458,7 @@ export async function anchorPassport(lane: ChainLane, opts: AnchorOpts): Promise
     });
     let attestationTxHash = '';
     for (const tx of txPlan) {
-        const { txHash, jobId } = await lane.submitAnchorTx({ contractAddress, tx });
+        const { txHash, jobId } = await lane.submitVaultTx({ contractAddress, tx });
         if (!attestationTxHash) attestationTxHash = txHash;
         for (const c of tx.calls) {
             await onStep?.({ kind: c.circuit as AnchorStep['kind'], jobId, txHash });

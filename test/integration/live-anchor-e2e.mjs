@@ -1,68 +1,36 @@
-// Live on-chain e2e against a RUNNING NIGHTPASS server (real wallet, any network).
+// Live on-chain anchor e2e against a RUNNING NIGHTPASS server.
 //
-//   npm start                                      (terminal 1, cds-tsx serve)
+//   npm start                                                   (terminal 1)
 //   node --env-file=.env test/integration/live-anchor-e2e.mjs   (terminal 2)
 //
-// Two phases, selected by PASSPORT_CONTRACT_ADDRESS:
+// The server signs with its default server wallet and hands the anchor to the
+// NIGHTGATE API. It needs NIGHTGATE_API_URL, NIGHTGATE_AGENT_TOKEN,
+// PASSPORT_CONTRACT_ADDRESS and PRODUCER_WALLET_MNEMONIC.
 //
-// Phase A (PASSPORT_CONTRACT_ADDRESS unset): wallet bring-up + contract deploy.
-//   connectWallet -> connectWalletForSigning (await prewarm job) ->
-//   registerForDustGeneration (poll; waits only if new UTXOs were registered) ->
-//   deployContract(attestation-vault) -> prints the contract address.
-//   Put that address into .env as PASSPORT_CONTRACT_ADDRESS, restart the
-//   server, then run this script again for Phase B.
-//
-// Phase B (PASSPORT_CONTRACT_ADDRESS set): the actual passport anchor test.
-//   connectWallet -> connectWalletForSigning (warm restore) ->
-//   producer/createPassport(submit:true) returns mode=anchoring immediately;
-//   the server anchors DETACHED (attest + bindPassport + contentRoot). This
-//   script then polls the Passports row until status=anchored, prints the
-//   per-step tx log, and crawler-free-confirms via verifyAttestationState.
-//
-// Env knobs:
-//   NIGHTPASS_BASE            default http://localhost:4004
-//   LACE_VIEWING_KEY          required (wallet viewing key)
-//   LACE_MNEMONIC             required (BIP39 phrase; server does HD derivation)
-//   LIVE_SKIP_DUST=1          skip dust registration (already registered)
-//   LIVE_DUST_WAIT_SECONDS    default 120, wait after a fresh registration
-//   LIVE_PREWARM_TIMEOUT_MIN  default 240 (cold sync upper bound)
-
-// createPassport now returns immediately (the anchor runs detached), but the
-// prewarm/getJobStatus polls can still be slow calls on a busy server. Disable
-// undici's dispatcher-level 5 min headersTimeout so no long response gets
-// killed regardless of the per-request AbortSignal (same workaround as
-// NIGHTGATE's run-deploy-e2e.mjs).
-import { Agent, setGlobalDispatcher } from 'undici';
-setGlobalDispatcher(new Agent({ headersTimeout: 0, bodyTimeout: 0, connectTimeout: 30_000 }));
+// Env of this script:
+//   NIGHTPASS_BASE     default http://localhost:4004
+//   NIGHTGATE_API_URL  required; its public verify service confirms the anchor
 
 const BASE = process.env.NIGHTPASS_BASE || 'http://localhost:4004';
-const NG = `${BASE}/api/v1/nightgate`;
 const PROD = `${BASE}/api/v1/producer`;
-const VK = process.env.LACE_VIEWING_KEY;
-const MNEMONIC = (process.env.LACE_MNEMONIC || '').trim();
-const CONTRACT = (process.env.PASSPORT_CONTRACT_ADDRESS || '').trim();
-const SKIP_DUST = process.env.LIVE_SKIP_DUST === '1';
-const DUST_WAIT_S = parseInt(process.env.LIVE_DUST_WAIT_SECONDS || '120', 10);
-const PREWARM_TIMEOUT_MS = parseInt(process.env.LIVE_PREWARM_TIMEOUT_MIN || '240', 10) * 60_000;
+const API = (process.env.NIGHTGATE_API_URL || '').trim().replace(/\/$/, '');
 const POLL_MS = 5000;
 
-// NIGHTPASS runs custom auth (srv/auth.js); nightgate wallet actions require an
-// authenticated user and producer actions require the producer role.
+// NIGHTPASS runs custom auth (srv/auth.js); producer actions require the producer role.
 const AUTH = 'Basic ' + Buffer.from('producer:producer').toString('base64');
 
 function fail(msg) { console.error(`\nFAIL ${msg}`); process.exit(1); }
 function step(name) { console.log(`\n--- ${name} ---`); }
 function pretty(o) { return JSON.stringify(o, null, 2); }
 
-if (!VK) fail('LACE_VIEWING_KEY env var is required (run with node --env-file=.env)');
-if (!MNEMONIC) fail('LACE_MNEMONIC env var is required (run with node --env-file=.env)');
+if (!API) fail('NIGHTGATE_API_URL env var is required (run with node --env-file=.env)');
 
-async function post(base, path, body, timeoutMs = 30 * 60_000) {
+async function post(base, path, body) {
     const r = await fetch(`${base}${path}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: AUTH },
         body: JSON.stringify(body),
-        signal: AbortSignal.timeout(timeoutMs)
+        signal: AbortSignal.timeout(120_000)
     });
     const text = await r.text();
     let parsed;
@@ -70,117 +38,37 @@ async function post(base, path, body, timeoutMs = 30 * 60_000) {
     return { status: r.status, body: parsed };
 }
 
-async function get(base, path) {
-    const r = await fetch(`${base}${path}`, { headers: { Authorization: AUTH } });
-    if (!r.ok) fail(`GET ${path} -> ${r.status}: ${await r.text()}`);
+async function get(url, headers = { Authorization: AUTH }) {
+    const r = await fetch(url, { headers, signal: AbortSignal.timeout(120_000) });
+    if (!r.ok) fail(`GET ${url} -> ${r.status}: ${await r.text()}`);
     return r.json();
 }
 
-async function pollJob(sessionId, jobId, label, timeoutMs = PREWARM_TIMEOUT_MS, requireChainSuccess = false) {
-    const deadline = Date.now() + timeoutMs;
-    let last = null;
-    while (Date.now() < deadline) {
-        const r = await post(NG, '/getJobStatus', { jobId, sessionId }, 120_000);
-        if (r.status !== 200) fail(`getJobStatus(${jobId}) -> HTTP ${r.status}: ${pretty(r.body)}`);
-        const { status, chainStatus, result, errorCode, errorMessage } = r.body;
-        if (status !== last) { process.stdout.write(`\n     [${label}] ${jobId.slice(0, 8)} status=${status}`); last = status; }
-        else process.stdout.write('.');
-        if (status === 'succeeded' && requireChainSuccess && chainStatus === 'failure') {
-            process.stdout.write('\n'); fail(`[${label}] canonical chain execution failed`);
-        }
-        if (status === 'succeeded' && (!requireChainSuccess || chainStatus === 'success')) {
-            process.stdout.write('\n'); return result ? JSON.parse(result) : {};
-        }
-        if (status === 'failed') { process.stdout.write('\n'); fail(`[${label}] job ${jobId} failed: ${errorCode} - ${errorMessage}`); }
-        if (status === 'reconciliation_required') {
-            process.stdout.write('\n');
-            fail(`[${label}] job ${jobId} requires reconciliation: ${errorCode} - ${errorMessage}`);
-        }
-        await new Promise(r2 => setTimeout(r2, POLL_MS));
-    }
-    fail(`[${label}] job ${jobId} did not finish within ${timeoutMs / 1000}s`);
-}
-
 async function waitForServer() {
-    step('Waiting for NIGHTPASS server');
-    const deadline = Date.now() + 60_000;
-    while (Date.now() < deadline) {
+    step(`Waiting for NIGHTPASS at ${BASE}`);
+    for (let i = 0; i < 60; i++) {
         try {
-            const r = await fetch(`${BASE}/api/v1/indexer/getHealth()`, { headers: { Authorization: AUTH } });
-            if (r.ok) { console.log(`OK   server up: ${JSON.stringify(await r.json())}`); return; }
-        } catch { /* not up yet */ }
-        await new Promise(r => setTimeout(r, 1000));
+            const r = await fetch(`${PROD}/listServerWallets()`, { headers: { Authorization: AUTH } });
+            if (r.ok) {
+                const wallets = (await r.json()).value ?? [];
+                console.log(`OK   server up, wallets: ${wallets.map((w) => `${w.id}${w.signingReady ? '' : ' (no secret)'}`).join(', ') || '(none)'}`);
+                return;
+            }
+        } catch { /* booting */ }
+        await new Promise((r2) => setTimeout(r2, 2000));
     }
-    fail(`server at ${BASE} did not respond within 60s (start it with: npm start)`);
+    fail('server did not come up within 2 minutes');
 }
 
-async function connectSigningSession() {
-    step('connectWallet (read-only session)');
-    let r = await post(NG, '/connectWallet', { viewingKey: VK }, 120_000);
-    if (r.status !== 200 && r.status !== 201) fail(`connectWallet -> HTTP ${r.status}: ${pretty(r.body)}`);
-    const sessionId = r.body?.sessionId;
-    if (!sessionId) fail(`connectWallet returned no sessionId: ${pretty(r.body)}`);
-    console.log(`OK   sessionId = ${sessionId}`);
-
-    step('connectWalletForSigning (mnemonic; kicks off facade prewarm)');
-    r = await post(NG, '/connectWalletForSigning', { sessionId, mnemonic: MNEMONIC }, 10 * 60_000);
-    if (r.status !== 200 && r.status !== 201) fail(`connectWalletForSigning -> HTTP ${r.status}: ${pretty(r.body)}`);
-    console.log(`OK   signing enabled: ${pretty(r.body)}`);
-
-    const prewarmJobId = r.body?.prewarmJobId;
-    if (prewarmJobId) {
-        step(`Waiting for prewarm ${prewarmJobId.slice(0, 8)} (warm restore expected; cold sync can take hours)`);
-        await pollJob(sessionId, prewarmJobId, 'prewarm');
-        console.log('OK   facade prewarm complete');
-    } else {
-        console.log('WARN no prewarmJobId - first action pays sync cost inline');
-    }
-    return sessionId;
-}
-
-async function phaseA(sessionId) {
-    if (!SKIP_DUST) {
-        step('registerForDustGeneration');
-        const r = await post(NG, '/registerForDustGeneration', { sessionId, dustReceiverAddress: '' }, 10 * 60_000);
-        if (r.status !== 200 && r.status !== 201) fail(`registerForDustGeneration -> HTTP ${r.status}: ${pretty(r.body)}`);
-        const reg = await pollJob(sessionId, r.body.jobId, 'dust-reg', PREWARM_TIMEOUT_MS, true);
-        console.log(`OK   result: ${pretty(reg)}`);
-        if (reg.registeredCount > 0) {
-            step(`Waiting ${DUST_WAIT_S}s for first DUST accrual`);
-            await new Promise(r2 => setTimeout(r2, DUST_WAIT_S * 1000));
-        } else {
-            console.log('     no UTXOs needed registering; DUST already accruing.');
-        }
-    }
-
-    step('deployContract(attestation-vault)');
-    const r = await post(NG, '/deployContract', {
-        compiledArtifactRef: 'attestation-vault', sessionId, initialPrivateState: '{}'
-    }, 10 * 60_000);
-    if (r.status >= 400) fail(`deployContract -> HTTP ${r.status}: ${pretty(r.body)}`);
-    const dep = await pollJob(sessionId, r.body.jobId, 'deploy', PREWARM_TIMEOUT_MS, true);
-    console.log(`OK   result: ${pretty(dep)}`);
-    if (!dep.contractAddress) fail(`deploy returned no contractAddress: ${pretty(dep)}`);
-
-    console.log('\nPHASE A PASSED. AttestationVault deployed on preprod.');
-    console.log(`Tx hash:          ${dep.txHash}`);
-    console.log(`Contract address: ${dep.contractAddress}`);
-    console.log('\nNext: add to .env ->');
-    console.log(`PASSPORT_CONTRACT_ADDRESS=${dep.contractAddress}`);
-    console.log('then restart the server and re-run this script for Phase B.');
-}
-
-async function phaseB(sessionId) {
+async function anchor() {
     // runTag makes BOTH the passportId AND the private payload unique per run.
-    // The payload hash is computed over the batteries/recycledMaterials/
-    // diligenceDocs content only; a constant payload would hit the vault's
-    // "already attested" assert on every run after the first.
+    // The payload hash covers the child rows only, and a constant payload
+    // would hit the vault's "already attested" assert on every later run.
     const runTag = new Date().toISOString().slice(0, 19).replace(/[-:T]/g, '');
     const passportId = `BAT-LIVE-${runTag}`;
     step(`createPassport(${passportId}, submit:true) - server anchors detached`);
     const r = await post(PROD, '/createPassport', {
         submit: true,
-        sessionId,
         passportJson: JSON.stringify({
             passportId, manufacturerId: 'DE-CELLCO-001', batteryCategory: 'EV',
             model: 'PowerCell EV-75', manufactureDate: '2026-07-01', weightKg: 432.5, performanceClass: 'B',
@@ -191,50 +79,53 @@ async function phaseB(sessionId) {
     });
     if (r.status >= 400) fail(`createPassport -> HTTP ${r.status}: ${pretty(r.body)}`);
     console.log(`OK   response: ${pretty(r.body)}`);
-    if (r.body?.mode !== 'anchoring') fail(`expected mode=anchoring, got '${r.body?.mode}' (is PASSPORT_CONTRACT_ADDRESS set in the SERVER's env?)`);
-    // The server returns the Merkle content root it anchors; verifyAttestationState
-    // needs it to confirm the anchored root (contentRootOk is false without it).
+    if (r.body?.mode !== 'anchoring') {
+        fail(`expected mode=anchoring, got '${r.body?.mode}' (the SERVER needs the API access, a vault and a wallet mnemonic)`);
+    }
     const contentRoot = String(r.body?.contentRoot ?? '');
     if (!/^[0-9a-f]{64}$/i.test(contentRoot)) fail(`expected a 64-hex contentRoot in the createPassport response, got '${contentRoot}'`);
 
-    step('Poll passport row until anchored (attest + bindPassport + contentRoot; expect ~1-3 min)');
-    const rowUrl = `/Passports?$filter=passportId eq '${passportId}'&$select=ID,passportId,status,attestationTxHash,payloadHash,contractAddress`;
+    step('Poll passport row until anchored (attest + content root + binding in one transaction)');
+    const rowUrl = `${PROD}/Passports?$filter=passportId eq '${passportId}'&$select=ID,passportId,status,attestationTxHash,payloadHash,contractAddress,attesterId`;
     const deadline = Date.now() + 20 * 60_000;
     let row = null;
     let lastStatus = null;
     while (Date.now() < deadline) {
-        row = (await get(PROD, rowUrl)).value?.[0];
+        row = (await get(rowUrl)).value?.[0];
         const status = row?.status ?? '(no row yet)';
         if (status !== lastStatus) { process.stdout.write(`\n     [anchor] status=${status}`); lastStatus = status; }
         else process.stdout.write('.');
         if (status === 'anchored' || status === 'failed') break;
-        await new Promise(r2 => setTimeout(r2, POLL_MS));
+        await new Promise((r2) => setTimeout(r2, POLL_MS));
     }
     process.stdout.write('\n');
     if (!row) fail('passport row not found after createPassport');
 
     step('Transaction log');
-    const txs = await get(PROD, `/PassportTransactions?$filter=passport_ID eq ${row.ID}&$select=kind,status,txHash,errorMessage`);
+    const txs = await get(`${PROD}/PassportTransactions?$filter=passport_ID eq ${row.ID}&$select=kind,status,txHash,errorMessage`);
     for (const t of txs.value ?? []) console.log(`  tx: ${t.kind.padEnd(18)} ${t.status.padEnd(10)} ${t.txHash ?? t.errorMessage ?? ''}`);
     if (row.status !== 'anchored') fail(`passport status is '${row.status}' (expected 'anchored')`);
     if (!/^[0-9a-f]{64}$/i.test(String(row.attestationTxHash ?? ''))) fail(`expected a 64-hex attestationTxHash, got '${row.attestationTxHash}'`);
 
-    step('Crawler-free on-chain confirm: verifyAttestationState');
-    // OData FUNCTION (GET with inline parameters), not an action: POST gets 405.
-    // Pass the anchored contentRoot so the anchored Merkle root is checked too.
-    const v = await get(NG, `/verifyAttestationState(contractAddress='${row.contractAddress}',payloadHash='${row.payloadHash}',contentRoot='${contentRoot}',compiledArtifactRef='attestation-vault')`);
+    step('On-chain confirm through the public verify service of the NIGHTGATE API');
+    // The anchored content root goes along, so the Merkle root is checked too.
+    const v = await get(`${API}/odata/v4/midnight-verify/verifyAttestationState(contractAddress='${row.contractAddress}',attesterId='${row.attesterId}',payloadHash='${row.payloadHash}',contentRoot='${contentRoot}',compiledArtifactRef='attestation-vault')`, {});
     console.log(`verifyAttestationState -> ${pretty(v)}`);
     if (v?.verified !== true) fail('on-chain state did NOT confirm the attested payload hash');
     if (v?.contentRootOk !== true) fail(`anchored content root did NOT match (contentRootOk=${v?.contentRootOk}); anchored root ${contentRoot}`);
 
-    console.log('\nPHASE B PASSED. Passport anchored on preprod and state-verified crawler-free.');
+    step('The same through NIGHTPASS: verifyOnChain');
+    const own = await get(`${BASE}/api/v1/passport/verifyOnChain(passportId='${passportId}')`, {});
+    console.log(`verifyOnChain -> ${pretty(own)}`);
+    if (own?.verified !== true) fail('verifyOnChain did not confirm the anchor');
+
+    console.log('\nPASSED. Passport anchored and verified on chain.');
     console.log(`Passport:  ${passportId}`);
     console.log(`Attest tx: ${row.attestationTxHash}`);
 }
 
 (async () => {
     await waitForServer();
-    const sessionId = await connectSigningSession();
-    if (CONTRACT) await phaseB(sessionId); else await phaseA(sessionId);
+    await anchor();
     process.exit(0);
-})().catch(e => fail(e?.message ?? String(e)));
+})().catch((e) => fail(e?.message ?? String(e)));

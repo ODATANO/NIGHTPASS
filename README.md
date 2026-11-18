@@ -73,7 +73,7 @@ A demo run produces three on-chain transactions (four with the battery second-li
 |---|---|
 | [docs/producer-flow.md](docs/producer-flow.md) | Step-by-step battery lifecycle from creation to Second Life: which steps produce transactions and why, re-anchoring and handover, how to read transactions in the explorer, glossary |
 | [docs/producer-walkthrough.md](docs/producer-walkthrough.md) | Producer cockpit (battery) with screenshots, tab by tab |
-| [docs/architecture.md](docs/architecture.md) | Layers, data flow, security model, product profiles, field-bound proof construction, plugin build & deploy |
+| [docs/architecture.md](docs/architecture.md) | Layers, data flow, security model, product profiles, field-bound proof construction, build & deploy |
 | [docs/public-demo.md](docs/public-demo.md) | Public explorer and "Try it" demo: visitor flow, deployment modes, topology, hardening |
 | [docs/s4-mapping.md](docs/s4-mapping.md) | S/4HANA integration: the goods-receipt bridge, field-by-field Annex XIII mapping, and the sandbox / S/4 Cloud / Event Mesh lanes |
 | [docs/PITCHDECK.pdf](docs/PITCHDECK.pdf) | Pitch deck: problem, market, solution, architecture, traction, go-to-market |
@@ -86,7 +86,7 @@ Requires Node.js >= 22
 ```bash
 npm install            # postinstall generates @cds-models and builds the connector lib
 cp .env.example .env   # set ENCRYPTION_KEY (.env is gitignored)
-npm run deploy         # creates db/passport.db: domain tables + the midnight_* plugin tables
+npm run deploy         # creates db/passport.db
 npm start              # cds-tsx serve  ->  http://localhost:4004
 ```
 
@@ -102,7 +102,6 @@ Open http://localhost:4004/ for the launchpad.
 | BmsSimulatorService (simulated BMS telemetry) | `/api/v1/bms-sim` |
 | ProducerService | `/api/v1/producer` |
 | PassportService | `/api/v1/passport` |
-| NightgateService (+ indexer / analytics / admin) | `/api/v1/nightgate` |
 
 ## Scripts
 

@@ -112,7 +112,7 @@ if (!EXPECT_ANCHOR) {
 }
 
 step('Poll passport row until anchored (attest + bindPassport + contentRoot)');
-const rowUrl = `/api/v1/producer/Passports?$filter=passportId eq '${passportId}'&$select=ID,passportId,status,attestationTxHash,payloadHash,contractAddress`;
+const rowUrl = `/api/v1/producer/Passports?$filter=passportId eq '${passportId}'&$select=ID,passportId,status,attestationTxHash,payloadHash,contractAddress,attesterId`;
 const deadline = Date.now() + 20 * 60_000;
 let row = null, lastStatus = null;
 while (Date.now() < deadline) {
@@ -131,9 +131,9 @@ step('Transaction log');
 const txs = await get(`/api/v1/producer/PassportTransactions?$filter=passport_ID eq ${row.ID}&$select=kind,status,txHash,errorMessage`);
 for (const t of txs.value ?? []) console.log(`  tx: ${t.kind.padEnd(18)} ${t.status.padEnd(10)} ${t.txHash ?? t.errorMessage ?? ''}`);
 
-step('Crawler-free on-chain confirm: verifyAttestationState');
-const v = await get(`/api/v1/nightgate/verifyAttestationState(contractAddress='${row.contractAddress}',payloadHash='${row.payloadHash}',compiledArtifactRef='attestation-vault')`);
-console.log(`verifyAttestationState -> ${pretty(v)}`);
+step('On-chain confirm: verifyOnChain');
+const v = await get(`/api/v1/passport/verifyOnChain(passportId='${passportId}')`);
+console.log(`verifyOnChain -> ${pretty(v)}`);
 if (v?.verified !== true) fail('on-chain state did NOT confirm the attested payload hash');
 
 console.log(`\nERP INGEST E2E PASSED. Goods-receipt ${batchId} -> passport ${passportId} anchored on-chain.`);

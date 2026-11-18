@@ -3,7 +3,7 @@
 // producer cockpit) can dynamic-import them and run the Lace flow IN-APP,
 // instead of redirecting to the standalone connector page.
 //
-// WASM via vite-plugin-wasm + ledger-v8 dedupe. No top-level-await plugin:
+// WASM via vite-plugin-wasm + ledger dedupe. No top-level-await plugin:
 // the output is an ES module with target es2022, where TLA is native, and the
 // plugin's rollup peer dependency breaks fresh installs under rolldown-vite 8.
 // Output → app/connector/lib, served by CAP at /connector/lib/.
@@ -27,7 +27,7 @@ export default defineConfig({
         }
     },
     resolve: {
-        dedupe: ['@midnight-ntwrk/ledger-v8'],
+        dedupe: ['@midnightntwrk/ledger-v9'],
         alias: {
             // @subsquid/* (via the Midnight wallet SDK address-format package)
             // imports the Node "assert" builtin. Point it at a local browser

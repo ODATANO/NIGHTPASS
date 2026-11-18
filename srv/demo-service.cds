@@ -106,9 +106,8 @@ service DemoService @(path: '/api/v1/demo', requires: 'any') {
     };
 
     /**
-     * Ops dust monitor: NIGHT + dust snapshot of the fee-sponsor pool, so an
-     * operator can spot a depleting sponsor before it starts failing anchors.
-     * Empty when no sponsor is configured or the demo is disabled.
+     * Readiness gauge: one row for the NIGHTGATE API's sponsor pool, `ready`
+     * when the API answers. Empty when the demo is disabled.
      */
     function demoSponsorStatus() returns array of {
         walletId             : String;

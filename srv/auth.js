@@ -6,7 +6,7 @@ const cds = require('@sap/cds');
  * HTTP Basic → a principal identity, mirroring the Catena-X SSI shape:
  *   - Dataspace partners log in with their DID/BPN + secret (validated against
  *     the `passport.Partners` registry). `req.user.id = DID`, which is exactly
- *     what the read gate resolves against (midnight.GranteeIdentities.userId).
+ *     what the read gate resolves a grantee id from.
  *   - Built-in demo users (producer / recycler / authority, password = name)
  *     keep the cockpit + viewer flows working.
  *   - Anything else → anonymous (public consumer tier).

@@ -5,9 +5,7 @@
  * anchor-plan.ts):
  *   - browser: app/connector/connector.mjs proveFieldPredicateBatch
  *     (wallet-signed, one approval for the whole cart)
- *   - remote lane: srv/lib/lane-remote.ts (nightgate-tx prepare helpers)
- *   - plugin lane: NIGHTGATE issueFieldPredicateAttestationBatch builds the
- *     calls itself from the same claim list
+ *   - server: srv/lib/lane-remote.ts (nightgate-tx prepare helpers)
  *
  * Two claim kinds share the cart (mixed carts ride in one tx):
  *   - predicate:  proveFieldPredicate(record_key, field_key, threshold, op, valid_until)

@@ -20,11 +20,10 @@ services:
     # 4g carries wasm/server proving plus CAP; the wallet-worker era needed 12g.
     mem_limit: 4g
     env_file: .env.demo
-    # Schema is deployed as a one-off before up (README): the deploy step
-    # keeps the plugin event loop alive and never returns inside the CMD.
+    # Schema is deployed as a one-off before up (README), so a slow deploy
+    # never eats the healthcheck window.
     command: ["sh", "-c", "exec npx cds-tsx serve"]
     environment:
-      NIGHTGATE_REPLICA_COUNT: "1"
       # Prover keys fetched once from the hosted /zk-config, kept on a volume.
       NIGHTGATE_ZK_CACHE_DIR: /data/zk-cache
       cds_requires_db_credentials_host: postgres-demo
@@ -35,17 +34,12 @@ services:
     volumes:
       - passport-demo-zk-cache:/data/zk-cache
     expose: ["4004"]
-    # Wedged-process detection. demoInfo is DB-free and cheap; a container
-    # that stops answering HTTP goes unhealthy. Docker itself only MARKS the
-    # state: the actual recovery is demo-autoheal.sh from host cron, because
-    # the restart policy ignores health and a wedged process can even survive
-    # `docker restart` (2026-08-02 outage). No curl in node:22-slim, so the
-    # probe uses node's built-in fetch.
+    # Wedged-process detection: a container that stops answering HTTP goes
+    # unhealthy, and autoheal.sh from host cron recreates it. A 503 counts as
+    # alive, it is the answer of the maintenance page (DEMO_MAINTENANCE).
     healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://localhost:4004/api/v1/demo/demoInfo()').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      test: ["CMD", "node", "-e", "fetch('http://localhost:4004/api/v1/demo/demoInfo()').then(r=>process.exit(r.ok||r.status===503?0:1)).catch(()=>process.exit(1))"]
       interval: 30s
-      # The remote lane builds transactions on the CAP thread; a probe can wait
-      # behind a build, so the timeout must clear one build step.
       timeout: 30s
       retries: 5
       start_period: 300s
@@ -78,7 +72,7 @@ services:
   # proves in-process (wasm, 25-75 s per transaction and it blocks the
   # request thread while proving).
   proof-server:
-    image: midnightntwrk/proof-server:8.1.0
+    image: midnightntwrk/proof-server:9.0.2
     restart: unless-stopped
     logging: *default-logging
     mem_limit: 8g

@@ -13,8 +13,6 @@ entity Testers : cuid, managed {
     nickname        : String(24);
     /** Encrypted 64-byte BIP39 seed hex (the wallet's signing secret). */
     encSeedHex      : LargeString;
-    /** Encrypted NIGHTGATE viewing key (zswap encryption public key hex). */
-    encViewingKey   : LargeString;
     shieldedAddress : String(200);
     nightAddress    : String(200);
     /** Hashed client IP, the per-IP cap key. */

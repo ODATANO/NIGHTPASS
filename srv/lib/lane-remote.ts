@@ -1,9 +1,9 @@
 /**
- * The remote lane: a local `@odatano/nightgate-tx` builder proves and signs
- * with a seed that never leaves this process, the hosted NIGHTGATE pays the
+ * The chain lane: a local `@odatano/nightgate-tx` builder proves and signs
+ * with a seed that never leaves this process, the NIGHTGATE API pays the
  * dust and submits (`sponsorUnboundTransaction` under an agent grant). No
- * wallet session, no worker, no sync. Verification reads go through the same
- * client, token-authenticated.
+ * wallet session and no sync. Verification reads go to the public verify
+ * service of the same API.
  */
 import cds from '@sap/cds';
 import { randomUUID } from 'node:crypto';
@@ -15,11 +15,10 @@ import type { PreparedCall, TxBuilder } from '@odatano/nightgate-tx/txbuilder';
 import { blake2b256Hex, effectiveNetwork } from './passport-anchor';
 import { buildMembershipSet } from './membership-set';
 import { claimValidUntil } from './proof-plan';
-import type { AnchorCall } from './anchor-plan';
 import {
-    ProofCartError,
-    type AnchorTxInput, type ChainLane, type ClaimVerifyInput, type LaneTx, type ProofCartInput, type ProofCartOutcome,
-    type CartClaimArgs
+    ProofCartError, prepareVaultCall,
+    type ChainLane, type ClaimVerifyInput, type ComparisonInput, type LaneTx, type ProofCartInput,
+    type CartClaimArgs, type VaultTxInput
 } from './chain-lane';
 
 /** The hosted NIGHTGATE API serves every chain read of the lane (contract state, transaction lookup); no indexer, no node. */
@@ -33,8 +32,11 @@ export interface RemoteLaneConfig {
     ttlMinutes?: number;
 }
 
-/** Circuits the demo lane proves; prover keys are fetched for these only. */
-export const REMOTE_LANE_CIRCUITS = ['attest', 'bindDocument', 'anchorContentRoot', 'proveFieldPredicate', 'proveFieldMembership'];
+/** Circuits the lane proves; prover keys are fetched for these only. */
+export const REMOTE_LANE_CIRCUITS = [
+    'attest', 'bindDocument', 'anchorContentRoot', 'proveFieldPredicate', 'proveFieldMembership',
+    'proveFieldEquality', 'grantDisclosure', 'revokeDisclosure', 'registerDocument', 'proveDocumentComparison'
+];
 
 /**
  * Lane config from the environment. Throws with the missing key named, so a
@@ -43,12 +45,12 @@ export const REMOTE_LANE_CIRCUITS = ['attest', 'bindDocument', 'anchorContentRoo
 export function remoteLaneConfigFromEnv(env: NodeJS.ProcessEnv = process.env): RemoteLaneConfig {
     const need = (k: string) => {
         const v = String(env[k] ?? '').trim();
-        if (!v) throw new Error(`remote chain lane: ${k} is not set`);
+        if (!v) throw new Error(`chain lane: ${k} is not set`);
         return v;
     };
     return {
-        apiUrl: need('NIGHTGATE_API_URL').replace(/\/$/, ''),
-        agentToken: need('DEMO_NIGHTGATE_AGENT_TOKEN'),
+        apiUrl: apiUrlFromEnv(env),
+        agentToken: need('NIGHTGATE_AGENT_TOKEN'),
         networkId: String(env.NIGHTGATE_NETWORK ?? '').trim() || effectiveNetwork(),
         cacheDir: String(env.NIGHTGATE_ZK_CACHE_DIR ?? '').trim() || join(homedir(), '.cache', 'nightgate-txbuilder', 'attestation-vault'),
         proofServerUrl: String(env.NIGHTGATE_PROOF_SERVER_URL ?? '').trim() || undefined,
@@ -56,11 +58,22 @@ export function remoteLaneConfigFromEnv(env: NodeJS.ProcessEnv = process.env): R
     };
 }
 
+/** Whether this server can reach a NIGHTGATE API with a grant: both settings are present. */
+export function chainLaneConfigured(env: NodeJS.ProcessEnv = process.env): boolean {
+    return !!String(env.NIGHTGATE_API_URL ?? '').trim() && !!String(env.NIGHTGATE_AGENT_TOKEN ?? '').trim();
+}
+
+/** Base URL of the NIGHTGATE API (`NIGHTGATE_API_URL`), without a trailing slash. */
+export function apiUrlFromEnv(env: NodeJS.ProcessEnv = process.env): string {
+    const v = String(env.NIGHTGATE_API_URL ?? '').trim();
+    if (!v) throw new Error('chain lane: NIGHTGATE_API_URL is not set');
+    return v.replace(/\/$/, '');
+}
+
 // --- signer registry ---------------------------------------------------------
-// A remote handle is a UUID (the producer actions type `sessionId` as UUID)
-// that names a seed this process holds for the lifetime of one run. A
-// registered handle selects the remote lane; NIGHTGATE session ids are never
-// registered here. In memory only; the demo stores the seed encrypted.
+// A signer handle is a UUID (the producer actions type `sessionId` as UUID)
+// that names a seed this process holds: a server wallet for the process
+// lifetime, a demo tester for one run. In memory only.
 
 const signers = new Map<string, { seedHex: string; contractAddress?: string }>();
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -198,6 +211,22 @@ export function isRebuildable(err: unknown): boolean {
     return /\b1010\/(104|170|196)\b|\b1014\b|dust-race|DustDoubleSpend|InvalidDustSpendProof/i.test(msg);
 }
 
+/** A failure after the sponsor took the transaction. It may still land, so it is never rebuilt. */
+export class SubmittedTxError extends Error {}
+
+/** Whether a failed attempt is followed by a rebuild. */
+export function shouldRebuild(err: unknown, attempt: number, maxAttempts = 3): boolean {
+    return !(err instanceof SubmittedTxError) && attempt < maxAttempts - 1 && isRebuildable(err);
+}
+
+/** Whether a failed proof cart may have reached the chain, so every claim is checked on its own. */
+export function cartMayHaveLanded(err: unknown): boolean {
+    const e = err as { message?: string; cause?: { job?: { errorCode?: string } }; job?: { errorCode?: string } };
+    const job = e?.cause?.job ?? e?.job;
+    return e?.cause instanceof SubmittedTxError
+        || /OnChainStatus|PARTIAL/i.test(`${String(e?.message ?? err)} ${String(job?.errorCode ?? '')}`);
+}
+
 // --- the lane ---------------------------------------------------------------
 
 interface Sdk {
@@ -220,7 +249,6 @@ function sdk(): Promise<Sdk> {
 }
 
 export class RemoteLane implements ChainLane {
-    readonly kind = 'remote' as const;
     private builderPromise: Promise<TxBuilder> | null = null;
     private clientPromise: Promise<NightgateClient> | null = null;
     private readonly log = cds.log('remote-lane');
@@ -257,8 +285,9 @@ export class RemoteLane implements ChainLane {
                 // Vault circuits move no value: nothing to balance, so no
                 // wallet sync. A value-moving call would fail at balancing.
                 walletSync: false,
-                onProgress: (e: Record<string, unknown>) => {
-                    if (e?.phase === 'fetch') this.log.info(`[${this.label}] zk asset ${String(e.file ?? e.circuit ?? '')}`);
+                onProgress: (e) => {
+                    const asset = e as Record<string, unknown>;
+                    if (asset.phase === 'fetch') this.log.info(`[${this.label}] zk asset ${String(asset.file ?? asset.circuit ?? '')}`);
                 }
             });
             this.log.info(`[${this.label}] txbuilder ready in ${Date.now() - t0}ms (proving ${b.provingMode}, attester ${b.attesterId.slice(0, 12)}...)`);
@@ -299,22 +328,26 @@ export class RemoteLane implements ChainLane {
                 });
                 const txId = String(job?.txHash ?? '');
                 if (!txId) throw new Error(`${label}: sponsor job ${job?.jobId ?? '?'} succeeded without a transaction hash`);
-                // The next transaction reads the contract state from the same
-                // server, so wait until it has indexed this one; a build on the
-                // older state fails in the circuit ("no content root").
-                const { txbuilder } = await sdk();
-                const landed = await txbuilder.waitLanded(txId, { api: ng, timeoutMs: 240_000, pollMs: 5_000 });
-                if (!landed) throw new Error(`${label}: transaction ${txId.slice(0, 12)}... was sponsored but the server has not indexed it after 240s`);
-                if (landed.applied === false) throw new Error(`${label}: transaction ${txId.slice(0, 12)}... landed with status ${landed.status} (failed segments ${landed.failedSegments.join(',') || 'none'})`);
-                const txHash = await resolveTxHash(txId, ng);
-                if (txHash === txId.replace(/^0x/, '') && !HASH64.test(txId)) {
-                    this.log.warn(`[${this.label}] ${label}: could not resolve identifier ${txId.slice(0, 12)}... to a block hash; keeping the identifier`);
+                try {
+                    // The next transaction reads the contract state from the same
+                    // server, so wait until it has indexed this one; a build on the
+                    // older state fails in the circuit ("no content root").
+                    const { txbuilder } = await sdk();
+                    const landed = await txbuilder.waitLanded(txId, { api: ng, timeoutMs: 240_000, pollMs: 5_000 });
+                    if (!landed) throw new Error(`transaction ${txId.slice(0, 12)}... was sponsored but the server has not indexed it after 240s`);
+                    if (landed.applied === false) throw new Error(`transaction ${txId.slice(0, 12)}... landed with status ${landed.status} (failed segments ${landed.failedSegments.join(',') || 'none'})`);
+                    const txHash = await resolveTxHash(txId, ng);
+                    if (txHash === txId.replace(/^0x/, '') && !HASH64.test(txId)) {
+                        this.log.warn(`[${this.label}] ${label}: could not resolve identifier ${txId.slice(0, 12)}... to a block hash; keeping the identifier`);
+                    }
+                    this.log.info(`[${this.label}] ${label}: landed ${txHash} (job ${String(job.jobId ?? '').slice(0, 8)}, id ${txId.slice(0, 12)}...)`);
+                    return { txHash, jobId: String(job.jobId ?? '') };
+                } catch (e) {
+                    throw new SubmittedTxError(String((e as Error)?.message ?? e), { cause: e });
                 }
-                this.log.info(`[${this.label}] ${label}: landed ${txHash} (job ${String(job.jobId ?? '').slice(0, 8)}, id ${txId.slice(0, 12)}...)`);
-                return { txHash, jobId: String(job.jobId ?? '') };
             } catch (e) {
                 lastErr = e;
-                if (!isRebuildable(e) || attempt === 2) break;
+                if (!shouldRebuild(e, attempt)) break;
                 this.log.warn(`[${this.label}] ${label}: retryable (${String((e as Error)?.message ?? e).slice(0, 80)}), rebuilding...`);
             }
         }
@@ -322,35 +355,37 @@ export class RemoteLane implements ChainLane {
     }
 
     /**
-     * One transaction of the anchor plan (lineage 4: the whole anchor). The
-     * record is keyed by this lane's own attester id, so no other caller can
-     * collide with it; a failure here is final for the caller to judge.
+     * One transaction of vault calls. Records are keyed by this lane's own
+     * attester id, so no other caller can collide with them; a failure here
+     * is final for the caller to judge.
      */
-    submitAnchorTx({ contractAddress, tx }: AnchorTxInput): Promise<LaneTx> {
+    submitVaultTx({ contractAddress, tx }: VaultTxInput): Promise<LaneTx> {
         return this.buildAndSponsor(tx.label, contractAddress, async () => {
             const [{ calls: c }, b] = await Promise.all([sdk(), this.builder()]);
-            const secret = b.attestationSecret;
-            return tx.calls.map((call): PreparedCall => {
-                switch (call.circuit) {
-                    case 'attest':
-                        return c.prepareAttest({ payloadHash: call.args[0], metadataHash: call.args[1], attestationSecret: secret });
-                    case 'bindDocument':
-                        return c.prepareBindDocument({ documentId: call.args[0], payloadHash: call.args[1], attestationSecret: secret });
-                    case 'anchorContentRoot':
-                        return c.prepareAnchorContentRoot({
-                            payloadHash: call.args[0], contentRoot: call.args[1], schemaId: call.args[2], attestationSecret: secret
-                        });
-                    default:
-                        throw new Error(`remote lane: unsupported anchor circuit '${String((call as AnchorCall).circuit)}'`);
-                }
-            });
+            return tx.calls.map((call) => prepareVaultCall(c, b.attestationSecret, call));
         });
     }
 
-    async submitProofCart(input: ProofCartInput): Promise<ProofCartOutcome> {
-        let landedTx = '';
+    /** Both claims compare the same pair of records, so they share one transaction. */
+    submitComparison(input: ComparisonInput): Promise<LaneTx> {
+        return this.buildAndSponsor('version comparison', input.contractAddress, async () => {
+            const [{ calls: c, vault }, b] = await Promise.all([sdk(), this.builder()]);
+            const recordKeyA = c.recordKeyOf({ pureCircuits: vault.pureCircuits, attesterId: input.attesterIdA, payloadHash: input.payloadHashA });
+            const recordKeyB = c.recordKeyOf({ pureCircuits: vault.pureCircuits, attesterId: input.attesterIdB, payloadHash: input.payloadHashB });
+            const base = {
+                recordKeyA, recordKeyB, validUntil: input.validUntil ?? claimValidUntil(),
+                docPair: { schema: input.schema, openingA: input.openingA, openingB: input.openingB },
+                attestationSecret: b.attestationSecret
+            };
+            return input.claims.map((claim) => claim.kind === 'documentIntegrity'
+                ? c.prepareProveFieldsUnchangedExcept({ ...base, allowedMask: claim.allowedMask })
+                : c.prepareProveFieldsDiffer({ ...base, k: claim.k }));
+        }, { independentCalls: true });
+    }
+
+    async submitProofCart(input: ProofCartInput): Promise<LaneTx> {
         try {
-            const out = await this.buildAndSponsor('proof cart', input.contractAddress, async () => {
+            return await this.buildAndSponsor('proof cart', input.contractAddress, async () => {
                 const [{ calls: c, vault }, b] = await Promise.all([sdk(), this.builder()]);
                 const secret = b.attestationSecret;
                 // The claims name the attester's RECORD, not the payload: a
@@ -373,19 +408,21 @@ export class RemoteLane implements ChainLane {
                 // execution stage. An in-batch root anchor stays first.
                 independentCalls: true, orderedPrefix: input.contentRoot ? 1 : 0
             });
-            landedTx = out.txHash;
-            // The hosted lane issues no predicate-attestation ids; claims are
-            // verified by their on-chain coordinates (verifyClaimLanded).
-            return { ...out, claimIds: new Map() };
         } catch (e) {
             const msg = String((e as Error)?.message ?? e);
             const job = (e as any)?.cause?.job ?? (e as any)?.job;
-            const partial = /OnChainStatus|PARTIAL/i.test(msg + ' ' + String(job?.errorCode ?? '')) || !!landedTx;
-            throw new ProofCartError(msg, { partial, jobId: String(job?.jobId ?? ''), cause: e });
+            throw new ProofCartError(msg, { partial: cartMayHaveLanded(e), jobId: String(job?.jobId ?? ''), cause: e });
         }
     }
 
     private async prepareClaim(c: Sdk['calls'], secret: Uint8Array, recordKey: string, validUntil: number, claim: CartClaimArgs): Promise<PreparedCall> {
+        if (claim.predicate === 'bytesEquality') {
+            return c.prepareProveFieldEquality({
+                recordKey, validUntil, fieldKey: claim.fieldKey, expectedDigest: claim.expectedDigest,
+                merkleProof: { fieldSalt: claim.salt, siblings: claim.siblings, dirs: claim.dirs },
+                attestationSecret: secret
+            });
+        }
         if (claim.predicate === 'setMembership') {
             const set = await buildMembershipSet(claim.allowedValues);
             const path = set.proofFor(claim.value);
@@ -408,10 +445,10 @@ export class RemoteLane implements ChainLane {
         });
     }
 
-    async verifyClaimLanded(input: ClaimVerifyInput): Promise<{ verified: boolean; txHash: string }> {
+    async verifyClaimLanded(input: ClaimVerifyInput): Promise<boolean> {
         const ng = await hostedVerifyClient(this.cfg);
         const membership = input.predicate === 'setMembership';
-        if (membership && !input.setRoot) return { verified: false, txHash: '' };
+        if (membership && !input.setRoot) return false;
         const attesterId = input.attesterId ?? await this.attesterId();
         const res = await ng.verifyPredicate({
             contractAddress: input.contractAddress, attesterId, payloadHash: input.payloadHash, fieldKey: input.fieldKey,
@@ -419,7 +456,7 @@ export class RemoteLane implements ChainLane {
             ...(membership ? { setRoot: input.setRoot } : { threshold: Number(input.threshold ?? 0) }),
             compiledArtifactRef: 'attestation-vault'
         });
-        return { verified: res?.verified === true, txHash: '' };
+        return res?.verified === true;
     }
 
     /** Anchor effect check through the public verify service; the record defaults to this lane's own. */
@@ -441,10 +478,24 @@ export class RemoteLane implements ChainLane {
     }
 }
 
+let apiClientPromise: Promise<NightgateClient> | null = null;
+let apiClientKey = '';
+/** A client for the main service under the agent grant, shared per process. */
+export function apiClient(cfg: RemoteLaneConfig = remoteLaneConfigFromEnv()): Promise<NightgateClient> {
+    const key = `${cfg.apiUrl}|${cfg.agentToken}`;
+    if (!apiClientPromise || apiClientKey !== key) {
+        apiClientKey = key;
+        apiClientPromise = sdk().then(({ client }) => client.connect({
+            baseUrl: cfg.apiUrl, agentToken: cfg.agentToken, timeoutMs: 180_000, pollMs: 4000
+        }));
+    }
+    return apiClientPromise;
+}
+
 let hostedClientPromise: Promise<NightgateClient> | null = null;
 let hostedClientKey = '';
 /** A client for the public verify service, shared per process. It sends no token, so the reads cost nothing. */
-export function hostedVerifyClient(cfg: RemoteLaneConfig): Promise<NightgateClient> {
+export function hostedVerifyClient(cfg: Pick<RemoteLaneConfig, 'apiUrl'>): Promise<NightgateClient> {
     const key = cfg.apiUrl;
     if (!hostedClientPromise || hostedClientKey !== key) {
         hostedClientKey = key;
@@ -476,10 +527,10 @@ export async function remoteIdentity(cfg: RemoteLaneConfig, seedHex: string): Pr
     return { attesterId: id.attesterId, nightAddress: id.addresses.night, provingMode: cfg.proofServerUrl ? 'server' : 'wasm' };
 }
 
-/** The lane for a registered remote handle, configured from the environment. */
+/** The lane for a registered signer handle, configured from the environment. */
 export function remoteLaneFor(handle: string, cfg: RemoteLaneConfig = remoteLaneConfigFromEnv()): RemoteChainLane {
     const signer = signers.get(handle);
-    if (!signer) throw new Error(`remote chain lane: no signer registered for '${handle}'`);
+    if (!signer) throw new Error(`chain lane: no signer registered for '${handle}'`);
     return createRemoteLane(cfg, signer.seedHex, handle.slice(0, 8));
 }
 
@@ -498,7 +549,7 @@ export interface RemoteChainLane extends ChainLane {
 
 /** Methods the worker host forwards to its RemoteLane. */
 export const REMOTE_LANE_WORKER_METHODS: ReadonlySet<string> = new Set([
-    'identity', 'attesterId', 'submitAnchorTx', 'submitProofCart', 'verifyClaimLanded', 'verifyAnchor', 'dispose'
+    'identity', 'attesterId', 'submitVaultTx', 'submitProofCart', 'submitComparison', 'verifyClaimLanded', 'verifyAnchor', 'dispose'
 ]);
 
 const WORKER_FILE = __filename.replace(/lane-remote(\.[cm]?[jt]s)$/, 'lane-remote-worker$1');
@@ -512,7 +563,6 @@ export interface LaneErrorShape {
     status?: number;
     partial?: boolean;
     jobId?: string;
-    claimIds?: [string, string][];
 }
 
 export function serializeLaneError(e: unknown): LaneErrorShape {
@@ -529,14 +579,13 @@ export function serializeLaneError(e: unknown): LaneErrorShape {
     if (err instanceof ProofCartError) {
         out.partial = err.partial;
         out.jobId = err.jobId;
-        out.claimIds = [...err.claimIds.entries()];
     }
     return out;
 }
 
 export function deserializeLaneError(o: LaneErrorShape): Error {
     const err: Error & { code?: string; status?: number } = o.name === 'ProofCartError'
-        ? new ProofCartError(o.message, { partial: !!o.partial, jobId: o.jobId, claimIds: new Map(o.claimIds ?? []) })
+        ? new ProofCartError(o.message, { partial: !!o.partial, jobId: o.jobId })
         : new Error(o.message);
     if (o.name !== 'ProofCartError' && o.name) err.name = o.name;
     if (o.stack) err.stack = o.stack;
@@ -549,7 +598,6 @@ type Pending = { resolve: (v: any) => void; reject: (e: Error) => void };
 
 /** Main-thread proxy of a RemoteLane running in a worker thread. */
 export class RemoteLaneWorker implements RemoteChainLane {
-    readonly kind = 'remote' as const;
     private worker: Worker | null = null;
     private nextId = 1;
     private readonly pending = new Map<number, Pending>();
@@ -608,16 +656,19 @@ export class RemoteLaneWorker implements RemoteChainLane {
         return this.call('attesterId');
     }
 
-    submitAnchorTx(input: AnchorTxInput): Promise<LaneTx> {
-        return this.call('submitAnchorTx', input);
+    submitVaultTx(input: VaultTxInput): Promise<LaneTx> {
+        return this.call('submitVaultTx', input);
     }
 
-    async submitProofCart(input: ProofCartInput): Promise<ProofCartOutcome> {
-        const out = await this.call<ProofCartOutcome>('submitProofCart', input);
-        return { ...out, claimIds: out.claimIds instanceof Map ? out.claimIds : new Map(out.claimIds ?? []) };
+    submitProofCart(input: ProofCartInput): Promise<LaneTx> {
+        return this.call('submitProofCart', input);
     }
 
-    verifyClaimLanded(input: ClaimVerifyInput): Promise<{ verified: boolean; txHash: string }> {
+    submitComparison(input: ComparisonInput): Promise<LaneTx> {
+        return this.call('submitComparison', input);
+    }
+
+    verifyClaimLanded(input: ClaimVerifyInput): Promise<boolean> {
         return this.call('verifyClaimLanded', input);
     }
 

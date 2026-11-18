@@ -9,8 +9,8 @@ using {passport} from '../db/passport-schema';
  * bindDocument), manages disclosure grants, and proves the carbon-footprint
  * predicate in zero-knowledge, with a per-passport transaction overview.
  *
- * On-chain is offered BOTH ways: server-side automatic (the actions below, via
- * the NIGHTGATE plugin + a server signing session) and wallet-driven (the Fiori
+ * On-chain is offered BOTH ways: server-side automatic (the actions below sign
+ * with a server wallet and hand the transaction to the NIGHTGATE API) and wallet-driven (the Fiori
  * app hands off to the Lace connector). Everything is offline-first: without a
  * session/contract the rows land with tx status `offline`.
  */
@@ -83,8 +83,7 @@ service ProducerService {
                             submit: Boolean,
                             sessionId: UUID,
                             owner: String, // producer wallet identity (shielded address)
-                            walletId: String, // optional: which SERVER wallet signs (see listServerWallets)
-                            sponsorWalletId: String // optional: which pool member of PASSPORT_FEE_SPONSOR_WALLET pays the fees
+                            walletId: String // optional: which SERVER wallet signs (see listServerWallets)
     )                                                                    returns {
         passportId  : String;
         payloadHash : String;
@@ -160,23 +159,6 @@ service ProducerService {
      */
     function serverWalletSession(walletId: String)                       returns {
         sessionId : String;
-    };
-
-    /**
-     * Balance snapshot of the fee-sponsor POOL (PASSPORT_FEE_SPONSOR_WALLET),
-     * for the ops dust monitor. Reads only sponsors whose signing session is
-     * already open (boot prewarm); a cold or errored sponsor reports its state
-     * rather than a balance. Never opens a session, so the call stays cheap.
-     */
-    function sponsorPoolStatus()                                         returns array of {
-        walletId             : String;  // registry id of the sponsor wallet
-        label                : String;  // display name
-        state                : String;  // 'ready' | 'warming' | 'cold' | 'error'
-        nightDisplay         : String;  // unshielded NIGHT in display units ('' if unknown)
-        dustPresent          : Boolean; // has spendable dust to pay fees
-        registeredNightUtxos : Integer; // UTxOs registered for dust generation
-        healthy              : Boolean; // ready AND registered AND dust present
-        error                : String;
     };
 
     /**
@@ -294,8 +276,7 @@ service ProducerService {
                                 mimeType: String,
                                 contentBase64: LargeString,
                                 sessionId: UUID,   // optional: browser-wallet session
-                                walletId: String,  // optional: which SERVER wallet signs
-                                sponsorWalletId: String // optional: fee-sponsor pool member
+                                walletId: String // optional: which SERVER wallet signs
     )                                                                    returns {
         docId  : UUID;
         sha256 : String;
@@ -324,8 +305,7 @@ service ProducerService {
     action   reanchorPassport(passportId: String,
                               reason: String, // status-change | batch-telemetry | data-correction
                               sessionId: UUID,
-                              walletId: String,
-                              sponsorWalletId: String
+                              walletId: String
     )                                                                    returns {
         passportId          : String;
         archivedVersion     : Integer; // version number the previous anchor was stored as (0 = retry, nothing archived)
@@ -352,8 +332,7 @@ service ProducerService {
     action   changeBatteryStatus(passportId: String,
                                  newStatus: String, // repurposed | reused | remanufactured | waste
                                  sessionId: UUID,
-                                 walletId: String,
-                                 sponsorWalletId: String
+                                 walletId: String
     )                                                                    returns {
         passportId      : String;
         previousStatus  : String;
@@ -377,8 +356,7 @@ service ProducerService {
      * through this server action too.
      */
     action   claimPassportId(passportId: String,
-                             walletId: String,
-                             sponsorWalletId: String
+                             walletId: String
     )                                                                    returns {
         passportId      : String;
         walletId        : String;
@@ -401,8 +379,7 @@ service ProducerService {
      * after their first re-anchor.
      */
     action   transferPassportOperator(passportId: String,
-                                      newWalletId: String,
-                                      sponsorWalletId: String
+                                      newWalletId: String
     )                                                                    returns {
         passportId         : String;
         previousOwner      : String;
@@ -481,8 +458,7 @@ service ProducerService {
      */
     action   submitPassport(passportId: String,
                             sessionId: UUID,
-                            walletId: String, // optional: which SERVER wallet signs
-                            sponsorWalletId: String // optional: pool member of PASSPORT_FEE_SPONSOR_WALLET
+                            walletId: String // optional: which SERVER wallet signs
     )                                                                    returns {
         passportId  : String;
         contentRoot : String; // 64-hex Merkle root anchored on-chain (empty when nothing to anchor)
@@ -586,20 +562,17 @@ service ProducerService {
                                 threshold: Integer64,
                                 unit: String,
                                 sessionId: UUID,
-                                walletId: String, // optional: which SERVER wallet signs
-                                sponsorWalletId: String // optional: pool member of PASSPORT_FEE_SPONSOR_WALLET
+                                walletId: String // optional: which SERVER wallet signs
     )                                                                    returns {
         mode                   : String; // 'proving' | 'offline'
         txHash                 : String;
-        predicateAttestationId : String;
         result                 : Boolean;
         proofLogId             : String; // PredicateProofLog row to poll (mode 'proving')
     };
 
     /**
      * Proof cart, server lane: prove N field-bound claims on ONE passport
-     * in ONE transaction (NIGHTGATE issueFieldPredicateAttestationBatch,
-     * plugin >= 0.15.0 for mixed kinds). `claimsJson` is a JSON array of
+     * in ONE transaction. `claimsJson` is a JSON array of
      *   `{ sourceField, predicate: 'lessOrEqual'|'greaterOrEqual', threshold, unit? }`
      * with the RAW human threshold (scaled x1000 server-side, same as
      * provePassportValue), or
@@ -620,8 +593,7 @@ service ProducerService {
     action   provePassportValuesBatch(passportId: String,
                                       claimsJson: LargeString,
                                       sessionId: UUID,
-                                      walletId: String, // optional: which SERVER wallet signs
-                                      sponsorWalletId: String // optional: pool member of PASSPORT_FEE_SPONSOR_WALLET
+                                      walletId: String // optional: which SERVER wallet signs
     )                                                                    returns {
         mode        : String; // 'proving' | 'offline'
         proofLogIds : LargeString; // JSON array of PredicateProofLog row ids to poll
@@ -663,8 +635,7 @@ service ProducerService {
                                    allowedFieldsJson: String, // optional: JSON array of field names
                                    minChangedSlots: Integer,  // optional: k, adds the lower-bound claim
                                    sessionId: UUID,
-                                   walletId: String,          // optional: which SERVER wallet signs
-                                   sponsorWalletId: String    // optional: pool member of PASSPORT_FEE_SPONSOR_WALLET
+                                   walletId: String // optional: which SERVER wallet signs
     )                                                                    returns {
         mode            : String; // 'proving' | 'offline'
         proofLogId      : String; // integrity claim row

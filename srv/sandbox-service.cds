@@ -4,14 +4,11 @@
  * A tester runs a LOCAL script (their SDK builds records; prepareDocumentProof
  * is compute-only and runs client-side against any NIGHTGATE), then hands this
  * service the prepared coordinates. The service anchors + proves them against
- * one SHARED pre-deployed vault, with a pool sponsor wallet paying every dust
- * fee. The tester needs no wallet, NIGHT, tDUST, or server of their own.
+ * one SHARED pre-deployed vault, with the NIGHTGATE API's pool paying every
+ * dust fee. The tester needs no wallet, NIGHT, tDUST, or server of their own.
  *
- * Inert unless DEMO_ENABLED=true and SANDBOX_CONTRACT_ADDRESS is set. Runs
- * under one fixed technical principal (same as DemoService), so the tester's
- * caller session and the sponsor session share a user and same-user fee
- * sponsoring applies. Capped per IP / per tester / per day; one sponsor per
- * run, leased from PASSPORT_FEE_SPONSOR_WALLET.
+ * Inert unless DEMO_ENABLED=true and SANDBOX_CONTRACT_ADDRESS is set. Capped
+ * per IP / per tester / per day.
  */
 service SandboxService @(path: '/api/v1/sandbox', requires: 'any') {
 

@@ -1,7 +1,7 @@
 {
   "name": "@odatano/passport",
   "version": "0.1.0",
-  "description": "NIGHTPASS is a Digital Product Passport consumer app on Midnight (ZK): EU battery passports and component passports for safety-related plant parts. It consumes @odatano/nightgate as a CAP plugin.",
+  "description": "NIGHTPASS is a Digital Product Passport consumer app on Midnight (ZK): EU battery passports and component passports for safety-related plant parts. It builds and signs its transactions with @odatano/nightgate-tx and works against a NIGHTGATE API.",
   "private": true,
   "author": "ODATANO",
   "repository": {
@@ -12,10 +12,10 @@
     "@cap-js/postgres": "^3",
     "@odatano/brand": "^1.0.0",
     "@odatano/dpp-sdk": "^0.4.0",
-    "@odatano/nightgate": "^0.24.1",
-    "@odatano/nightgate-tx": "^0.15.1",
+    "@odatano/nightgate-tx": "^0.24.1",
     "@sap/cds": "^10",
     "animejs": "^4.5.0",
+    "bip39": "^3.1.0",
     "express": "^4",
     "qrcode": "^1.5.4",
     "sharp": "^0.35.3"
@@ -24,9 +24,11 @@
     "@cap-js/cds-typer": "^0.40.0",
     "@cap-js/cds-types": "^0.18.0",
     "@cap-js/sqlite": "^3",
+    "@odatano/contract-kit": "0.2.2",
     "@sap/cds-dk": "^10",
     "@types/node": "^24.0.0",
     "@types/qrcode": "^1.5.6",
+    "buffer": "^6.0.3",
     "playwright": "^1.60.0",
     "tsx": "^4",
     "typescript": "^6.0.3",
@@ -35,9 +37,6 @@
   },
   "engines": {
     "node": ">=22"
-  },
-  "overrides": {
-    "@midnight-ntwrk/ledger-v8": "8.1.0"
   },
   "scripts": {
     "postinstall": "npm run gen:types && npm run build:connector-lib && npm run vendor:explorer && npm run vendor:brand",
@@ -77,22 +76,6 @@
           "kind": "postgres",
           "credentials": {
             "url": null
-          }
-        }
-      },
-      "nightgate": {
-        "network": "preprod",
-        "runtimeMode": "single-instance",
-        "replicaCount": 1,
-        "granteeBinding": "did",
-        "crawler": {
-          "enabled": false
-        },
-        "contracts": {
-          "attestation-vault": {
-            "artifactPath": "node_modules/@odatano/nightgate/contracts/attestation-vault/src/managed/attestation-vault/contract/index.js",
-            "privateStateId": "attestationVaultPrivateState",
-            "zkConfigPath": "node_modules/@odatano/nightgate/contracts/attestation-vault/src/managed/attestation-vault"
           }
         }
       },
